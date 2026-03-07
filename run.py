@@ -1,6 +1,7 @@
 # !WINEPREFIX=~/.wine winetricks dxvk
 
 # kill gameserver and lolserver
+import datetime
 import os
 os.system("kill -9 wineserver")
 
@@ -15,6 +16,15 @@ load_dotenv()
 
 import anthropic
 import time
+
+import argparse
+parser = argparse.ArgumentParser()
+parser.add_argument("--client", action="store_true")
+parser.add_argument("--train", action="store_true")
+args = parser.parse_args()
+
+run_client = args.client
+TRAIN = args.train
 
 client = anthropic.Anthropic()
 
@@ -68,7 +78,8 @@ class PolicyValidator(ast.NodeVisitor):
                 self.errors.append(f"Call to dangerous function {node.func.id} is not allowed")
         self.generic_visit(node)
 
-INITIAL_POLICY = Path("./policies/sensible.py").read_text()
+latest_checkpoint_fname = max(Path("./checkpoints").glob("*.py")).name
+INITIAL_POLICY = Path("./checkpoints/" + latest_checkpoint_fname).read_text()
 
 OBSERVATION_SCHEMA = """
 The observation data represents a League of Legends game state. Let me explain the key parts:
@@ -246,7 +257,7 @@ spell - Spell Option, Point
 </example>
 """
 
-SPEED = "Crucially, limit your thinking to under 1000 words. We want fast iteration."
+SPEED = "<priority value='LIFE AND DEATH' Crucially, limit your thinking to under 1000 words. We want fast iteration.</priority>"
 TRAINING_PROMPT = lambda current_policy, data: f"""
 You are T1 Faker, the best league of legends player in the world.
 
@@ -455,7 +466,7 @@ def act(self, obs):
 </example>
 
 <task>
-You must now return the new policy based on <example></example.
+You must now return the new policy based on <example></example>.
 Simply infill and complete the tags below.
 DO NOT PROVIDE ANY PREAMBLE OR IRRELEVANT TEXT, FILL IN THE TEMPLATE AS REQUIRED.
 </task>
@@ -574,8 +585,10 @@ class Policy():
         # Find the content between <policy> and </policy> tags
         policy_start = res.find('<policy>') + len('<policy>')
         policy_end = res.find('</policy>')
-
         policy_code = res[policy_start:policy_end].strip()
+
+        thinking_end = res.find('</thinking>')
+        thinking_code = res[0:thinking_end].strip()
 
         if policy_start >= 0 and policy_end >= 0:
           try:
@@ -590,6 +603,13 @@ class Policy():
                 raise ValueError(f"Policy validation failed: {'; '.join(validator.errors)}")
                 
             self.update_policy(policy_code)
+
+            model_checkpoint_fname = f"./checkpoints/{datetime.datetime.now().isoformat()}.py"
+            thinking_checkpoint_fname = f"./checkpoints/{datetime.datetime.now().isoformat()}_thinking.txt"
+            prompt_checkpoint_fname = f"./checkpoints/{datetime.datetime.now().isoformat()}_prompt.txt"
+            with open(model_checkpoint_fname, "w+") as f: f.write(policy_code)
+            with open(thinking_checkpoint_fname, "w+") as f: f.write(thinking_code)
+            with open(prompt_checkpoint_fname, "w+") as f: f.write(prompt)
 
           except SyntaxError as e:
             raise ValueError(f"Policy contains invalid Python syntax: {e}")
@@ -615,14 +635,14 @@ feature_map_size = 16000
 feature_move_range = 8
 player_list = "Ezreal.BLUE,Ezreal.PURPLE" # Comma-separated list of `Player.Team`
 map = "Old Summoners Rift" # ["New Summoners Rift", "Howling Abyss"]
-max_steps = 10000 # 1000 steps / 4 obs_per_sec := 250 seconds
-max_episodes = 1000 # When set to 0, ignores this variable
+max_steps = 1000 # 100 steps / 4 obs_per_sec := 25 seconds
+max_episodes = 3 # When set to 0, ignores this variable
 host = "127.0.1.1"
 config_path = "./config_dirs.txt"
 obs_sec = 4
-max_steps_per_episode = 10000 # 100 steps := 25 secs
-run_client = True
-TRAIN = False
+max_steps_per_episode = 100 # 100 steps := 25 secs
+# run_client = False
+# TRAIN = True
 
 def constrain_movement(x, y, me):
   """
@@ -631,20 +651,30 @@ def constrain_movement(x, y, me):
   """
   my_x = me["position"]["X"]
   my_y = me["position"]["Y"]
-  enemy_champ_x_delta = (x - my_x) # 1 - 2
-  enemy_champ_y_delta = (y - my_y) # 1 - 2
+  enemy_champ_x_delta_og = (x - my_x) # 1 - 2
+  enemy_champ_y_delta_og = (y - my_y) # 1 - 2
 
-  enemy_champ_x_delta = max(-400, enemy_champ_x_delta)
+  enemy_champ_x_delta = max(-400, enemy_champ_x_delta_og)
   enemy_champ_x_delta = min(+400, enemy_champ_x_delta)
   enemy_champ_x_delta = round(enemy_champ_x_delta / 100)
   enemy_champ_x_delta += 4
 
-  enemy_champ_y_delta = max(-400, enemy_champ_y_delta)
+  enemy_champ_y_delta = max(-400, enemy_champ_y_delta_og)
   enemy_champ_y_delta = min(+400, enemy_champ_y_delta)
   enemy_champ_y_delta = round(enemy_champ_y_delta / 100)
   enemy_champ_y_delta += 4
-  
-  return [enemy_champ_x_delta, enemy_champ_y_delta]
+
+  new_x = my_x + ((enemy_champ_x_delta-4)*100)
+  new_y = my_y + ((enemy_champ_y_delta_og-4)*100)
+
+  # if new_x < 6900-1000 or new_x > 7100+1000:
+  #    enemy_champ_x_delta = 4
+  # if new_y < 6900-1000 or new_y > 7100+1000:
+  #    enemy_champ_y_delta = 4
+
+  out = [enemy_champ_x_delta, enemy_champ_y_delta]
+  print("MOVE:", out, new_x, new_y, my_x, my_y)
+  return out
 
 def normalize_to_move_range(x, y, move_range=8):
   # y *= -1
@@ -661,16 +691,16 @@ def normalize_to_move_range(x, y, move_range=8):
   return [[x, y]]
 
 class CustomAgent(base_agent.BaseAgent):
-    _data = []
-    _policy = Policy()
-    _episode_buffer = 5
-    _episode_idx = 0
-    _time_to_game = 0
-    _first_rec = False
-
     def __init__(self):
-      super().__init__()
-      self._time_to_game = time.time()
+        super().__init__()
+        self._time_to_game = time.time()
+        self._data = []
+        self._policy = Policy()
+        self._episode_buffer = 1
+        self._episode_idx = 0
+        self._time_to_game = time.time()
+        self._first_rec = False
+        self._done = False
 
     def step(self, obs):
         super(CustomAgent, self).step(obs)
@@ -678,18 +708,18 @@ class CustomAgent(base_agent.BaseAgent):
            self._first_rec = True
            print("time to get into game:", time.time() - self._time_to_game)
 
-        print(">>> RAW OBS:", obs.observation)
+        # print(">>> RAW OBS:", obs.observation)
 
         # Collect data
         # Note: You might want to filter this. Sending EVERY frame is too much tokens.
         # Maybe send every 10th frame, or only frames where health changed.
         if not obs.last():
-             # Basic sampling to save context window
-             if obs.observation["observation"]["game_time"] % 1.0 < 0.1: 
-                self._data.append({
-                    "rew": obs.reward,
-                    "obs": obs.observation
-                })
+            # Basic sampling to save context window
+            # if obs.observation["observation"]["game_time"] % 1.0 < 0.1:
+            self._data.append({
+                "rew": obs.reward,
+                "obs": obs.observation
+            })
 
         if obs.last():
             # Trigger async training at end of episode
@@ -697,6 +727,8 @@ class CustomAgent(base_agent.BaseAgent):
             if self._data and TRAIN and self._episode_idx == 0:
               self._policy.train(self._data)
               self._data = [] # Clear immediately for next game
+              self._done = True
+              exit()
 
         else:
             action_id, args = self._policy.act(obs.observation["observation"])
@@ -705,13 +737,13 @@ class CustomAgent(base_agent.BaseAgent):
             if action_id == 1:
                 # Ensure args are floats/ints not arrays if your policy returns weird stuff
                 me = next(u for u in obs.observation["observation"]["champ_units"] if u["my_team"] == 1.0)
-                args = args[0]
+                # args = args[0]
                 args = constrain_movement(args[0], args[1], me)
                 # if oob:
                 #   normalized = [[4, 4]]
                 # else:
-                normalized = normalize_to_move_range(args[0], args[1])
-                args = normalized
+                # normalized = normalize_to_move_range(args[0], args[1])
+                args = [args]
             
             return actions.FunctionCall(action_id, args)
         
@@ -723,10 +755,10 @@ for player in player_list.split(","):
   players.append(lol_env.Agent(champion=c, team=t))
   # agents.append(base_agent.BaseAgent())
   # agents.append(base_agent.BaseAgent())
-  # agents.append(CustomAgent())
-  # agents.append(CustomAgent())
-  agents.append(base_agent.BaseAgent())
   agents.append(CustomAgent())
+  agents.append(CustomAgent())
+#   agents.append(base_agent.BaseAgent())
+  # agents.append(CustomAgent())
 
 try:
   # Run the Game

@@ -1,0 +1,40 @@
+<thinking>
+Let me analyze the experience data carefully:
+
+1. **The bot is playing Ezreal (both sides seem to be Ezreal based on projectile names)**
+2. **Position pattern**: The bot starts at (6350,6350) and slowly moves toward the enemy at (1300,1300), then continues advancing. Both champions are moving toward each other along the diagonal.
+3. **The current policy is bizarre**: It alternates between moving toward the enemy and casting Q based on a timer modulo. This is not strategic at all.
+
+Key observations from the experience:
+- T0-T2753: Both at 100% HP. The bot isn't taking or dealing damage despite projectiles flying around.
+- T3506: Both drop to 86% HP - they're trading evenly
+- T3771: Both at 59% HP - continued even trading
+- T4002: Both at 45-46% HP
+- T4266: Both at 19% HP
+- T5023: Both at 5-6% HP
+
+The problem is clear: **The bot walks straight at the enemy and trades evenly, never gaining an advantage.** Both champions are taking identical damage. The bot needs to:
+
+1. **Dodge projectiles** - There are tons of EzrealMysticShot projectiles flying around. The bot ignores them completely.
+2. **Not walk in a straight line toward the enemy** - Walking diagonally directly into skillshots.
+3. **Use abilities more strategically** - Cast Q when it'll hit, dodge when projectiles are incoming.
+4. **Kite/orbit** instead of walking straight in.
+
+The projectile data shows dx,dy relative to the player. When projectiles have equal dx and dy values approaching from the enemy direction (bottom-left), the bot should dodge perpendicular.
+
+Key issues with current policy:
+- Uses `enemy_champ_x, enemy_champ_y` which are the enemy's absolute position for movement - walking straight at them
+- The time-based alternating between move and Q is nonsensical
+- No projectile dodging at all
+- No consideration of HP advantage/disadvantage
+- No retreat behavior when low HP
+
+New policy should:
+1. **Prioritize dodging incoming projectiles** - move perpendicular to their trajectory
+2. **Use Q to poke from range** rather than walking into the enemy
+3. **Maintain distance** - Ezreal Q has 1150 range, auto has 550. Stay at Q range.
+4. **Retreat when low HP** to avoid dying
+5. **Kite with E** if available for repositioning
+6. **Use W for extra damage** when committing to trades
+
+Let me write the improved policy:

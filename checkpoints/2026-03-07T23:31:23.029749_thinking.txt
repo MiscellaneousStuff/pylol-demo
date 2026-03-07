@@ -1,0 +1,22 @@
+Looking at the experience data, I can identify several critical issues:
+
+1. **The bot never moves toward the enemy.** From T0 to T1019, the bot sits at (6350,6350) while the enemy is at (1300,1300) - over 7000 units away. It never approaches. The `enemy_dist` is massive (~7100), so the approach code should trigger, but looking more carefully at the observations, the enemy position is (1300,1300) while my position is (6350,6350). The distance is huge.
+
+2. **The bot gets hit by EzrealTrueshotBarrage (R) twice.** At T2266, HP drops from 100% to 64% - hit by the first ult. At T3257, HP drops from 65% to 30% - hit by a second projectile. The bot fails to dodge these.
+
+3. **The bot never casts any abilities.** Despite having Q/W/E/R all ready with full mana, it never fires back. The enemy is ~7000+ units away, which is beyond all ability ranges, but the bot should be closing distance.
+
+4. **Projectile dodging fails completely.** The EzrealTrueshotBarrage projectiles are detected but the dodge logic uses `distance_to_me < 450` threshold - these are global ults traveling at 2000 speed, so by the time they're within 450 units, there may not be enough time. The `dx_to_me` and `dy_to_me` values show the projectiles approaching (getting smaller), but the bot doesn't react until too late.
+
+Key fixes needed:
+- **Increase dodge detection range significantly** (at least 800-1000 for fast projectiles like Ezreal R)
+- **Actually approach the enemy** - the bot seems stuck. Need to verify the approach logic works with the observation format.
+- **Use E to dodge** when projectiles are close
+- **Fire abilities when in range** - especially Q for poke at 1100 range
+- **The bot needs to predict projectile path** better - use velocity direction, not just distance
+
+The dodge logic uses `proj_dx` and `proj_dy` as `dx_to_me` and `dy_to_me` from the projectile - these represent the vector FROM the projectile TO me. The projectile's travel direction is roughly opposite to this when it's coming toward us. We need perpendicular to the projectile's travel direction.
+
+Also the approach code calculates `angle_to_enemy = math.atan2(enemy_dy, enemy_dx)` where enemy_dy/dx are `dy_to_me`/`dx_to_me` - the vector from enemy to me. So the angle points FROM enemy TO me, but we want to move TOWARD the enemy. We need to reverse this or use the direct position.
+
+Let me fix all of these issues.

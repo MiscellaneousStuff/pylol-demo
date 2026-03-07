@@ -1,0 +1,18 @@
+Looking at the experience data, I can identify several critical issues:
+
+1. **The bot NEVER attacks the enemy.** Throughout the entire episode (~24 seconds of game time), the bot has 0 kills, 0 deaths, and 35 gold (starting gold). It never casts Q, W, E, R, or auto-attacks. The enemy is consistently ~1300-1900 units away, which is beyond Q range (1150) but the bot never tries to close the gap to get into range.
+
+2. **The bot just orbits at extreme range.** Looking at positions, the bot stays around (6100-6300, 5900-6200) while the enemy is around (1400-1800, 1700-2200). The distance is roughly sqrt(1500^2 + 1300^2) ≈ 1984 units consistently. This is way too far to do anything.
+
+3. **The enemy HP is regenerating** (from 86% back up to 91%), meaning whatever initial damage happened at T2266 (both dropped to 86%) was never followed up on.
+
+4. **Projectiles are always far away** (~1200-1500 distance) - these are the bot's OWN projectiles being reflected back or the enemy's Q's that are very far. The bot is dodging projectiles that aren't even threatening because the distance is so large.
+
+5. **The bot fires Q at T2266** (both lose HP), but then the enemy distance increases and the bot never re-engages. The positioning code keeps the bot orbiting at ~1100+ range and since enemy_dist > optimal_range + 200 (900+200=1100), it approaches with a zigzag offset that doesn't actually close distance efficiently.
+
+Key fixes needed:
+- **Actually approach the enemy** to get within Q range (1100) and auto range (550)
+- **Use abilities aggressively** - cast Q whenever in range and it's up
+- **Auto-attack** between abilities for DPS
+- **Only dodge projectiles that are actually close** (< 400 distance, not 900)
+- **Close distance more decisively** instead of zigzagging at max range
