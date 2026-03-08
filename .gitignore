@@ -2,3 +2,4 @@
 *.deb
 config_dirs.txt
 LeagueSandbox-RL-Learning/
+pylol/
