@@ -1,0 +1,83 @@
+<thinking>
+Let me analyze the experience data carefully:
+
+1. **The bot never casts any spells the entire game.** Looking at the observations:
+   - HP starts at 100%, drops to 88% at T33 (initial), then stays at 86% after getting hit around T2760
+   - Then drops to 73% at T5517, then 59-60% at T6006, then 47% at T8017
+   - It stabilizes around 47-50% for the rest of the game
+   - Enemy HP follows similar pattern (mirror match - both Ezreals)
+   - **Neither player gains gold, XP, or kills throughout the entire episode**
+
+2. **The bot is getting hit by enemy Q's repeatedly** but NOT casting its own spells. Looking at the flow:
+   - T2265: Enemy projectiles appear (EzrealMysticShot)
+   - T2760: Bot HP drops from 100% to 86% - GOT HIT
+   - T5517: HP drops from 86% to 73% - GOT HIT AGAIN  
+   - T6006: HP drops from 73% to 59% - GOT HIT AGAIN
+   - T8017: HP drops from 47% - GOT HIT AGAIN
+
+3. **The bot's Q is always showing cooldown 0** (Q0), meaning it never uses Q. Same for W, E, R.
+
+4. **Key problem identified**: The enemy distance in the observations shows values like 615,552 which means the enemy is about 826 units away. This is within the Q range (1000 units in the policy). So WHY isn't Q being cast?
+
+Let me check: The policy checks `enemy_dist < 1000` for Q. The enemy distance is calculated from `enemy_dx` and `enemy_dy`. Looking at T2265: enemy is at (615, 552) relative = sqrt(615² + 552²) ≈ 826. That's < 1000, so Q should fire...
+
+Wait - looking more carefully at the observation format. At T2265, there are already projectiles (both from bot and enemy, based on the IDs). Two projectiles with IDs 1073741854 and 1073741853. The even ID (1073741854) seems to be the enemy projectile (dx=615, dy=552 moving toward bot) and odd (1073741853) at (0,0) is the bot's own.
+
+Actually wait - at T2265, both projectiles appear simultaneously. The bot's projectile (1073741853) is at (0,0) meaning it was just cast. So the bot DID cast Q at T2265! But then looking at subsequent frames, it seems like the bot keeps casting but also keeps getting hit.
+
+Let me re-examine: After T2760, the bot is at 86% and enemy at 86% - they traded evenly. Then from T3522 onwards, there are constant projectile exchanges. The problem is:
+
+1. **The bot is trading evenly but not gaining an advantage** - both lose HP at the same rate
+2. **The bot doesn't dodge well** - it gets hit by skillshots
+3. **After T8017 (both at 47%), the bot seems to stop taking damage** - it's dodging better or stopped engaging
+
+Actually, looking more carefully from T8282 onwards, the bot continues to have projectiles around it but doesn't lose HP. It seems like after getting low, the kiting pattern works better but it NEVER casts spells again (no HP changes on enemy).
+
+The main issues:
+1. **The bot is not aggressive enough with spells** - it should be casting Q on cooldown when in range
+2. **Dodging is not effective enough** - bot gets hit too often
+3. **The bot never uses auto-attacks** which would provide free damage
+4. **The bot seems to stop fighting entirely after reaching ~47% HP** even though all abilities are available
+
+Let me look at the projectile detection issue. The policy uses `p["my_team"] == 0` to detect enemy projectiles. But looking at the projectile data format: `[owner_id, dx, dy, speed, name]`. The IDs are 1073741854 and 1073741853. The bot needs to identify which are enemy. If `my_team` field works correctly, the dodging logic should trigger.
+
+But wait - looking at the actual behavior, the bot IS moving (positions change). It seems to be doing the kiting/strafing pattern from Priority 3. But it's not effectively dodging AND it's also not casting spells consistently.
+
+The real problems:
+1. **Projectile detection/dodge needs improvement** - the bot detects projectiles with `pdist < 350` but the projectile data shows distances like 615, 552 (vector) = ~826 units. The `pdist` is calculated from `pdx` and `pdy`. If these are at ~300+ initially, the bot should dodge but it's not working.
+
+2. **The bot needs to cast Q more aggressively** - every time Q is off cooldown and enemy is in range
+
+3. **The bot should use auto-attacks** between spells
+
+4. **Better dodge: instead of just perpendicular movement, predict where the projectile will be**
+
+New policy priorities:
+1. Cast Q whenever ready and enemy in range (1000 units) - this is the primary damage source
+2. Dodge enemy projectiles by moving perpendicular when detected
+3. Use W when in range
+4. Use auto-attacks between abilities
+5. Maintain optimal range (~700-800 units) 
+6. Use E defensively when low HP
+
+Let me also look at why the bot might not be casting. Oh wait - I think I see it. Looking at T2529: projectiles at (224,197) and (390,355). The `truly_threatening` check would find projectiles with pdist < 350. pdist for first = sqrt(224²+197²) ≈ 298. That's < 350, so dodging takes PRIORITY over casting spells. This means the bot spends ALL its time dodging instead of attacking!
+
+The problem: **Dodging has higher priority than casting spells, and enemy keeps throwing spells, so the bot never gets a chance to cast.**
+
+Fix: Cast Q/W WHILE dodging. The dodge move and the spell cast should be combined - cast Q at enemy, THEN dodge. Or better: cast spells first (they're instant-cast for Ezreal Q), then immediately dodge.
+
+Actually, the biggest issue is that after the initial exchange, the bot seems to go into permanent dodge mode because there are ALWAYS projectiles on screen (they persist in the observation even when far away). The bot checks distance < 500 and < 350 for threat detection, but those old projectiles that are moving away still show up.
+
+Key insight: A projectile moving TOWARD us has its distance DECREASING. A projectile moving AWAY has distance INCREASING. We need to check if the projectile is actually approaching us, not just nearby.
+
+Let me design a better policy:
+1. Always try to cast Q when ready (it's Ezreal's bread and butter)
+2. Only dodge projectiles that are actually approaching (dot product of velocity and position is negative)
+3. Use auto-attacks
+4. Better spacing
+
+Here's my approach:
+- Check if projectile is approaching: if the projectile's velocity direction has a negative dot product with its position vector relative to us, it's approaching
+- Cast Q at enemy with slight lead
+- Dodge only truly threatening approaching projectiles
+- Maintain ~750 unit range

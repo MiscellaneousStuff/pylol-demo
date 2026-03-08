@@ -1,0 +1,279 @@
+<thinking>
+Let me analyze the experience data carefully:
+
+1. **Early game (T0-T2007)**: The bot slowly approaches the enemy. Enemy is at ~(579,591) relative distance. Both start at 100% HP. The bot is at position ~(6710,6704) and enemy is far away.
+
+2. **T2271-T2765**: Both fire Q at each other. Both drop to 86% HP. The bot isn't dodging at all - it's standing still at (6710,6704) while projectiles fly.
+
+3. **T3525-T3757**: Same thing happens again. Both trade Qs, bot drops to 72%, enemy to 73%. Bot is STILL standing at (6710,6704).
+
+4. **T4518-T4782**: Again, both trade. Bot drops to 59%, enemy to 60%.
+
+5. **T5277-T5770**: More trades. Bot drops to 46%, enemy to 46%.
+
+6. **T6266-T6761**: Bot drops to 29% (from 46%), enemy drops to 29% (from 47%). Bot gets hit by both Q and W.
+
+7. **T7523 onwards**: The bot is at 29% HP and finally starts moving! It's dodging projectiles and actually succeeding for a while - staying at 29-30% HP while the enemy slowly regens.
+
+8. **T15759**: Bot suddenly drops to 17% HP (from 31%). Got hit by something.
+
+9. **T17002**: Bot drops to 3% HP! Critical.
+
+10. **T18017 onwards**: Bot at 4% HP, running away. Enemy fires R (EzrealTrueshotBarrage). Bot continues running.
+
+11. **T24030**: Enemy dropped to 16% HP (from 34%) - suggesting our Q/W/R hit at some point earlier.
+
+**Key Problems:**
+
+1. **THE BOT STANDS COMPLETELY STILL FROM T2271 to T6761** - It's at position (6710,6704) the entire time! It fires Q at the enemy but never moves. This means it gets hit by EVERY enemy Q. The enemy distance is ~579-591 units which is within Q range (1050), so the bot fires Q (correct) but doesn't move to dodge incoming Q.
+
+2. **The bot doesn't actually cast Q in the first few seconds** - Looking at T2007, enemy is at distance ~sqrt(579²+591²) ≈ 827 units. Q range is 1050. Q is ready. But at T2271, both projectiles appear simultaneously - the bot did cast Q. OK.
+
+3. **The fundamental issue**: The policy casts Q first (PRIORITY 0), then checks for dodge. But after casting Q, the next tick the bot needs to MOVE to dodge the incoming projectile. Instead, it seems to just stand there waiting for Q cooldown to come back up.
+
+4. **After T6761**, when the bot starts moving, it's actually decent at dodging for a while (stays at 29-30% HP from T6761 to ~T15500).
+
+5. **The bot never uses auto-attacks** when in range. At ~550 range, it could be auto-attacking between Q casts.
+
+6. **The bot runs away in a straight line** when low HP, making it predictable and easy to hit.
+
+**Root Causes:**
+- Bot stands still between spell casts because the movement code only triggers when enemy is >1100 or in certain conditions. When enemy_dist is ~830, it falls into the "In combat range" section, but the movement isn't executing because the Q cast takes priority and then nothing else happens until next Q.
+- The dodge code only triggers for projectiles < 300 units, but by then it's too late for the standing-still bot.
+- The bot needs to ALWAYS be moving, especially between spell casts.
+
+**Fixes needed:**
+1. Cast Q, then IMMEDIATELY move to dodge. Don't stand still.
+2. Start dodging proactively - move unpredictably even before projectiles appear.
+3. Use auto-attacks when in range and spells are on cooldown.
+4. Better retreat pathing - not straight line.
+5. The movement/kiting code should be the DEFAULT behavior, with spells cast opportunistically.
+6. The leading aim is wrong - `nx * lead_dist * 0.3` barely leads at all. Need better aim prediction.
+7. When enemy fires Q (visible as projectile), immediately dodge perpendicular.
+
+Let me rewrite the policy with these fixes:
+
+Key insight: The bot should ALWAYS be moving. The pattern should be:
+1. Check for incoming projectiles and dodge them
+2. If Q is ready and enemy in range, cast Q (this is instant, doesn't prevent movement next tick)
+3. If W ready and Q on cooldown, cast W
+4. ALWAYS move between casts - strafe perpendicular to the enemy
+
+Wait, looking more carefully at the observation format - the enemy position is given as `(dx, dy)` relative to me. And projectile positions are also `(dx, dy)` relative to me.
+
+Let me look at the projectile detection issue. At T2271, projectiles appear: `[1073741854,579,591,2000,EzrealMysticShot]` - this is 579 dx, 591 dy, distance = ~827 units. That's > 600 so it gets filtered out by `if pdist > 600: continue`. Then at T2501: `[1073741854,283,238,2000,EzrealMysticShot]` - distance ~370, still > 300 for the dodge trigger. Then at T2765, the projectile has already hit (HP drops to 86%).
+
+So the projectile detection range of 600 is too small, and the dodge trigger of 300 is WAY too late. By the time a 2000-speed projectile is at 300 units, it arrives in 0.15 seconds - basically unhittable.
+
+**Fix**: Start dodge earlier - when projectile is detected at 600+ units, start moving perpendicular. Also, the `pdist > 600` filter is removing projectiles we SHOULD be tracking.
+
+Also critically: the bot stands still at (6710, 6704) for the ENTIRE early laning phase because it enters the combat range section but the movement code uses `game_time * 0.001` for the phase calculation. With game_time values like 2271, `t = 2.271`, `phase = (2.271 * 17) % (2π) = 38.607 % 6.283 = 38.607 - 6*6.283 = 38.607 - 37.699 = 0.908`. This gives different lateral values but... the bot ISN'T MOVING. 
+
+OH WAIT - the issue is that `cast_q_first` is True (Q ready, enemy < 1050, mana > 5%), and `must_dodge_now` is False (no threatening projectile within 150 units). So it returns the Q cast spell action EVERY SINGLE TICK. It keeps trying to cast Q even when Q is on cooldown because... wait, `q_ready = my_champ["q_cooldown"] == 0`. If Q was just cast, cooldown should be >0.
+
+But looking at the observations: Q0W0E0R0 EVERY SINGLE TIME. The cooldowns are always 0! That means Q is always "ready" according to the policy, so it always tries to cast Q first. But Q might be on internal cooldown or the cast might not go through...
+
+Actually, the game might report cooldown as 0 between ticks if the observation happens right after cast completes. Or maybe the spell casting isn't working at all and Q is genuinely always ready but not being cast properly.
+
+Looking more carefully: at T2271, both projectiles appear - so both champions cast Q. At T2765, both are 86% HP. Then at T3525 (about 750ms later), both fire again. Ezreal Q cooldown at level 1 is about 5.5 seconds, but here it seems like ~1.25 seconds between casts... something is off with the timing. Actually T values might be in different units.
+
+Wait, T2271 to T3525 is 1254 time units. T0 to T264 is 264 units = maybe that's 264ms? So 1254 units ≈ 1.25 seconds? That's too fast for Q cooldown.
+
+Actually looking at T529 to T759 = 230 units = maybe each "T" unit is ~16ms (a frame at 60fps)? So 264 = ~4 seconds? No that doesn't work either.
+
+Let me look: T0 → T264 → T529 → T759 → T1022. The intervals are ~260, ~265, ~230, ~263. If these are centiseconds (1/100th), then each gap is ~2.6 seconds. T2271 to T3525 = 1254 centiseconds = 12.54 seconds, which is way more than Q cooldown. That makes sense!
+
+So Q cooldown is expiring between observations. The bot IS casting Q successfully, but it's standing still the entire time because it always enters the "cast Q" branch first.
+
+**The fix is clear**: After casting Q, the bot should MOVE. It should not just return the Q cast - it should alternate between casting and moving. Since we can only return one action per tick, the logic should be:
+- If Q is ready AND no imminent projectile: cast Q
+- Otherwise: MOVE (dodge/strafe)
+
+But the current code returns Q cast whenever Q is ready. The problem is Q cooldown shows as 0 even right after casting. So the bot thinks Q is always ready.
+
+Wait actually - at T2271 both projectiles appear. At T2501, the projectiles have moved (283,238). At T2765 HP dropped. Between T2271 and T2765, Q should be on cooldown (5+ seconds). But the observation shows Q0. Maybe the observation is wrong or the cooldown display is bugged.
+
+If cooldown is always 0, the bot will ALWAYS try to cast Q and never move. That's the critical bug in interaction with the observation system.
+
+**Solution**: Track whether we recently cast Q using game_time, and force movement between casts. Or, better yet, restructure the priority so we ALWAYS move, and only cast Q every N ticks.
+
+Let me design a new policy:
+
+1. Always track projectiles with wider range
+2. Alternate between casting spells and moving
+3. When not casting, strafe perpendicular to enemy
+4. Use a simple state machine: cast → dodge → cast → dodge
+5. Better aim prediction for Q
+
+Here's my improved policy:
+
+```python
+def act(self, observation):
+    import math
+    
+    my_champ = next(unit for unit in observation["champ_units"] if unit["my_team"] == 1)
+    enemy_champ = next(unit for unit in observation["champ_units"] if unit["my_team"] == 0)
+    
+    my_hp_pct = my_champ["current_hp"] / max(my_champ["max_hp"], 1)
+    enemy_hp_pct = enemy_champ["current_hp"] / max(enemy_champ["max_hp"], 1)
+    my_mp_pct = my_champ["current_mp"] / max(my_champ["max_mp"], 1)
+    my_x = my_champ["position"]["X"]
+    my_y = my_champ["position"]["Y"]
+    enemy_dx = enemy_champ["dx_to_me"]
+    enemy_dy = enemy_champ["dy_to_me"]
+    enemy_dist = math.sqrt(enemy_dx**2 + enemy_dy**2)
+    enemy_x = my_x + enemy_dx
+    enemy_y = my_y + enemy_dy
+    
+    game_time = observation.get("game_time", 0)
+    
+    # Track last Q cast time using class variable
+    if not hasattr(self, '_last_q_time'):
+        self._last_q_time = -99999
+        self._last_w_time = -99999
+        self._last_action_was_spell = False
+        self._dodge_direction = 1
+    
+    # Normalized direction to enemy
+    if enemy_dist > 0:
+        nx = enemy_dx / enemy_dist
+        ny = enemy_dy / enemy_dist
+    else:
+        nx, ny = 1, 0
+    
+    def move_to(target_y, target_x):
+        target_x = max(0, min(16000, target_x))
+        target_y = max(0, min(16000, target_y))
+        return (1, [target_y, target_x])
+    
+    def cast_spell(spell_idx, target_y, target_x):
+        target_x = max(0, min(16000, target_x))
+        target_y = max(0, min(16000, target_y))
+        return (2, [[spell_idx], [target_y, target_x]])
+    
+    # Detect enemy projectiles
+    enemy_projectiles = [p for p in observation["projectiles"] if p["my_team"] == 0]
+    
+    # Find closest approaching projectile
+    closest_proj = None
+    closest_proj_dist = 9999
+    for p in enemy_projectiles:
+        pdx = p["dx_to_me"]
+        pdy = p["dy_to_me"]
+        pdist = math.sqrt(pdx**2 + pdy**2)
+        if pdist < 15:
+            continue
+        if pdist < closest_proj_dist:
+            closest_proj_dist = pdist
+            closest_proj = p
+    
+    # Perpendicular dodge direction calculation
+    def get_dodge_target(proj, dodge_dist=350):
+        pdx = proj["dx_to_me"]
+        pdy = proj["dy_to_me"]
+        # Perpendicular directions
+        perp1_x, perp1_y = pdy, -pdx
+        perp2_x, perp2_y = -pdy, pdx
+        mag = math.sqrt(perp1_x**2 + perp1_y**2)
+        if mag > 0:
+            perp1_x /= mag
+            perp1_y /= mag
+            perp2_x /= mag
+            perp2_y /= mag
+        # Alternate dodge direction based on stored state
+        if self._dodge_direction > 0:
+            dx, dy = perp1_x, perp1_y
+        else:
+            dx, dy = perp2_x, perp2_y
+        return my_x + dx * dodge_dist, my_y + dy * dodge_dist
+    
+    # PRIORITY 0: Dodge close projectiles (< 500 units) - ALWAYS dodge these
+    if closest_proj and closest_proj_dist < 500:
+        # Use E for very close dangerous projectiles when low HP
+        if closest_proj_dist < 150 and my_champ["e_cooldown"] == 0 and my_hp_pct < 0.3:
+            dodge_x, dodge_y = get_dodge_target(closest_proj, 475)
+            self._dodge_direction *= -1
+            return cast_spell(2, dodge_y, dodge_x)
+        
+        dodge_x, dodge_y = get_dodge_target(closest_proj, 400)
+        self._dodge_direction *= -1
+        return move_to(dodge_y, dodge_x)
+    
+    # PRIORITY 1: Retreat if very low HP
+    if my_hp_pct < 0.15:
+        # Run toward base (lower coordinates typically)
+        retreat_x = my_x - nx * 500
+        retreat_y = my_y - ny * 500
+        # Zigzag while retreating
+        t = game_time * 0.01
+        perp_x = -ny * math.sin(t * 7) * 300
+        perp_y = nx * math.sin(t * 7) * 300
+        retreat_x += perp_x
+        retreat_y += perp_y
+        # Use E to escape if available
+        if my_champ["e_cooldown"] == 0 and enemy_dist < 800:
+            return cast_spell(2, retreat_y, retreat_x)
+        return move_to(retreat_y, retreat_x)
+    
+    # PRIORITY 2: Alternate between casting and moving
+    # Only cast spell every other tick to ensure we move between casts
+    should_cast = not self._last_action_was_spell
+    
+    # Cast R for execute
+    if my_champ["r_cooldown"] == 0 and enemy_hp_pct < 0.2 and enemy_dist < 2500 and my_mp_pct > 0.1:
+        self._last_action_was_spell = True
+        return cast_spell(3, enemy_y, enemy_x)
+    
+    # Cast Q if ready and we should cast this tick
+    if should_cast and my_champ["q_cooldown"] == 0 and enemy_dist < 1050 and my_mp_pct > 0.05:
+        # Aim prediction - lead the target
+        travel_time = enemy_dist / 2000.0
+        # Aim directly at enemy position (they're moving unpredictably too)
+        aim_x = enemy_x
+        aim_y = enemy_y
+        self._last_action_was_spell = True
+        self._last_q_time = game_time
+        return cast_spell(0, aim_y, aim_x)
+    
+    # Cast W if Q on cooldown
+    if should_cast and my_champ["w_cooldown"] == 0 and enemy_dist < 900 and my_mp_pct > 0.15:
+        aim_x = enemy_x
+        aim_y = enemy_y
+        self._last_action_was_spell = True
+        self._last_w_time = game_time
+        return cast_spell(1, aim_y, aim_x)
+    
+    # PRIORITY 3: ALWAYS MOVE - strafe perpendicular to enemy
+    self._last_action_was_spell = False
+    
+    optimal_range = 800  # Stay at Q range, hard for enemy to auto
+    range_correction = (enemy_dist - optimal_range) * 0.35
+    
+    # Sharp lateral movement - change direction frequently
+    t = game_time * 0.01
+    # Use a pattern that changes direction every ~0.5-1 seconds
+    phase = math.sin(t * 5.0)
+    if phase > 0.3:
+        lateral = 400
+    elif phase < -0.3:
+        lateral = -400
+    else:
+        lateral = 350 * math.sin(t * 13.0)  # Fast jitter in transition
+    
+    move_x = my_x + nx * range_correction + (-ny) * lateral
+    move_y = my_y + ny * range_correction + (nx) * lateral
+    
+    return move_to(move_y, move_x)
+```
+
+Wait, I realize I need to double-check the approach. The key insight is that `self._last_action_was_spell` will alternate: cast Q → move → cast Q → move. This ensures the bot moves between casts.
+
+But there's still the issue with Q cooldown always showing 0. Even with alternating, if Q is truly always ready, the bot casts every other tick. That's fine - it means it moves every other tick at least.
+
+Actually, let me reconsider. The Q cooldown at rank 1 is 5.5 seconds. The observations at T2271 show Q0 (ready), and at T2501 also Q0. At 60fps, each tick is ~16ms, but the observation intervals are ~230-260 time units. If each unit is ~10ms, that's 2.3-2.6 seconds between observations. With Q being cast at T2271, the next observation at T2501 is 230 units later. If Q cooldown is 5.5 seconds = 550 units, then Q should still be on cooldown at T2501. But it shows Q0.
+
+Maybe the cooldown display is bugged, or maybe the game handles it differently. In any case, the `_last_action_was_spell` approach ensures movement happens.
+
+Let me also fix the dodge direction logic. The current approach of alternating might not be optimal. Better to choose the direction that moves away from the enemy when low HP, or perpendicular when healthy.
+
+Let me finalize the policy.

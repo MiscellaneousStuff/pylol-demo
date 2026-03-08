@@ -1,1 +1,1 @@
-for i in {1..2}; do python3 run.py --train; done
+for i in {1..5}; do python3 run.py --train; done

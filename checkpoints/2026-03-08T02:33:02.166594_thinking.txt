@@ -1,0 +1,32 @@
+<thinking>
+Let me analyze the experience data carefully:
+
+1. **The bot NEVER casts any spells the entire game.** Looking at the observations from T0 to T24525, both champions stay at nearly 100% HP the entire time. The bot's HP goes from 100% to ~97-98% and enemy similarly. Both have 0 kills and 0 deaths. Gold stays at 35 the entire time.
+
+2. **The bot never attacks.** Despite having all abilities ready (Q0W0E0R0), the bot appears to only be moving around. The enemy distance stays around 200-600 units consistently, which is well within Q range (1050) and W range (900), yet the bot never fires.
+
+3. **Why isn't it casting?** Looking at the policy logic:
+   - The bot enters PRIORITY 0 (dodge) because there are ALWAYS enemy projectiles within 600 units. The projectile distances shown (like 500, 400, 300 etc.) are consistently under 600.
+   - So the bot is ALWAYS dodging and never gets to the casting priorities.
+
+4. **The projectiles are far away but the bot treats them as close.** Looking at projectile data, there are always two projectiles: `EzrealMysticShot` with distances like 400-600. But many of these projectiles have large negative dx values (meaning they're moving AWAY or have already passed). The bot is dodging projectiles that aren't even threats.
+
+5. **Key issues:**
+   - The dodge threshold of 600 is too aggressive - it triggers on every single frame
+   - No distinction between projectiles moving toward vs away from the bot
+   - The bot never engages because it's perpetually in dodge mode
+   - The bot should be using auto attacks as well
+   - Enemy is within 200-600 range consistently - perfect for all-in but bot just dances around
+
+**Fixes needed:**
+1. Check if projectile is actually moving TOWARD us (dot product of projectile velocity with projectile-to-me vector)
+2. Reduce dodge trigger distance or be smarter about when to dodge
+3. ALWAYS try to cast spells and auto-attack when in range
+4. Actually approach the enemy and fight
+5. Use auto attacks (action available in ACT list)
+
+Let me write a new policy that:
+- Only dodges projectiles that are actually threatening (moving toward us AND close)
+- Prioritizes dealing damage (Q, W, auto attacks)
+- Maintains good positioning
+- Alternates between casting and moving properly

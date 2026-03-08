@@ -1,0 +1,107 @@
+<thinking>
+Let me analyze the experience data carefully.
+
+Key observations from the experience:
+
+1. **The bot NEVER casts any spells.** Looking at the entire experience, the bot starts at position ~(6350,6350) and the enemy is at ~(1300,1300) relative... wait, let me re-read the observation format.
+
+Looking at the observations more carefully:
+- ME position is like (6350,6350), enemy shows as (1300,1300) for ENY field
+- But the ENY field shows (dx, dy) relative values based on the observation spec
+
+Wait, re-reading the spec: `ENY50,80,(333,36),L1` - "Enemy at 50% HP, 80% mana, 333 units right and 36 units up"
+
+So the ENY coordinates are (dx, dy) from me to enemy. So the enemy is at distances like 500-800 units away throughout the game.
+
+2. **Enemy distance**: Looking at the data, enemy_dx and enemy_dy values like (449,438) give distance ~627, (324,727) gives ~795, etc. The enemy is typically 400-800 units away.
+
+3. **The bot never attacks!** Looking at Q cooldown - it's always 0 (ready). Enemy is within 1050 range (Q range check). But the bot never fires Q. Why?
+
+Let me trace through the policy:
+- `enemy_dist` = sqrt(enemy_dx^2 + enemy_dy^2) - this should be ~600-800
+- Q ready and enemy_dist < 1050 and mp > 0.05 → should be TRUE
+- So it should cast Q... but wait, looking at the observations, the bot's HP only changes from natural regen (88→89→90→91→92%), and enemy HP mirrors it. Neither champion is dealing damage!
+
+Wait, looking more carefully at the first few observations:
+- T0: Position (6350,6350), ENY at (1300,1300) - this is distance ~1838. Too far for Q!
+- The bot approaches slowly...
+- T2270: ENY at (324,727) - distance ~795. This IS within 1050 range for Q.
+
+But then the bot position doesn't change much, and Q is never on cooldown. So either Q is being cast but missing, or the action isn't being executed properly.
+
+Actually wait - let me look at the action output format. The policy returns `cast_spell(0, enemy_y, enemy_x)` where `enemy_x = my_x + enemy_dx` and `enemy_y = my_y + enemy_dy`. That should be correct.
+
+But the Q cooldown is always 0... If Q was being cast, it should go on cooldown. So the bot is NOT casting Q at all despite the conditions being met.
+
+Let me re-examine: At T2270, `enemy_dx=324, enemy_dy=727`, `enemy_dist = sqrt(324^2 + 727^2) = sqrt(104976 + 528529) = sqrt(633505) ≈ 796`. This is < 1050, Q is ready, mp is 100% > 5%. So the Q cast should happen...
+
+Unless there are projectiles being detected as threatening. At T2270, there are projectiles: `[1073741854,324,727,2000,EzrealMysticShot][1073741853,0,0,2000,EzrealMysticShot]`
+
+The projectile at (324,727) has distance 796 > 400, so filtered out. The one at (0,0) has distance 0 < 10, filtered. So `truly_threatening` is None.
+
+So Q should fire... but it doesn't show on cooldown. Unless the spell cast is failing for some reason.
+
+OH WAIT. I see the issue. The `cast_spell` function returns `(2, [[spell_idx], [target_y, target_x]])` but the action format expects `[[0],[0, 8000]]`. Let me check the example:
+```
+action_args: [[0],[0, 8000]]
+```
+
+So it's `[[spell_option_idx], [target_y, target_x]]`. The current policy's `cast_spell` returns `(2, [[spell_idx], [target_y, target_x]])` which looks correct.
+
+Hmm, maybe the issue is something else entirely. Let me look at the actual observations again - the positions show the projectiles from BOTH teams (owner IDs 1073741854 and 1073741853). So maybe 1073741854 is enemy and 1073741853 is friendly. But the projectiles exist from the start... 
+
+Actually, looking at the EzrealMysticShot projectiles - they appear at T2270 with one at (324,727) and one at (0,0). This might mean both champions ARE casting abilities. But the cooldowns show Q0 for both... Maybe the observation update is asynchronous?
+
+Actually, the BIGGEST issue I can see: **The bot is not dealing ANY damage.** Both champions' HP changes are synchronized (both go 100→96→92→88→89 etc.), suggesting natural HP regen and maybe minion damage, but no champion-to-champion damage is happening.
+
+Let me reconsider. Maybe the spell is being cast but the projectile is missing? But we'd still see the cooldown change...
+
+OK, new theory: maybe both champions are Ezreal, and the projectiles shown are from both. The bot IS casting Q but always missing because it aims directly at the enemy without proper lead time.
+
+Actually, looking more carefully at the projectile data - at T2270 the first projectile has dx_to_me=324, dy_to_me=727 - that's exactly where the enemy is! This is likely OUR projectile that was just cast AT the enemy position. And the (0,0) one might be a new spawn.
+
+So maybe Q IS being cast and hitting sometimes (both HP drop from 100 to 96 to 92 to 88 symmetrically), but the damage is trading evenly.
+
+OK let me focus on the ACTUAL problems:
+
+1. **No use of auto-attacks** - The bot never uses auto-attacks, which are free damage
+2. **Spells might be missing** - Q is a skillshot and needs lead prediction
+3. **Both champions trade evenly** - The bot needs to dodge more while dealing more damage
+4. **The bot doesn't use E offensively** - E could be used for repositioning to land combos
+5. **The bot orbits but doesn't actually trade effectively** - It's just walking around
+
+Main issues to fix:
+1. **Add auto-attacks** - `auto` is in the action list. The bot should auto-attack when in range (~550 for Ezreal)
+2. **Better Q aiming** - Need to lead the target based on projectile speed and distance
+3. **Use W for poke** - W marks enemy, hitting with another ability after does bonus damage
+4. **Dodge projectiles better** - The projectiles ARE hitting (HP drops)
+5. **R for finishes** - Use ult when enemy is low
+
+Wait, auto-attack... looking at the action spec, there's no explicit "auto" action_id. The actions are: 0=no_op, 1=move, 2=spell. But ACT shows [auto] as available. Maybe auto-attack is done by... moving to the enemy? Or maybe there's a separate mechanism.
+
+Actually, I think auto-attack might be triggered by right-clicking (move) to the enemy position when in range. Or it might be a separate action not listed. Given the action_ids only have 0, 1, 2, auto might not be directly controllable, or it happens automatically when in range and not moving.
+
+Let me focus on what's clearly wrong:
+
+1. **The bot never seems to effectively damage the enemy** - Both HPs track identically
+2. **Q/W are not being used aggressively enough** or are missing
+3. **No use of W (spell_1)** at all effectively
+4. **Positioning could be more aggressive** to force favorable trades
+
+Here's my improved policy plan:
+1. Cast Q with better aim prediction (lead the target)
+2. Cast W for poke/mark
+3. Use auto-attacks if possible (maybe through spell action or move-to-enemy)
+4. Better dodge logic - the current 250 range threshold is too small
+5. Use R for execute
+6. Better engagement pattern - poke then retreat
+
+Let me write the new policy:
+
+Key changes:
+- Cast Q with lead prediction based on distance/speed
+- Cast W as secondary poke
+- Auto-attack when close and abilities on CD
+- Better projectile dodge (wider detection range)
+- Smarter positioning (kite after abilities)
+- Use E for dodge, not for closing distance

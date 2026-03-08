@@ -21,6 +21,7 @@ import argparse
 parser = argparse.ArgumentParser()
 parser.add_argument("--client", action="store_true")
 parser.add_argument("--train", action="store_true")
+parser.add_argument("--checkpoint", type=str, default=None)
 args = parser.parse_args()
 
 run_client = args.client
@@ -78,7 +79,10 @@ class PolicyValidator(ast.NodeVisitor):
                 self.errors.append(f"Call to dangerous function {node.func.id} is not allowed")
         self.generic_visit(node)
 
-latest_checkpoint_fname = max(Path("./checkpoints").glob("*.py")).name
+if not args.checkpoint:
+    latest_checkpoint_fname = max(Path("./checkpoints").glob("*.py")).name
+else:
+    latest_checkpoint_fname = args.checkpoint
 INITIAL_POLICY = Path("./checkpoints/" + latest_checkpoint_fname).read_text()
 
 OBSERVATION_SCHEMA = """

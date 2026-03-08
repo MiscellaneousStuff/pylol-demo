@@ -1,0 +1,24 @@
+Looking at the experience data, I can identify several critical issues:
+
+1. **Bot never casts spells**: Despite having all abilities ready (Q0W0E0R0) the entire game, and the enemy being within range (enemy_dist around 200-400 units at times), the bot never casts Q, W, or any spell. The enemy HP drops sometimes (from our projectiles hitting - those are "1073741853" team projectiles), but we're clearly not casting enough.
+
+2. **Bot takes damage without dodging**: At T11769, HP drops from 100% to 86%. At T12264, drops to 72%. At T13521, drops to 68%. The bot is getting hit by EzrealMysticShot projectiles repeatedly.
+
+3. **The enemy is VERY close** (dx/dy around -200 to -400 range, meaning ~200-400 units away) but the bot keeps trying to position instead of attacking. The `enemy_dist` is well within Q range (1050) and even auto range (550).
+
+4. **Projectile dodging fails**: The `distance_to_me` threshold of 300 for threatening projectiles is likely not being triggered properly because many projectiles have large dx/dy values (far away) but the `distance_to_me` field might not match. Looking at the data, projectiles with dx_to_me around -195, -62 (distance ~205) should trigger dodge but the bot just stands still.
+
+5. **Bot slowly walks toward enemy but never engages**: It walks from (6350,6350) towards the enemy but once it gets close enough to cast, it enters the "maintain ~750 range" kiting loop and never actually casts spells because the positioning code runs first.
+
+Key fixes needed:
+- **Prioritize casting spells when in range** - Q should be cast immediately when enemy is in range
+- **Better projectile dodging** - use actual distance calculation and dodge more aggressively
+- **Don't stand still** - the bot stays at the same position for many timesteps, making it easy to hit
+- **Auto attack when close** - use the auto action properly
+- **The enemy is Ezreal** - so we need to sidestep Q's which are linear skillshots
+
+The biggest problem: the policy checks `enemy_dist > 1000` for closing distance, but enemy is often at ~300 units. Then it goes to the "optimal range 750" section and just jukes laterally without ever casting. The spell casting section runs but the conditions are somehow not met or the code falls through to positioning first.
+
+Wait - looking more carefully, the enemy distance calculation: `enemy_dist = math.sqrt(enemy_dx**2 + enemy_dy**2)`. With enemy at (-195, -62), that's ~205 units. Q is ready, enemy_dist < 1050, mp > 0.05... so it SHOULD cast Q. But `enemy_x = my_x + enemy_dx` and `enemy_y = my_y + enemy_dy`. Let me check - the threatening projectile check runs first. With so many projectiles in the observation, some might have `distance_to_me < 300`, causing the dodge to trigger every single frame and preventing spell casts.
+
+That's the bug! The dodge check runs every frame because there are always close projectiles (many with small dx/dy), so the bot NEVER reaches the spell casting code. Need to fix the projectile filtering to only dodge projectiles actually heading toward us.
