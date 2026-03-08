@@ -1,0 +1,56 @@
+<thinking>
+Let me analyze the experience data carefully.
+
+Key observations from the experience:
+
+1. **The bot NEVER casts any spells** - Throughout the entire ~24 second episode, the bot has Q, W, E, R all at 0 cooldown, yet never uses them. It just moves around. This means it's getting zero offensive reward.
+
+2. **The bot barely takes damage** - HP stays around 86-91% throughout, and enemy also stays around 86-91%. The bot is dodging reasonably well but not attacking at all.
+
+3. **The enemy is constantly firing projectiles** (EzrealMysticShot, EzrealEssenceFlux) - these are visible in every observation after T2266.
+
+4. **Enemy distance** - The enemy is consistently within 400-800 units (based on dx/dy values), which is well within Q range (1050) and W range (900). Yet the bot never attacks.
+
+5. **The root cause**: Looking at the policy, the bot enters the kiting/movement section (Priority 4) because:
+   - No projectile is within 550 distance (the dodge threshold)
+   - HP is fine (88-91%), not below 35%
+   - Enemy distance is within 400-800 range... but then it checks `enemy_dist > 1000` first, which is false
+   - So it falls to the "In combat range" section which just does lateral movement
+
+Wait, let me re-read. The Q cast condition is `enemy_dist < 1050` and `q_ready` and `my_mp_pct > 0.05`. Enemy is within range (dist ~400-800). Q is ready (cooldown 0). Mana is 100%. 
+
+But wait - the Priority 1 dodge check happens first. Let me look at projectile distances. The projectiles have `dx_to_me` and `dy_to_me` values like (-400, -300), etc. The `distance_to_me` field would be the actual distance. Looking at the observations, many projectiles are listed with dx/dy values suggesting distances of 400-800+ units.
+
+Actually, I think the issue is that the `closest_proj_dist` check catches projectiles at distances under 550, and there are ALWAYS multiple projectiles in the air (Ezreal firing constantly). So the bot is perpetually stuck in dodge mode and never gets to Priority 3 (casting spells).
+
+Looking more carefully at the projectile data - there are always 2-4 projectiles on screen. Some have dx_to_me values that when calculated as distance would be 300-800. So many are within the 550 threshold, causing constant dodging.
+
+**This is the critical bug**: The bot is always in "dodge mode" because Ezreal spams projectiles, so it never reaches the spell casting section.
+
+The fix should be:
+1. **Interleave attacking and dodging** - Don't make dodging completely block attacking
+2. **Cast spells while dodging** - If we need to dodge but also have spells ready, cast the spell THEN dodge, or dodge toward a position where we can also cast
+3. **Be smarter about which projectiles to dodge** - Only dodge projectiles actually heading toward us, not all nearby ones
+4. **Auto-attack** - The bot never uses auto attacks either
+
+Also looking at the projectile data more carefully - some projectiles have negative dx_to_me which might mean they're already past us or moving away. We should only dodge projectiles actually threatening us.
+
+Let me also note: the enemy is an Ezreal mirror match (both are Ezreal based on the projectile names). The bot should be using its own Q, W, E aggressively.
+
+New policy priorities:
+1. **Check if projectiles are actually heading toward us** (not just near us) - use dot product of projectile velocity with position vector
+2. **Cast Q whenever it's up and enemy is in range** - Q is the bread and butter, should be used on cooldown  
+3. **Weave auto attacks between spells**
+4. **Use W for extra damage**
+5. **Dodge only truly threatening projectiles**
+6. **Lead targets slightly with skillshots**
+
+Let me also think about projectile threatening detection. The dx_to_me and dy_to_me represent the projectile's position relative to the player. A projectile is threatening if it's moving toward us. Without velocity direction info directly, we can track if the distance is decreasing. But we do have the projectile name and speed.
+
+Actually, looking at the observation format more carefully: `[owner, dx, dy, speed, name]` - but in the actual observation, the projectiles have `dx_to_me`, `dy_to_me`, `distance_to_me`, `my_team`, `speed`, and `name` fields.
+
+For a projectile to be threatening, it should be moving toward us. We can estimate this by checking if its distance is decreasing between frames, but we only have one frame. Alternatively, projectiles with small `distance_to_me` are worth dodging.
+
+A better heuristic: if a projectile is within ~350 units and close enough to our path, dodge. Otherwise, keep attacking.
+
+Let me write the improved policy:

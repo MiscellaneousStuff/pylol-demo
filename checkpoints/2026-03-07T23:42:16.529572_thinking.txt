@@ -1,0 +1,60 @@
+<thinking>
+Let me analyze the experience data carefully.
+
+Key observations from the experience:
+1. The bot stays at 100% HP the entire time - it never gets hit
+2. The enemy also stays at 100% HP the entire time - the bot never attacks
+3. Gold stays at 35 the entire time - no gold earned
+4. K0D0 throughout - no kills, no deaths
+5. The bot is just orbiting/walking around at ~5800-6100, 6100-6200 range
+6. Enemy is at ~1900-2400, 1600-1800 range
+7. Enemy distance is roughly 1500-2000+ units away (based on dx/dy values like 600-700, 300-400)
+8. All abilities Q/W/E/R are at 0 cooldown the entire time - NEVER USED
+9. Projectiles are all far away (dx/dy values of 500-1700) - they're not threatening
+
+The MASSIVE problem: The bot NEVER casts any spells and NEVER attacks. It's just walking around doing nothing. The enemy distance is too large (>1150 for Q range check), so it never gets close enough to use abilities.
+
+Looking at the distances: enemy_dx values are around 500-800, enemy_dy values around 200-500. So actual enemy_dist = sqrt(dx^2 + dy^2) ≈ sqrt(600^2 + 300^2) ≈ 670. Wait, but looking more carefully...
+
+Wait, the dx/dy values in the ENY field represent the offset. Let me look: `ENY100,100,(2069,1689)` - this is enemy position. My position is like `(5970,6154)`. So the actual distance is sqrt((5970-2069)^2 + (6154-1689)^2) = sqrt(3901^2 + 4465^2) ≈ sqrt(15217801 + 19936225) ≈ sqrt(35154026) ≈ 5929 units.
+
+That's WAY too far! The bot is about 5900 units from the enemy. Q range is typically 1150 for Ezreal. The bot needs to get MUCH closer.
+
+But the policy says if enemy_dist > 1200, approach. Why isn't it approaching? Let me check...
+
+The approach code uses zigzag with `step = min(500, enemy_dist - optimal_range)` where optimal_range = 850. So step = 500. It should be moving toward enemy. But looking at the positions, the bot barely moves toward the enemy over 24 seconds.
+
+Wait - looking at projectiles. All the projectiles have distances like 500-1700. But the enemy is 5900 units away. These projectiles from the enemy are traveling toward the bot. The `distance_to_me` for projectiles would be different from the champion distance.
+
+Actually looking at the policy logic: it checks `nearby_projectiles` (distance < 700) first. If ANY projectile is within 700, it dodges. The projectiles ARE within 700 units of the bot! So the bot is constantly dodging projectiles instead of approaching.
+
+Look at T2263: `PROJ[1073741854,434,211,2000,EzrealMysticShot]` - distance = sqrt(434^2+211^2) ≈ 482. This triggers the nearby_projectiles dodge (< 700).
+
+The bot is perpetually dodging projectiles that are far away and not even threatening, preventing it from ever approaching or attacking! The projectiles at 400-700 range are likely already past the bot or not on a collision course.
+
+Key issues to fix:
+1. **The bot never approaches the enemy** because it's always dodging distant projectiles
+2. **The bot never casts spells** because it never gets in range
+3. **Projectile dodge threshold is too high** - 700 is way too generous, causing constant dodge behavior
+4. **Need to prioritize approaching** over dodging non-threatening projectiles
+5. **Need to check if projectile is actually heading toward us** - not just distance
+
+The fix should:
+1. Reduce dodge thresholds significantly (maybe 250 for urgent, 400 for nearby)
+2. Check if projectile is actually moving toward us (dot product check)
+3. Prioritize approaching enemy and using abilities
+4. Actually get in range to fight
+
+Let me also think about projectile direction. If a projectile has dx=500, dy=300 to me, and it's moving at speed 2000, I need to know if it's moving TOWARD me. The dx/dy seems to be the vector FROM projectile TO me. If the projectile's movement direction aligns with this vector, it's heading toward us. But we don't have projectile direction directly - we'd need to track it across frames or infer from the name.
+
+Actually, looking at the observation spec: "dx/dy shows direction relative to player" and "Negative dx means projectile moving left". Wait no, that's the example format. In the actual data, the projectile fields are [owner, dx, dy, speed, name]. The dx/dy might be the offset from the projectile to me, or the projectile's movement direction.
+
+Given that projectiles are EzrealMysticShot fired from an enemy at position ~(2000, 1700) toward us at ~(5900, 6100), the projectile should be moving in roughly the direction (+3900, +4400). The dx/dy values like (600, 300) seem like position offsets from projectile to me, not velocity.
+
+For a proper dodge, I should check if the projectile is closing in (distance decreasing). But with single-frame data, I need to use heuristics.
+
+Let me write a cleaner policy that:
+1. Aggressively approaches the enemy to get in ability range
+2. Only dodges truly threatening projectiles (very close AND heading toward us)
+3. Fires abilities whenever in range
+4. Uses E offensively or for dodging when needed

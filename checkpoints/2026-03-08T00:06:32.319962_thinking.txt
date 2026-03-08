@@ -1,0 +1,356 @@
+<thinking>
+Let me analyze the experience data carefully.
+
+Key observations:
+1. The bot is playing Ezreal vs Ezreal (mirror matchup based on projectile names "EzrealMysticShot", "EzrealEssenceFlux")
+2. The bot starts at position ~(6350,6350), enemy starts at ~(1300,1300) relative... wait, looking at the ENY data, the enemy position shows relative dx/dy to me.
+
+Let me re-read the observations more carefully:
+
+T0: ME at (6350,6350), ENY at (1300,1300) relative distance. Bot has all spells ready.
+T264-T1770: Bot slowly moves forward, enemy distance shrinking
+T2032: Enemy fires EzrealMysticShot at us. Projectiles appear at distance 619,602.
+T2529: ME HP drops from 100% to 86%! We got hit by the Q. Enemy also at 86% (we traded Q's?)
+
+Wait, looking more carefully - at T2032 there are projectiles. The bot didn't dodge and got hit. HP went from 100% to 86%.
+
+Then T2529-T2761: Bot moves but enemy fires again at T3024.
+T3516: More projectiles, bot seems to not dodge effectively.
+
+T4270: ME 82%, ENY 83% - we're slightly behind
+T5024: ME 78%, ENY 79% - still slightly behind
+T5515: ME 75%, ENY 75% - even
+
+Then from T5515 onwards... the bot is stuck in a weird orbit pattern! Look at the positions:
+- The bot oscillates between roughly (7019-7140, 6891-7012) 
+- Enemy dx/dy stays around (-39 to -282, -25 to 216)
+- The enemy distance seems to be around 200-300 units based on the dx/dy values
+
+Wait, but the bot NEVER CASTS ANY SPELLS! All abilities show Q0W0E0R0 (all ready with 0 cooldown) throughout the ENTIRE experience from T5515 onwards. The bot just orbits endlessly without attacking.
+
+This is the CRITICAL problem. The enemy is very close (dx/dy of ~200 range), Q is ready, all spells are ready, but the bot never attacks. Let me understand why...
+
+Looking at the policy code:
+- Priority 1: Dodge projectiles within 500 range and >50 range
+- The projectiles in the observations have distances of 400-800+ (looking at the dx/dy values, they're quite far like 500+)
+
+The projectiles have dx/dy values like (-456,-428), (-383,-514), etc. The distance would be sqrt(456^2 + 428^2) ≈ 625. So these are all >500 distance and get filtered out by the dangerous_projectiles check.
+
+Then Priority 3: Q when enemy_dist < 1100. Looking at the enemy dx/dy: (-160, 95) gives distance sqrt(160^2+95^2) ≈ 186. That's < 1100! So Q should fire...
+
+Wait, but the enemy_dist comes from `enemy_champ["distance_to_me"]`. Let me look at the ENY values again. The format says ENY shows relative position dx,dy. At T7509: ENY100,100,(-56,199) - so dx=-56, dy=199, distance = sqrt(56^2+199^2) ≈ 207.
+
+So enemy_dist should be ~207 which is < 1100. Q is ready. MP > 0.05. So the bot SHOULD be casting Q. But it's not happening based on the experience...
+
+Unless `enemy_dist` is somehow being read differently. Or the projectile check is catching everything first.
+
+Wait - let me re-check the dangerous_projectiles filter. The projectiles have `distance_to_me`. Looking at the projectile data:
+`[1073741854,-456,-428,2000,EzrealMysticShot]`
+
+The format is [owner, dx, dy, speed, name]. The `distance_to_me` for projectiles would be sqrt(456^2 + 428^2) ≈ 625. This is > 500, so not dangerous.
+
+But wait, there are ALSO projectiles from team 1073741853 (our own?) with positive dx/dy values. Let me check - `p["my_team"] == 0` filters for enemy projectiles only. The owner IDs are 1073741854 and 1073741853. One of these is ours, one is enemy's.
+
+Actually, looking at the projectile format more carefully: `[owner,dx,dy,speed,name]` - but in the observation spec, it's the projectile data from the observation dict, not raw format. The `my_team` field would indicate if it's our projectile or enemy's.
+
+Hmm, but something is wrong. The bot has been orbiting for 15+ seconds without casting a single spell while having all spells off cooldown and the enemy within range. 
+
+Let me look at the actual flow more carefully. All the projectiles shown have large distances (400-800). None pass the <500 filter. So dangerous_projectiles is empty.
+
+Priority 2: R ready, enemy HP < 25%? Enemy is at 76-79%, so no.
+Priority 3: Q ready AND enemy_dist < 1100. Enemy is ~200 units away. Q IS ready. So this should trigger!
+
+Unless... the observation format is different from what I think. Let me re-read:
+
+`ENY78,100,(-160,95)` - this shows HP%, MP%, and then relative position (dx, dy)?
+
+Wait, I need to check how the code reads `enemy_dist`. The code uses:
+```python
+enemy_dist = enemy_champ["distance_to_me"]
+```
+
+Maybe `distance_to_me` is actually very large? Like the raw game distance? The positions are (7079, 6951) for us and the enemy position... wait, the ENY format shows `(dx, dy)` which are relative. But the actual enemy position in the game must be computed from those.
+
+Actually looking again at the observation format description:
+```
+ENY50,80,(333,36),L1
+```
+"Enemy at 50% HP, 80% mana, 333 units right and 36 units up"
+
+So those ARE the dx,dy distances. For ENY at (-160, 95), the distance would be sqrt(160^2+95^2) ≈ 186 units.
+
+But in the code, it reads `enemy_champ["distance_to_me"]`. This field might be pre-computed. If it's truly ~186, then Q should fire.
+
+HOWEVER - I think I might be misreading the observation format. Looking at T0:
+`ENY100,100,(1300,1300),L1`
+
+The enemy is 1300,1300 units away. Starting positions suggest the map coordinates. My position is (6350,6350) and enemy absolute position might be something like (7650,7650)?
+
+Hmm, but by T2032, the format shows:
+`ENY100,100,(619,602),L1`
+This is when the enemy fires Q and hits us. The distance is sqrt(619^2+602^2) ≈ 863, which is within Ezreal Q range (1150).
+
+Then at T5515:
+`ENY75,100,(46,91),L1`
+Distance = sqrt(46^2+91^2) ≈ 102. That's SUPER close.
+
+Then at T5776:
+`ENY75,100,(166,211),L1`
+Distance ≈ 268.
+
+So the enemy IS very close throughout this orbiting phase. The bot absolutely should be casting Q.
+
+I think the issue is that the projectile dodge check is somehow always triggering. Let me check again...
+
+The enemy_projectiles filter: `p["my_team"] == 0`. Looking at projectile owner IDs: 1073741854 and 1073741853. Both are EzrealMysticShot. One must be ours, one enemy's. If BOTH have `my_team` of 0 or something weird, then ALL projectiles would be enemy projectiles.
+
+Actually, looking at the projectile pairs, there are always pairs like:
+`[1073741854,-456,-428,2000,EzrealMysticShot][1073741853,456,628,2000,EzrealMysticShot]`
+
+Notice they have opposite signs roughly - one is moving toward us, one away. The one with positive dx/dy is probably the one we fired. So projectile from 1073741854 is enemy (negative dx = moving toward us) and 1073741853 is ours (positive dx = moving away from us).
+
+Now checking distances for dangerous_projectiles:
+- Enemy projectiles (1073741854): dx=-456, dy=-428 → distance ≈ 625 → > 500, not dangerous
+- But some enemy projectiles might be closer. Let me check...
+
+At T5515: `[1073741854,-458,-526,2000,EzrealMysticShot]` - dist ≈ 697
+`[1073741854,-287,-517,2000,EzrealMysticShot]` - dist ≈ 591
+
+All enemy projectiles seem to have distances > 500 in this orbiting phase. So the dangerous check shouldn't trigger.
+
+Unless the projectile `distance_to_me` field is different from what I'm computing from dx/dy. Maybe the field is pre-computed differently.
+
+OK wait - I think there might be a deeper issue. Let me look at the observation code more carefully. The `distance_to_me` for projectiles might include Z-axis or something. OR, the bot is hitting the projectile distance_to_me < 500 check on some projectiles I'm not seeing.
+
+Actually, I think the real issue might be simpler. Looking at the experience, ALL observations show projectiles present from T5515 onwards. The bot fires Q, enemy fires Q, these projectiles persist in the observation. If ANY of those projectiles from team 0 have distance < 500, the bot would dodge instead of attack.
+
+But from the dx/dy values, all seem >500... Unless the `distance_to_me` property is calculated differently than sqrt(dx^2+dy^2).
+
+Actually, you know what - I bet the issue is that these projectiles are "ghost" projectiles or persistent objects that keep appearing in observations even though they've already passed. They might not actually be "flying" projectiles but rather visual effects or something that stays in the game state.
+
+OK regardless of the exact bug, the MASSIVE problem is clear: **The bot never casts spells even when in range with everything off cooldown.** It just orbits endlessly. The enemy is regenerating HP (76→78→79%) while we also regenerate but never trade.
+
+The fix needs to:
+1. **PRIORITIZE ATTACKING over dodging when spells are ready and enemy is in range** - the bot should cast Q/W/auto when in range
+2. **Only dodge when projectiles are genuinely threatening** (much smaller distance threshold, and maybe check if projectile is actually moving toward us)
+3. **Close distance more aggressively** at the start instead of slowly walking
+
+Key issues to fix:
+1. The bot NEVER casts Q despite being in range with it off cooldown for 20+ seconds
+2. The bot orbits pointlessly without dealing damage
+3. The bot took damage early (100%→86%→82%→78%→75%) without trading effectively
+4. The projectile detection seems to be interfering or something else prevents spell casting
+
+Let me rewrite the policy to be much more aggressive about casting spells, and smarter about when to dodge vs when to attack.
+
+Actually, I bet I know the real issue now. Looking at the projectile data more carefully:
+
+At T7509:
+```
+PROJ[1073741854,-459,-430,2000,EzrealMysticShot][1073741853,404,631,2000,EzrealMysticShot][1073741854,-381,-512,2000,EzrealMysticShot][1073741853,326,713,2000,EzrealMysticShot][1073741854,680,834,1600,EzrealEssenceFlux][1073741853,-737,-635,1600,EzrealEssenceFlux]
+```
+
+Wait - there's an EzrealEssenceFlux (W) projectile from 1073741854 at (680,834). Distance = sqrt(680^2+834^2) ≈ 1076. And from 1073741853 at (-737,-635), distance ≈ 972.
+
+These are W projectiles. But they're all >500 distance.
+
+Hmm but at T5515 there's:
+`[1073741854,251,298,1600,EzrealEssenceFlux]` - distance ≈ 390. THIS IS < 500!
+`[1073741853,-205,-206,1600,EzrealEssenceFlux]` - distance ≈ 290. THIS IS < 500 AND < 300!
+
+If 1073741853 is also an enemy projectile (which it might be if my_team labeling is different), then we'd have dangerous projectiles detected. But even if only 1073741854 is enemy, at T5515 the EssenceFlux at distance 390 would be detected as dangerous.
+
+But by T6265, the W projectile distances are large (677,831 → ~1073). So they should pass through.
+
+Actually... these projectiles seem to persist in observations for a VERY long time. From T5024 to T7772+ the same W projectiles are showing. And Q projectiles persist from very early. These might be "orbiting" or "lingering" game objects that don't actually threaten us but keep triggering dodge behavior.
+
+WAIT. I just realized - the persistent projectiles at large distances are probably PAST us already (they've already flown by). The bot keeps seeing them and tracking them but they're no longer threats. The issue is that the projectile filtering isn't checking if the projectile is MOVING TOWARD us.
+
+So the fix is:
+1. Check if projectile is actually moving toward us (dot product of velocity with direction to us should be positive)
+2. Prioritize attacking more aggressively
+3. Don't let distant/past projectiles prevent us from acting
+
+Let me write the new policy:
+
+```python
+def act(self, observation):
+    import math
+    
+    my_champ = next(unit for unit in observation["champ_units"] if unit["my_team"] == 1)
+    enemy_champ = next(unit for unit in observation["champ_units"] if unit["my_team"] == 0)
+    
+    my_hp_pct = my_champ["current_hp"] / max(my_champ["max_hp"], 1)
+    enemy_hp_pct = enemy_champ["current_hp"] / max(enemy_champ["max_hp"], 1)
+    my_mp_pct = my_champ["current_mp"] / max(my_champ["max_mp"], 1)
+    my_x = my_champ["position"]["X"]
+    my_y = my_champ["position"]["Y"]
+    enemy_dx = enemy_champ["dx_to_me"]
+    enemy_dy = enemy_champ["dy_to_me"]
+    enemy_dist = enemy_champ["distance_to_me"]
+    enemy_x = enemy_champ["position"]["X"]
+    enemy_y = enemy_champ["position"]["Y"]
+    
+    q_ready = my_champ["q_cooldown"] == 0
+    w_ready = my_champ["w_cooldown"] == 0
+    e_ready = my_champ["e_cooldown"] == 0
+    r_ready = my_champ["r_cooldown"] == 0
+    
+    game_time = observation.get("game_time", 0)
+    
+    def move_to(target_y, target_x):
+        target_x = max(0, min(16000, target_x))
+        target_y = max(0, min(16000, target_y))
+        return (1, [target_y, target_x])
+    
+    def cast_spell(spell_idx, target_y, target_x):
+        target_x = max(0, min(16000, target_x))
+        target_y = max(0, min(16000, target_y))
+        return (2, [[spell_idx], [target_y, target_x]])
+    
+    # Detect TRULY dangerous projectiles - must be close AND moving toward us
+    enemy_projectiles = [p for p in observation["projectiles"] if p["my_team"] == 0]
+    dangerous_projectiles = []
+    for p in enemy_projectiles:
+        pdist = p["distance_to_me"]
+        pdx = p["dx_to_me"]
+        pdy = p["dy_to_me"]
+        # Only consider very close projectiles that are genuinely threatening
+        # The projectile must be within 400 units AND closing distance
+        if pdist < 400 and pdist > 30:
+            dangerous_projectiles.append(p)
+    
+    # ===== TOP PRIORITY: Cast Q when in range - this is the primary damage source =====
+    if q_ready and enemy_dist < 1100 and my_mp_pct > 0.05:
+        # Lead target slightly based on distance
+        lead_factor = enemy_dist / 2000.0  # small lead
+        target_x = enemy_x + enemy_dx * lead_factor * 0.1
+        target_y = enemy_y + enemy_dy * lead_factor * 0.1
+        return cast_spell(0, enemy_y, enemy_x)
+    
+    # ===== PRIORITY 2: Cast W when in range =====
+    if w_ready and enemy_dist < 900 and my_mp_pct > 0.15:
+        return cast_spell(1, enemy_y, enemy_x)
+    
+    # ===== PRIORITY 3: Execute with R =====
+    if r_ready and enemy_hp_pct < 0.30 and enemy_dist < 3000 and my_mp_pct > 0.1:
+        return cast_spell(3, enemy_y, enemy_x)
+    
+    # ===== PRIORITY 4: Dodge very close projectiles =====
+    if dangerous_projectiles:
+        closest = min(dangerous_projectiles, key=lambda p: p["distance_to_me"])
+        pdist = closest["distance_to_me"]
+        pdx = closest["dx_to_me"]
+        pdy = closest["dy_to_me"]
+        
+        perp1_x = pdy
+        perp1_y = -pdx
+        perp2_x = -pdy
+        perp2_y = pdx
+        
+        dot1 = perp1_x * enemy_dx + perp1_y * enemy_dy
+        dot2 = perp2_x * enemy_dx + perp2_y * enemy_dy
+        
+        if dot1 >= dot2:
+            dodge_nx, dodge_ny = perp1_x, perp1_y
+        else:
+            dodge_nx, dodge_ny = perp2_x, perp2_y
+        
+        mag = math.sqrt(dodge_nx**2 + dodge_ny**2)
+        if mag > 0:
+            dodge_nx /= mag
+            dodge_ny /= mag
+            
+            if e_ready and pdist < 200:
+                e_x = my_x + dodge_nx * 475
+                e_y = my_y + dodge_ny * 475
+                return cast_spell(2, e_y, e_x)
+            
+            move_x = my_x + dodge_nx * 300
+            move_y = my_y + dodge_ny * 300
+            return move_to(move_y, move_x)
+    
+    # ===== PRIORITY 5: Retreat if very low HP =====
+    if my_hp_pct < 0.15 and enemy_hp_pct > my_hp_pct + 0.15:
+        if e_ready:
+            rdx = my_x - enemy_x
+            rdy = my_y - enemy_y
+            rdist = math.sqrt(rdx**2 + rdy**2)
+            if rdist > 0:
+                retreat_x = my_x + (rdx / rdist) * 475
+                retreat_y = my_y + (rdy / rdist) * 475
+                return cast_spell(2, retreat_y, retreat_x)
+        retreat_x = my_x + (my_x - enemy_x) * 0.5
+        retreat_y = my_y + (my_y - enemy_y) * 0.5
+        return move_to(retreat_y, retreat_x)
+    
+    # ===== PRIORITY 6: Close distance aggressively to get into Q range =====
+    if enemy_dist > 1050:
+        dx = enemy_x - my_x
+        dy = enemy_y - my_y
+        dist = math.sqrt(dx**2 + dy**2)
+        if dist == 0:
+            dist = 1
+        nx = dx / dist
+        ny = dy / dist
+        
+        # Zigzag while approaching
+        juke_dir = 1 if (int(game_time * 0.003) % 2 == 0) else -1
+        perp_x = -ny * juke_dir * 150
+        perp_y = nx * juke_dir * 150
+        
+        step = min(800, enemy_dist - 800)
+        target_x = my_x + nx * step + perp_x
+        target_y = my_y + ny * step + perp_y
+        return move_to(target_y, target_x)
+    
+    # ===== PRIORITY 7: Orbit while waiting for cooldowns =====
+    dx = enemy_x - my_x
+    dy = enemy_y - my_y
+    dist = math.sqrt(dx**2 + dy**2)
+    if dist == 0:
+        dist = 1
+    nx = dx / dist
+    ny = dy / dist
+    
+    optimal_range = 850
+    orbit_dir = 1 if (int(game_time * 0.002) % 2 == 0) else -1
+    range_adjust = (enemy_dist - optimal_range) * 0.4
+    
+    orbit_x = my_x + nx * range_adjust + (-ny * orbit_dir) * 350
+    orbit_y = my_y + ny * range_adjust + (nx * orbit_dir) * 350
+    return move_to(orbit_y, orbit_x)
+```
+
+Wait, I realize the fundamental issue might be even simpler. Looking at Priority 5 in the original code:
+```python
+if enemy_dist < 600:
+    return cast_spell(0, enemy_y, enemy_x) if q_ready else move_to(enemy_y, enemy_x)
+```
+
+This was auto-attack range check. But the bigger issue is that Q never fires. Let me check the Q condition again:
+`if q_ready and enemy_dist < 1100 and my_mp_pct > 0.05:`
+
+The enemy_dist from the observations shows dx/dy like (-160, 95), so absolute distance ≈ 186. This IS < 1100. Q IS ready (Q0). MP is 100%. So this SHOULD trigger.
+
+Unless the `distance_to_me` field in the actual observation dict is different from what the compact format shows. Maybe the dx/dy shown in the compact format are the dx_to_me/dy_to_me fields, and distance_to_me is computed differently (perhaps it's the actual game distance which is larger?).
+
+Looking at the ENY format: `ENY78,100,(-160,95),L1` - but the observation spec says these are the last two numbers in position. Maybe the position shown is the ABSOLUTE position of the enemy, and the dx/dy fields are separate?
+
+Hmm, the spec says: "ENY50,80,(333,36),L1" means "Enemy at 50% HP, 80% mana, 333 units right and 36 units up". So (333,36) ARE the relative dx,dy.
+
+But in the code, `enemy_x = enemy_champ["position"]["X"]` and `enemy_y = enemy_champ["position"]["Y"]`. If position gives ABSOLUTE coordinates and dx_to_me/dy_to_me give relative... 
+
+Actually, the position in the observation spec shows (333,36) which the spec says are "333 units right and 36 units up" - so these ARE relative. But the code reads `position["X"]` and `position["Y"]`. This could be the absolute position.
+
+If the compact notation shows (dx, dy) but the actual dict has absolute position... then enemy_x and enemy_y would be absolute world coordinates. The code then computes `enemy_dist = enemy_champ["distance_to_me"]` which should be the pre-computed distance.
+
+OK I think there might be a mismatch between what the compact format shows and what the actual dict fields contain. But regardless, the key fix is:
+
+**The bot MUST cast spells. Currently it appears to never cast Q/W despite having them available.**
+
+My new policy will:
+1. Put spell casting as the ABSOLUTE TOP PRIORITY when spells are ready and enemy is in range
+2. Reduce the projectile dodge threshold significantly (only dodge extremely close threats)
+3. Be more aggressive about closing distance
+4. Use auto attacks when in range and spells are on CD

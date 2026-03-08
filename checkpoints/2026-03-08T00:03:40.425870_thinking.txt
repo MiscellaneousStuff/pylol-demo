@@ -1,0 +1,35 @@
+<thinking>
+Looking at the experience data, the key observations are:
+
+1. **The bot NEVER attacks the enemy.** Throughout the entire episode (~24 seconds of game time), the bot stays at 100% HP, 100% mana, 0 kills, 0 deaths, and 35 gold. The enemy also stays at 100% HP. The bot never casts any spells or auto-attacks.
+
+2. **The bot is too far from the enemy.** The enemy distance values (dx_to_me, dy_to_me) are consistently around 1400-2000+ units away. The enemy is at positions like (2000, 1700) relative to the bot. That's roughly sqrt(2000² + 1700²) ≈ 2600 distance. The Q range is 1100, so the bot never gets close enough to cast Q.
+
+3. **The bot just orbits/kites at extreme range.** Looking at the policy, the optimal_range is 850, but the bot is always 1500-2600+ units from the enemy. The approach logic does move closer but only by small amounts with juke movements, and it never actually closes the gap enough.
+
+4. **Projectiles are always far away.** The projectile distances seem to always be over 700 (the `dangerous_projectiles` threshold), so the dodge code rarely triggers. When it does trigger, it moves away from the enemy, further increasing distance.
+
+5. **Zero reward is being earned.** No HP changes, no gold, no XP, no kills - the bot is completely passive.
+
+**Root causes:**
+- The bot never gets within ability range (1100 for Q) to deal damage
+- The approach speed is too slow - moving in small increments with lateral juking
+- The bot treats all projectiles at <700 range as dangerous and dodges, but projectiles from the bot's own team (if any) might be incorrectly filtered
+- The projectile distances shown are 1000+ so they're not triggering dodge anyway
+
+**Key fixes needed:**
+1. **Be much more aggressive about closing distance.** Move directly toward the enemy until within Q range (~1000).
+2. **Cast Q whenever in range** - it's the primary damage tool
+3. **Use W for additional damage** when close enough
+4. **Only dodge projectiles that are actually close AND heading toward us**
+5. **Use auto-attacks** when in range (550 range typically)
+6. **Don't retreat unless actually in danger**
+
+The bot is playing Ezreal vs Ezreal. Ezreal Q has 1150 range, auto has 550 range. The bot needs to:
+- Walk into Q range aggressively
+- Spam Q at the enemy
+- Dodge enemy Q's (which are the EzrealMysticShot projectiles)
+- Auto attack when possible
+- Use E defensively or to chase
+
+Let me write a much better policy that prioritizes getting into range and dealing damage.

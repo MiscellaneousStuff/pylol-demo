@@ -1,0 +1,544 @@
+
+You are T1 Faker, the best league of legends player in the world.
+
+You are observing the behaviour of an autonomous League of Legends scripting bot.
+The bot is currently acting on a hand-crafted python based policy.
+You will be provided the observations, actions and calculated reward for each timestep in game.
+
+You must improve the policy of the agent based on its gathered experience playing the game.
+You must determine instances where either its reward dropped immediately, or it performed
+an action later down the line which caused its reward to drop (getting hit by an enemy projectile,
+dying, etc.)
+
+<priority value='LIFE AND DEATH' Crucially, limit your thinking to under 1000 words. We want fast iteration.</priority>
+
+<reward-shaping>
+def calc_reward(self, last_obs, obs):
+  # Returns the cumulative reward for an observation.
+
+  reward = 0
+
+  # Winning (+5) Zero-Sum
+  winning_weighting = 5.0
+  if self._state == environment.StepType.LAST: # Last observation for episode
+      if obs["me_unit"].kill_count > obs["enemy_unit"].kill_count:
+          winning_reward = winning_weighting
+      elif obs["me_unit"].kill_count < last_obs["enemy_unit"].kill_count:
+          winning_reward = -winning_weighting
+      else:
+          winning_reward = 0
+      reward += winning_reward
+      print("Winning Reward:",
+        winning_reward,
+        obs["me_unit"].kill_count,
+        obs["enemy_unit"].kill_count)
+
+  # Death (-1)
+  death_weighting = -1
+  death_reward = 0
+  if obs["me_unit"].death_count > last_obs["me_unit"].death_count:
+      death_reward += death_weighting
+  if obs["enemy_unit"].death_count > last_obs["enemy_unit"].death_count:
+      death_reward += -death_weighting
+  if obs["me_unit"].death_count == last_obs["me_unit"].death_count and           obs["enemy_unit"].death_count == last_obs["enemy_unit"].death_count:
+      death_reward = 0
+  reward += death_reward
+  # print("Death Reward:", death_reward)
+
+  # XP Gained (+0.002) Zero-Sum
+  xp_weighting = 0.002
+  me_xp_diff = obs["me_unit"].current_xp - last_obs["me_unit"].current_xp
+  me_xp_reward = me_xp_diff * xp_weighting
+  enemy_xp_diff = obs["enemy_unit"].current_xp - last_obs["enemy_unit"].current_xp
+  enemy_xp_reward = -(enemy_xp_diff * xp_weighting)
+  xp_reward = me_xp_reward + enemy_xp_reward # Zero-Sum
+  reward += xp_reward
+  # print("XP Reward:", xp_reward)
+  
+  # Gold Gained (+0.006) Zero-Sum
+  gold_weighting = 0.006
+  me_gold_diff = obs["me_unit"].current_gold - last_obs["me_unit"].current_gold
+  me_gold_reward = me_gold_diff * gold_weighting
+  enemy_gold_diff = obs["enemy_unit"].current_gold - last_obs["enemy_unit"].current_gold
+  enemy_gold_reward = -(enemy_gold_diff * gold_weighting)
+  gold_reward = me_gold_reward + enemy_gold_reward
+  reward += gold_reward
+  # print("Gold Reward:", gold_reward)
+
+  # Health Changed (+2) Zero-Sum
+  hp_weighting = 2.0
+  def hp_change_to_reward(x): return (x + 1 - (1 - x)**4) / 2
+  me_cur_hp_diff  = obs["me_unit"].current_hp / obs["me_unit"].max_hp
+  me_last_hp_diff = last_obs["me_unit"].current_hp / last_obs["me_unit"].max_hp
+  me_hp_diff = me_cur_hp_diff - me_last_hp_diff
+  me_hp_reward = hp_change_to_reward(me_hp_diff) * hp_weighting
+
+  enemy_cur_hp_diff  = obs["enemy_unit"].current_hp / obs["enemy_unit"].max_hp
+  enemy_last_hp_diff = last_obs["enemy_unit"].current_hp / last_obs["enemy_unit"].max_hp
+  enemy_hp_diff = enemy_cur_hp_diff - enemy_last_hp_diff
+  enemy_hp_reward = -(hp_change_to_reward(enemy_hp_diff) * hp_weighting)
+
+  hp_reward = me_hp_reward + enemy_hp_reward
+  reward += hp_reward
+  # print("HP Reward:", hp_reward)
+
+  # Mana Changed (+0.75)
+  mp_weighting = 0.75
+  me_cur_mp_diff  = obs["me_unit"].current_mp / obs["me_unit"].max_mp
+  me_last_mp_diff = last_obs["me_unit"].current_mp / last_obs["me_unit"].max_mp
+  me_mp_diff = me_cur_mp_diff - me_last_mp_diff
+  me_mp_reward = me_mp_diff * mp_weighting
+
+  enemy_cur_mp_diff  = obs["enemy_unit"].current_mp / obs["enemy_unit"].max_mp
+  enemy_last_mp_diff = last_obs["enemy_unit"].current_mp / last_obs["enemy_unit"].max_mp
+  enemy_mp_diff = enemy_cur_mp_diff - enemy_last_mp_diff
+  enemy_mp_reward = -(enemy_mp_diff * mp_weighting)
+
+  mp_reward = me_mp_reward + enemy_mp_reward
+  reward += mp_reward
+  # print("MP Reward:", mp_reward)
+
+  # Killed Hero (+1, -0.6)
+  kill_weighting = +1
+  kill_reward = 0
+  if obs["me_unit"].kill_count > last_obs["me_unit"].kill_count:
+      kill_diff = obs["me_unit"].kill_count - last_obs["me_unit"].kill_count
+      kill_reward += kill_diff * kill_weighting
+  if obs["enemy_unit"].kill_count > last_obs["enemy_unit"].kill_count:
+      kill_diff = obs["enemy_unit"].kill_count - last_obs["enemy_unit"].kill_count
+      kill_reward += -(kill_diff * kill_weighting)
+  if obs["me_unit"].kill_count == last_obs["me_unit"].kill_count and           obs["enemy_unit"].kill_count == last_obs["enemy_unit"].kill_count:
+      kill_reward = 0
+  reward += kill_reward
+  # print("Kill Reward:", kill_reward)
+
+  # Lane Assignment (-0.15 * seconds out of assigned lane)
+  pass # Empty for now, not primary concern
+  
+  # print("Reward:", reward, end = "
+
+")
+  return reward
+</reward-shaping>
+
+<observation-spec>
+
+The observation data represents a League of Legends game state. Let me explain the key parts:
+
+1. Time Format (T{seconds}):
+   Shows game time in seconds
+   
+2. Champion State (ME/ENY):
+   - Health/Mana as percentages
+   - Position as (y, x) coordinates
+   - Level and gold
+   - Kills/Deaths
+   
+3. Ability Status (QWER):
+   - Cooldowns in seconds
+   - 0 means ability is ready
+   
+4. Projectiles (PROJ):
+   - Each [owner,dx,dy,speed,name]
+   - dx/dy shows direction relative to player
+   - Negative dx means projectile moving left
+   - Negative dy means projectile moving down
+   
+5. Available Actions (ACT):
+   - List of currently possible actions
+   - move: Can move
+   - auto: Can auto attack
+   - q/w/e/r: Can cast abilities
+
+For example:
+T12262|ME80,100,(9553,9271),L1,G35,K0D0|Q0W0E0R0|ENY50,80,(333,36),L1|PROJ[1234,-100,50,2000,EzQ]|ACT[move,q]
+
+This shows:
+- 12262 seconds into game
+- I'm at 80% HP, full mana, position (9553,9271)
+- Level 1, 35 gold, no kills/deaths
+- All abilities ready (0 cooldown)
+- Enemy at 50% HP, 80% mana, 333 units right and 36 units up
+- One enemy projectile moving left and slightly up
+
+This format preserves all tactical information while being much more compact than raw JSON.
+
+</observation-spec>
+
+<action-spec>
+
+<spell_options>
+SPELL_OPTIONS = (
+    ("Q", 0),
+    ("W", 1),
+    ("E", 2),
+    ("R", 3),
+    ("Sum1", 4),
+    ("Sum2", 5)
+)
+</spell_options>
+<action_ids>
+0 - no_op
+1 - move
+2 - spell
+</action_ids>
+<arg_type>
+Point - (y, x) (Range between 0 and 16000 inclusive)
+</arg_type>
+<action_args>
+no_op - None
+move  - Point (y, x)
+spell - Spell Option, Point
+</action_args>
+
+<example>
+<action_name>spell</action_name>
+<action_id>2</action_id>
+<action_args>
+[[0],[0, 8000]]
+</action_args>
+</example>
+
+</action-spec>
+
+<current-policy>
+def act(self, observation):
+    import math
+
+    my_champ = next(unit for unit in observation["champ_units"] if unit["my_team"] == 1)
+    enemy_champ = next(unit for unit in observation["champ_units"] if unit["my_team"] == 0)
+
+    my_hp_pct = my_champ["current_hp"] / max(my_champ["max_hp"], 1)
+    enemy_hp_pct = enemy_champ["current_hp"] / max(enemy_champ["max_hp"], 1)
+    my_mp_pct = my_champ["current_mp"] / max(my_champ["max_mp"], 1)
+    my_x = my_champ["position"]["X"]
+    my_y = my_champ["position"]["Y"]
+    enemy_dx = enemy_champ["dx_to_me"]
+    enemy_dy = enemy_champ["dy_to_me"]
+    enemy_dist = math.sqrt(enemy_dx**2 + enemy_dy**2)
+    enemy_x = my_x + enemy_dx
+    enemy_y = my_y + enemy_dy
+
+    q_ready = my_champ["q_cooldown"] == 0
+    w_ready = my_champ["w_cooldown"] == 0
+    e_ready = my_champ["e_cooldown"] == 0
+    r_ready = my_champ["r_cooldown"] == 0
+
+    game_time = observation.get("game_time", 0)
+
+    def move_to(target_y, target_x):
+        target_x = max(0, min(16000, target_x))
+        target_y = max(0, min(16000, target_y))
+        return (1, [target_y, target_x])
+
+    def cast_spell(spell_idx, target_y, target_x):
+        target_x = max(0, min(16000, target_x))
+        target_y = max(0, min(16000, target_y))
+        return (2, [[spell_idx], [target_y, target_x]])
+
+    # Track state for alternating attack/move via game_time
+    # Use a simple frame-based approach: cast spell, then move, then cast, etc.
+    # We want to kite: spell -> move -> spell -> move
+    
+    # Check for extremely close enemy projectiles that we MUST dodge
+    enemy_projectiles = [p for p in observation["projectiles"] if p["my_team"] == 0]
+    imminent_threat = None
+    for p in enemy_projectiles:
+        pdist = p["distance_to_me"]
+        if pdist < 250 and pdist > 20:
+            if imminent_threat is None or pdist < imminent_threat["distance_to_me"]:
+                imminent_threat = p
+
+    # If a projectile is EXTREMELY close, dodge with E or sidestep
+    if imminent_threat is not None:
+        pdx = imminent_threat["dx_to_me"]
+        pdy = imminent_threat["dy_to_me"]
+        pdist = imminent_threat["distance_to_me"]
+        
+        # Perpendicular dodge
+        perp1_x = pdy
+        perp1_y = -pdx
+        perp2_x = -pdy
+        perp2_y = pdx
+        
+        # Pick direction closer to enemy (aggressive dodge)
+        dot1 = perp1_x * enemy_dx + perp1_y * enemy_dy
+        dot2 = perp2_x * enemy_dx + perp2_y * enemy_dy
+        
+        if dot1 >= dot2:
+            dodge_nx, dodge_ny = perp1_x, perp1_y
+        else:
+            dodge_nx, dodge_ny = perp2_x, perp2_y
+        
+        mag = math.sqrt(dodge_nx**2 + dodge_ny**2)
+        if mag > 0:
+            dodge_nx /= mag
+            dodge_ny /= mag
+            
+            # Use E for very close projectiles if HP is low
+            if e_ready and pdist < 150 and my_hp_pct < 0.5:
+                e_x = my_x + dodge_nx * 475
+                e_y = my_y + dodge_ny * 475
+                return cast_spell(2, e_y, e_x)
+            
+            move_x = my_x + dodge_nx * 350
+            move_y = my_y + dodge_ny * 350
+            return move_to(move_y, move_x)
+
+    # ===== ATTACK PHASE: Use spells aggressively =====
+    
+    # Lead the target: predict where enemy is moving
+    # Simple lead: aim slightly ahead in the direction enemy appears to be moving
+    # Since we don't have velocity, aim at enemy position with slight offset
+    # Use a small random-ish offset based on game_time to vary aim
+    lead_offset = 80  # Small lead amount
+    # Vary lead direction to be unpredictable
+    lead_angle = (game_time * 0.007) % (2 * math.pi)
+    lead_x = enemy_x + math.cos(lead_angle) * lead_offset
+    lead_y = enemy_y + math.sin(lead_angle) * lead_offset
+
+    # Q - Primary damage, 1150 range, cast whenever ready
+    if q_ready and enemy_dist < 1150 and my_mp_pct > 0.05:
+        return cast_spell(0, lead_y, lead_x)
+
+    # W - Secondary poke, 950 range
+    if w_ready and enemy_dist < 950 and my_mp_pct > 0.15:
+        return cast_spell(1, lead_y, lead_x)
+
+    # R - Execute low HP enemies from any range
+    if r_ready and enemy_hp_pct < 0.25 and my_mp_pct > 0.1 and enemy_dist < 3000:
+        return cast_spell(3, enemy_y, enemy_x)
+
+    # ===== LOW HP: Retreat if very low =====
+    if my_hp_pct < 0.15 and enemy_hp_pct > my_hp_pct + 0.15:
+        if e_ready and enemy_dist < 600:
+            if enemy_dist > 0:
+                retreat_x = my_x - (enemy_dx / enemy_dist) * 475
+                retreat_y = my_y - (enemy_dy / enemy_dist) * 475
+                return cast_spell(2, retreat_y, retreat_x)
+        retreat_x = my_x - enemy_dx * 0.5
+        retreat_y = my_y - enemy_dy * 0.5
+        return move_to(retreat_y, retreat_x)
+
+    # ===== MOVEMENT PHASE: Kite and position while spells are on cooldown =====
+    
+    # If we're too far, close the distance aggressively
+    if enemy_dist > 1050:
+        if enemy_dist > 0:
+            nx = enemy_dx / enemy_dist
+            ny = enemy_dy / enemy_dist
+        else:
+            nx, ny = 0, 0
+        
+        # Zigzag approach - change direction more frequently for unpredictability
+        juke_phase = math.sin(game_time * 0.012) 
+        perp_x = -ny * juke_phase * 200
+        perp_y = nx * juke_phase * 200
+        
+        step = min(600, enemy_dist - 700)
+        target_x = my_x + nx * step + perp_x
+        target_y = my_y + ny * step + perp_y
+        return move_to(target_y, target_x)
+
+    # Optimal kiting range: stay at ~800-900 for Q range but dodge-able
+    # Move erratically while maintaining range
+    if enemy_dist > 0:
+        nx = enemy_dx / enemy_dist
+        ny = enemy_dy / enemy_dist
+    else:
+        nx, ny = 1, 0
+
+    # Target range of ~850 units (comfortable Q range with room to dodge)
+    optimal_range = 850
+    range_diff = enemy_dist - optimal_range
+    
+    # Erratic lateral movement - use sine waves with different frequencies
+    # to create unpredictable movement patterns that are hard to predict
+    t = game_time * 0.001
+    lateral_amount = math.sin(t * 7.3) * 250 + math.sin(t * 13.1) * 150
+    
+    # Move toward/away from optimal range + lateral juke
+    move_x = my_x + nx * range_diff * 0.5 + (-ny) * lateral_amount
+    move_y = my_y + ny * range_diff * 0.5 + (nx) * lateral_amount
+    
+    return move_to(move_y, move_x)
+</current-policy>
+
+<experience>
+T33|ME88,100,(26,280),L1,G35,K0D0|Q0W0E0R0|ENY88,100,(13901,13895),L1|PROJ|ACT[no_op,move,auto,spell_0,spell_1,spell_2,spell_3,spell_4,spell_5]
+T0|ME100,100,(6350,6350),L1,G35,K0D0|Q0W0E0R0|ENY100,100,(1300,1300),L1|PROJ|ACT[no_op,move,auto,spell_0,spell_1,spell_2,spell_3,spell_4,spell_5]
+T262|ME100,100,(6350,6350),L1,G35,K0D0|Q0W0E0R0|ENY100,100,(1300,1300),L1|PROJ|ACT[no_op,move,auto,spell_0,spell_1,spell_2,spell_3,spell_4,spell_5]
+T525|ME100,100,(6410,6410),L1,G35,K0D0|Q0W0E0R0|ENY100,100,(1179,1179),L1|PROJ|ACT[no_op,move,auto,spell_0,spell_1,spell_2,spell_3,spell_4,spell_5]
+T756|ME100,100,(6463,6463),L1,G35,K0D0|Q0W0E0R0|ENY100,100,(1073,1073),L1|PROJ|ACT[no_op,move,auto,spell_0,spell_1,spell_2,spell_3,spell_4,spell_5]
+T1018|ME100,100,(6523,6523),L1,G35,K0D0|Q0W0E0R0|ENY100,100,(952,952),L1|PROJ|ACT[no_op,move,auto,spell_0,spell_1,spell_2,spell_3,spell_4,spell_5]
+T1279|ME100,100,(6583,6583),L1,G35,K0D0|Q0W0E0R0|ENY100,100,(832,832),L1|PROJ|ACT[no_op,move,auto,spell_0,spell_1,spell_2,spell_3,spell_4,spell_5]
+T1508|ME100,100,(6643,6628),L1,G35,K0D0|Q0W0E0R0|ENY100,100,(713,743),L1|PROJ|ACT[no_op,move,auto,spell_0,spell_1,spell_2,spell_3,spell_4,spell_5]
+T1774|ME100,100,(6712,6679),L1,G35,K0D0|Q0W0E0R0|ENY100,100,(575,640),L1|PROJ|ACT[no_op,move,auto,spell_0,spell_1,spell_2,spell_3,spell_4,spell_5]
+T2005|ME100,100,(6712,6679),L1,G35,K0D0|Q0W0E0R0|ENY100,100,(575,640),L1|PROJ|ACT[no_op,move,auto,spell_0,spell_1,spell_2,spell_3,spell_4,spell_5]
+T2268|ME100,100,(6712,6679),L1,G35,K0D0|Q0W0E0R0|ENY100,100,(575,640),L1|PROJ[1073741854,246,319,2000,EzrealMysticShot][1073741853,310,339,2000,EzrealMysticShot]|ACT[no_op,move,auto,spell_0,spell_1,spell_2,spell_3,spell_4,spell_5]
+T2532|ME86,100,(6712,6679),L1,G35,K0D0|Q0W0E0R0|ENY86,100,(575,640),L1|PROJ|ACT[no_op,move,auto,spell_0,spell_1,spell_2,spell_3,spell_4,spell_5]
+T2762|ME86,100,(6712,6679),L1,G35,K0D0|Q0W0E0R0|ENY86,100,(575,640),L1|PROJ|ACT[no_op,move,auto,spell_0,spell_1,spell_2,spell_3,spell_4,spell_5]
+T3026|ME86,100,(6712,6679),L1,G35,K0D0|Q0W0E0R0|ENY86,100,(575,640),L1|PROJ[1073741854,575,640,2000,EzrealMysticShot][1073741853,0,0,2000,EzrealMysticShot]|ACT[no_op,move,auto,spell_0,spell_1,spell_2,spell_3,spell_4,spell_5]
+T3257|ME86,100,(6712,6679),L1,G35,K0D0|Q0W0E0R0|ENY86,100,(575,640),L1|PROJ[1073741854,222,342,2000,EzrealMysticShot][1073741853,295,354,2000,EzrealMysticShot]|ACT[no_op,move,auto,spell_0,spell_1,spell_2,spell_3,spell_4,spell_5]
+T3521|ME86,100,(6712,6679),L1,G35,K0D0|Q0W0E0R0|ENY72,100,(575,640),L1|PROJ[1073741854,-181,1,2000,EzrealMysticShot][1073741854,575,640,2000,EzrealMysticShot][1073741854,575,640,1600,EzrealEssenceFlux]|ACT[no_op,move,auto,spell_0,spell_1,spell_2,spell_3,spell_4,spell_5]
+T3752|ME86,100,(6712,6679),L1,G35,K0D0|Q0W0E0R0|ENY73,100,(575,640),L1|PROJ[1073741854,-333,-126,2000,EzrealMysticShot][1073741854,280,284,2000,EzrealMysticShot][1073741854,313,379,1600,EzrealEssenceFlux]|ACT[no_op,move,auto,spell_0,spell_1,spell_2,spell_3,spell_4,spell_5]
+T4017|ME69,100,(6798,6679),L1,G35,K0D0|Q0W0E0R0|ENY73,100,(489,640),L1|PROJ[1073741854,-418,-125,2000,EzrealMysticShot][1073741854,-72,80,1600,EzrealEssenceFlux]|ACT[no_op,move,auto,spell_0,spell_1,spell_2,spell_3,spell_4,spell_5]
+T4280|ME69,100,(6798,6679),L1,G35,K0D0|Q0W0E0R0|ENY73,100,(489,640),L1|PROJ[1073741854,-418,-125,2000,EzrealMysticShot][1073741853,0,0,2000,EzrealMysticShot]|ACT[no_op,move,auto,spell_0,spell_1,spell_2,spell_3,spell_4,spell_5]
+T4511|ME69,100,(6816,6752),L1,G35,K0D0|Q0W0E0R0|ENY73,100,(471,567),L1|PROJ[1073741854,-385,-155,2000,EzrealMysticShot][1073741853,295,265,2000,EzrealMysticShot]|ACT[no_op,move,auto,spell_0,spell_1,spell_2,spell_3,spell_4,spell_5]
+T4775|ME69,100,(6816,6752),L1,G35,K0D0|Q0W0E0R0|ENY59,100,(471,567),L1|PROJ[1073741854,-386,-156,2000,EzrealMysticShot][1073741854,145,238,2000,EzrealMysticShot]|ACT[no_op,move,auto,spell_0,spell_1,spell_2,spell_3,spell_4,spell_5]
+T5007|ME55,100,(6816,6752),L1,G35,K0D0|Q0W0E0R0|ENY60,100,(471,567),L1|PROJ[1073741854,-438,-200,2000,EzrealMysticShot]|ACT[no_op,move,auto,spell_0,spell_1,spell_2,spell_3,spell_4,spell_5]
+T5271|ME56,100,(6816,6752),L1,G35,K0D0|Q0W0E0R0|ENY60,100,(471,567),L1|PROJ[1073741854,-438,-199,2000,EzrealMysticShot][1073741853,349,303,2000,EzrealMysticShot][1073741853,238,283,1600,EzrealEssenceFlux]|ACT[no_op,move,auto,spell_0,spell_1,spell_2,spell_3,spell_4,spell_5]
+T5501|ME56,100,(6816,6677),L1,G35,K0D0|Q0W0E0R0|ENY56,100,(471,642),L1|PROJ[1073741854,-386,-81,2000,EzrealMysticShot][1073741853,696,680,2000,EzrealMysticShot][1073741853,475,639,1600,EzrealEssenceFlux]|ACT[no_op,move,auto,spell_0,spell_1,spell_2,spell_3,spell_4,spell_5]
+T5764|ME56,100,(6816,6656),L1,G35,K0D0|Q0W0E0R0|ENY56,100,(471,663),L1|PROJ[1073741854,-385,-59,2000,EzrealMysticShot][1073741854,146,338,2000,EzrealMysticShot][1073741853,297,361,2000,EzrealMysticShot][1073741853,895,874,2000,EzrealMysticShot]|ACT[no_op,move,auto,spell_0,spell_1,spell_2,spell_3,spell_4,spell_5]
+T6027|ME42,100,(6730,6656),L1,G35,K0D0|Q0W0E0R0|ENY56,100,(471,663),L1|PROJ[1073741854,-300,-59,2000,EzrealMysticShot][1073741853,723,764,2000,EzrealMysticShot][1073741853,980,873,2000,EzrealMysticShot]|ACT[no_op,move,auto,spell_0,spell_1,spell_2,spell_3,spell_4,spell_5]
+T6256|ME42,100,(6677,6709),L1,G35,K0D0|Q0W0E0R0|ENY57,100,(524,610),L1|PROJ[1073741854,-297,-153,2000,EzrealMysticShot][1073741853,903,861,2000,EzrealMysticShot][1073741853,984,779,2000,EzrealMysticShot]|ACT[no_op,move,auto,spell_0,spell_1,spell_2,spell_3,spell_4,spell_5]
+T6517|ME42,100,(6618,6769),L1,G35,K0D0|Q0W0E0R0|ENY57,100,(584,551),L1|PROJ[1073741854,-237,-214,2000,EzrealMysticShot][1073741854,584,551,2000,EzrealMysticShot][1073741853,963,801,2000,EzrealMysticShot][1073741853,1044,718,2000,EzrealMysticShot][1073741854,342,277,1600,EzrealEssenceFlux]|ACT[no_op,move,auto,spell_0,spell_1,spell_2,spell_3,spell_4,spell_5]
+T6780|ME38,100,(6665,6698),L1,G35,K0D0|Q0W0E0R0|ENY57,100,(536,622),L1|PROJ[1073741854,-284,-142,2000,EzrealMysticShot][1073741854,160,255,2000,EzrealMysticShot][1073741853,916,872,2000,EzrealMysticShot][1073741853,997,790,2000,EzrealMysticShot][1073741854,16,33,1600,EzrealEssenceFlux]|ACT[no_op,move,auto,spell_0,spell_1,spell_2,spell_3,spell_4,spell_5]
+T7010|ME24,100,(6665,6698),L1,G35,K0D0|Q0W0E0R0|ENY57,100,(536,622),L1|PROJ[1073741854,-234,-100,2000,EzrealMysticShot][1073741853,873,822,2000,EzrealMysticShot][1073741853,1046,833,2000,EzrealMysticShot]|ACT[no_op,move,auto,spell_0,spell_1,spell_2,spell_3,spell_4,spell_5]
+T7274|ME24,100,(6486,7090),L1,G35,K0D0|Q0W0E0R0|ENY57,100,(776,169),L1|PROJ[1073741854,-55,-492,2000,EzrealMysticShot][1073741853,1053,430,2000,EzrealMysticShot][1073741853,1226,441,2000,EzrealMysticShot]|ACT[no_op,move,auto,spell_0,spell_1,spell_2,spell_3,spell_4,spell_5]
+T7505|ME24,100,(6538,7037),L1,G35,K0D0|Q0W0E0R0|ENY57,100,(723,222),L1|PROJ[1073741854,-157,-481,2000,EzrealMysticShot][1073741853,1042,532,2000,EzrealMysticShot][1073741853,1124,451,2000,EzrealMysticShot]|ACT[no_op,move,auto,spell_0,spell_1,spell_2,spell_3,spell_4,spell_5]
+T7771|ME24,100,(6600,6975),L1,G35,K0D0|Q0W0E0R0|ENY57,100,(662,283),L1|PROJ[1073741854,-218,-420,2000,EzrealMysticShot][1073741853,981,594,2000,EzrealMysticShot][1073741853,1062,512,2000,EzrealMysticShot][1073741854,313,-24,2000,EzrealMysticShot]|ACT[no_op,move,auto,spell_0,spell_1,spell_2,spell_3,spell_4,spell_5]
+T8003|ME24,100,(6618,6902),L1,G35,K0D0|Q0W0E0R0|ENY57,100,(644,356),L1|PROJ[1073741854,-188,-305,2000,EzrealMysticShot][1073741853,921,618,2000,EzrealMysticShot][1073741853,1092,627,2000,EzrealMysticShot][1073741854,-52,-257,2000,EzrealMysticShot]|ACT[no_op,move,auto,spell_0,spell_1,spell_2,spell_3,spell_4,spell_5]
+T8268|ME25,100,(6679,6841),L1,G35,K0D0|Q0W0E0R0|ENY57,100,(583,417),L1|PROJ[1073741854,-249,-245,2000,EzrealMysticShot][1073741854,486,-36,2000,EzrealMysticShot][1073741854,583,417,1600,EzrealEssenceFlux][1073741853,861,680,2000,EzrealMysticShot][1073741853,1031,687,2000,EzrealMysticShot][1073741854,-311,-372,2000,EzrealMysticShot]|ACT[no_op,move,auto,spell_0,spell_1,spell_2,spell_3,spell_4,spell_5]
+T8533|ME25,100,(6730,6773),L1,G35,K0D0|Q0W0E0R0|ENY57,100,(531,486),L1|PROJ[1073741854,-303,-178,2000,EzrealMysticShot][1073741854,324,-485,2000,EzrealMysticShot][1073741854,341,107,1600,EzrealEssenceFlux][1073741853,810,750,2000,EzrealMysticShot][1073741853,978,755,2000,EzrealMysticShot][1073741854,-361,-301,2000,EzrealMysticShot]|ACT[no_op,move,auto,spell_0,spell_1,spell_2,spell_3,spell_4,spell_5]
+T8764|ME25,100,(6764,6705),L1,G35,K0D0|Q0W0E0R0|ENY58,100,(498,553),L1|PROJ[1073741854,-388,-154,2000,EzrealMysticShot][1073741854,248,-614,2000,EzrealMysticShot][1073741854,140,-155,1600,EzrealEssenceFlux][1073741853,821,869,2000,EzrealMysticShot][1073741853,893,778,2000,EzrealMysticShot][1073741854,-344,-189,2000,EzrealMysticShot]|ACT[no_op,move,auto,spell_0,spell_1,spell_2,spell_3,spell_4,spell_5]
+T9028|ME25,100,(6687,6744),L1,G35,K0D0|Q0W0E0R0|ENY58,100,(651,476),L1|PROJ[1073741854,-312,-193,2000,EzrealMysticShot][1073741854,325,-653,2000,EzrealMysticShot][1073741854,121,-383,1600,EzrealEssenceFlux][1073741853,897,831,2000,EzrealMysticShot][1073741853,969,739,2000,EzrealMysticShot][1073741854,-267,-227,2000,EzrealMysticShot][1073741854,386,199,1600,EzrealEssenceFlux]|ACT[no_op,move,auto,spell_0,spell_1,spell_2,spell_3,spell_4,spell_5]
+T9260|ME25,100,(6729,6806),L1,G35,K0D0|Q0W0E0R0|ENY58,100,(567,476),L1|PROJ[1073741854,-302,-212,2000,EzrealMysticShot][1073741854,297,-649,2000,EzrealMysticShot][1073741854,104,-397,1600,EzrealEssenceFlux][1073741853,812,717,2000,EzrealMysticShot][1073741853,978,721,2000,EzrealMysticShot][1073741854,-360,-335,2000,EzrealMysticShot][1073741854,146,-176,1600,EzrealEssenceFlux]|ACT[no_op,move,auto,spell_0,spell_1,spell_2,spell_3,spell_4,spell_5]
+T9525|ME25,100,(6643,6806),L1,G35,K0D0|Q0W0E0R0|ENY58,100,(654,563),L1|PROJ[1073741854,-215,-211,2000,EzrealMysticShot][1073741854,384,-649,2000,EzrealMysticShot][1073741853,898,716,2000,EzrealMysticShot][1073741853,1065,721,2000,EzrealMysticShot][1073741854,-274,-335,2000,EzrealMysticShot]|ACT[no_op,move,auto,spell_0,spell_1,spell_2,spell_3,spell_4,spell_5]
+T9757|ME25,100,(6706,6848),L1,G35,K0D0|Q0W0E0R0|ENY58,100,(666,521),L1|PROJ[1073741854,-329,-296,2000,EzrealMysticShot][1073741854,307,-756,2000,EzrealMysticShot][1073741853,878,725,2000,EzrealMysticShot][1073741853,952,636,2000,EzrealMysticShot][1073741854,-287,-333,2000,EzrealMysticShot]|ACT[no_op,move,auto,spell_0,spell_1,spell_2,spell_3,spell_4,spell_5]
+T10023|ME25,100,(6783,6810),L1,G35,K0D0|Q0W0E0R0|ENY58,100,(650,498),L1|PROJ[1073741854,-405,-257,2000,EzrealMysticShot][1073741854,230,-716,2000,EzrealMysticShot][1073741853,800,763,2000,EzrealMysticShot][1073741853,876,675,2000,EzrealMysticShot][1073741854,-365,-295,2000,EzrealMysticShot]|ACT[no_op,move,auto,spell_0,spell_1,spell_2,spell_3,spell_4,spell_5]
+T10254|ME25,100,(6836,6756),L1,G35,K0D0|Q0W0E0R0|ENY58,100,(534,593),L1|PROJ[1073741854,-406,-160,2000,EzrealMysticShot][1073741854,191,-596,2000,EzrealMysticShot][1073741853,703,764,2000,EzrealMysticShot][1073741853,874,773,2000,EzrealMysticShot][1073741854,-469,-287,2000,EzrealMysticShot]|ACT[no_op,move,auto,spell_0,spell_1,spell_2,spell_3,spell_4,spell_5]
+T10518|ME25,100,(6760,6795),L1,G35,K0D0|Q0W0E0R0|ENY58,100,(697,555),L1|PROJ[1073741854,-328,-197,2000,EzrealMysticShot][1073741854,268,-633,2000,EzrealMysticShot][1073741853,778,724,2000,EzrealMysticShot][1073741853,952,736,2000,EzrealMysticShot][1073741854,-394,-327,2000,EzrealMysticShot]|ACT[no_op,move,auto,spell_0,spell_1,spell_2,spell_3,spell_4,spell_5]
+T10750|ME25,100,(6706,6848),L1,G35,K0D0|Q0W0E0R0|ENY58,100,(697,555),L1|PROJ[1073741854,-325,-293,2000,EzrealMysticShot][1073741854,308,-751,2000,EzrealMysticShot][1073741853,874,721,2000,EzrealMysticShot][1073741853,955,639,2000,EzrealMysticShot][1073741854,-291,-336,2000,EzrealMysticShot]|ACT[no_op,move,auto,spell_0,spell_1,spell_2,spell_3,spell_4,spell_5]
+T11016|ME25,100,(6783,6809),L1,G35,K0D0|Q0W0E0R0|ENY58,100,(620,507),L1|PROJ[1073741854,-402,-254,2000,EzrealMysticShot][1073741854,230,-712,2000,EzrealMysticShot][1073741853,797,760,2000,EzrealMysticShot][1073741853,879,678,2000,EzrealMysticShot][1073741854,-369,-298,2000,EzrealMysticShot]|ACT[no_op,move,auto,spell_0,spell_1,spell_2,spell_3,spell_4,spell_5]
+T11282|ME25,100,(6845,6748),L1,G35,K0D0|Q0W0E0R0|ENY58,100,(630,520),L1|PROJ[1073741854,-463,-192,2000,EzrealMysticShot][1073741854,170,-650,2000,EzrealMysticShot][1073741853,735,820,2000,EzrealMysticShot][1073741853,818,740,2000,EzrealMysticShot][1073741854,-430,-238,2000,EzrealMysticShot]|ACT[no_op,move,auto,spell_0,spell_1,spell_2,spell_3,spell_4,spell_5]
+T11515|ME25,100,(6777,6782),L1,G35,K0D0|Q0W0E0R0|ENY58,100,(752,433),L1|PROJ[1073741854,-343,-183,2000,EzrealMysticShot][1073741854,251,-618,2000,EzrealMysticShot][1073741853,759,735,2000,EzrealMysticShot][1073741853,937,750,2000,EzrealMysticShot][1073741854,-413,-316,2000,EzrealMysticShot]|ACT[no_op,move,auto,spell_0,spell_1,spell_2,spell_3,spell_4,spell_5]
+T11780|ME25,100,(6777,6782),L1,G35,K0D0|Q0W0E0R0|ENY58,100,(691,494),L1|PROJ[1073741854,-345,-184,2000,EzrealMysticShot][1073741854,251,-620,2000,EzrealMysticShot][1073741853,761,737,2000,EzrealMysticShot][1073741853,935,748,2000,EzrealMysticShot][1073741854,-411,-314,2000,EzrealMysticShot]|ACT[no_op,move,auto,spell_0,spell_1,spell_2,spell_3,spell_4,spell_5]
+T12012|ME25,100,(6844,6748),L1,G35,K0D0|Q0W0E0R0|ENY58,100,(570,581),L1|PROJ[1073741854,-464,-194,2000,EzrealMysticShot][1073741854,169,-652,2000,EzrealMysticShot][1073741853,737,822,2000,EzrealMysticShot][1073741853,817,738,2000,EzrealMysticShot][1073741854,-428,-236,2000,EzrealMysticShot]|ACT[no_op,move,auto,spell_0,spell_1,spell_2,spell_3,spell_4,spell_5]
+T12277|ME25,100,(6784,6809),L1,G35,K0D0|Q0W0E0R0|ENY58,100,(630,520),L1|PROJ[1073741854,-403,-254,2000,EzrealMysticShot][1073741854,230,-712,2000,EzrealMysticShot][1073741853,797,760,2000,EzrealMysticShot][1073741853,878,678,2000,EzrealMysticShot][1073741854,-368,-297,2000,EzrealMysticShot]|ACT[no_op,move,auto,spell_0,spell_1,spell_2,spell_3,spell_4,spell_5]
+T12508|ME25,100,(6730,6863),L1,G35,K0D0|Q0W0E0R0|ENY58,100,(630,520),L1|PROJ[1073741854,-298,-264,2000,EzrealMysticShot][1073741854,298,-699,2000,EzrealMysticShot][1073741853,807,656,2000,EzrealMysticShot][1073741853,982,669,2000,EzrealMysticShot][1073741854,-366,-395,2000,EzrealMysticShot]|ACT[no_op,move,auto,spell_0,spell_1,spell_2,spell_3,spell_4,spell_5]
+T12773|ME26,100,(6791,6802),L1,G35,K0D0|Q0W0E0R0|ENY58,100,(509,642),L1|PROJ[1073741854,-359,-203,2000,EzrealMysticShot][1073741854,237,-638,2000,EzrealMysticShot][1073741853,746,716,2000,EzrealMysticShot][1073741853,922,730,2000,EzrealMysticShot][1073741854,-427,-335,2000,EzrealMysticShot]|ACT[no_op,move,auto,spell_0,spell_1,spell_2,spell_3,spell_4,spell_5]
+T13005|ME26,100,(6825,6734),L1,G35,K0D0|Q0W0E0R0|ENY58,100,(412,751),L1|PROJ[1073741854,-444,-179,2000,EzrealMysticShot][1073741854,189,-637,2000,EzrealMysticShot][1073741853,756,835,2000,EzrealMysticShot][1073741853,837,753,2000,EzrealMysticShot][1073741854,-409,-222,2000,EzrealMysticShot]|ACT[no_op,move,auto,spell_0,spell_1,spell_2,spell_3,spell_4,spell_5]
+T13270|ME26,100,(6764,6795),L1,G35,K0D0|Q0W0E0R0|ENY59,100,(387,690),L1|PROJ[1073741854,-383,-240,2000,EzrealMysticShot][1073741854,250,-699,2000,EzrealMysticShot][1073741853,817,774,2000,EzrealMysticShot][1073741853,898,692,2000,EzrealMysticShot][1073741854,-348,-283,2000,EzrealMysticShot]|ACT[no_op,move,auto,spell_0,spell_1,spell_2,spell_3,spell_4,spell_5]
+T13503|ME26,100,(6764,6720),L1,G35,K0D0|Q0W0E0R0|ENY59,100,(463,766),L1|PROJ[1073741854,-332,-122,2000,EzrealMysticShot][1073741854,264,-558,2000,EzrealMysticShot][1073741853,774,799,2000,EzrealMysticShot][1073741853,948,811,2000,EzrealMysticShot][1073741854,-398,-252,2000,EzrealMysticShot]|ACT[no_op,move,auto,spell_0,spell_1,spell_2,spell_3,spell_4,spell_5]
+T13768|ME26,100,(6764,6720),L1,G35,K0D0|Q0W0E0R0|ENY59,100,(532,714),L1|PROJ[1073741854,-333,-122,2000,EzrealMysticShot][1073741854,264,-559,2000,EzrealMysticShot][1073741853,775,800,2000,EzrealMysticShot][1073741853,947,810,2000,EzrealMysticShot][1073741854,-397,-251,2000,EzrealMysticShot]|ACT[no_op,move,auto,spell_0,spell_1,spell_2,spell_3,spell_4,spell_5]
+T14033|ME26,100,(6703,6781),L1,G35,K0D0|Q0W0E0R0|ENY59,100,(644,584),L1|PROJ[1073741854,-272,-183,2000,EzrealMysticShot][1073741854,325,-619,2000,EzrealMysticShot][1073741853,835,739,2000,EzrealMysticShot][1073741853,1008,750,2000,EzrealMysticShot][1073741854,-337,-312,2000,EzrealMysticShot]|ACT[no_op,move,auto,spell_0,spell_1,spell_2,spell_3,spell_4,spell_5]
+T14265|ME26,100,(6669,6848),L1,G35,K0D0|Q0W0E0R0|ENY59,100,(720,454),L1|PROJ[1073741854,-289,-293,2000,EzrealMysticShot][1073741854,345,-752,2000,EzrealMysticShot][1073741853,912,722,2000,EzrealMysticShot][1073741853,992,639,2000,EzrealMysticShot][1073741854,-253,-336,2000,EzrealMysticShot]|ACT[no_op,move,auto,spell_0,spell_1,spell_2,spell_3,spell_4,spell_5]
+T14531|ME26,100,(6738,6796),L1,G35,K0D0|Q0W0E0R0|ENY59,100,(579,554),L1|PROJ[1073741854,-358,-241,2000,EzrealMysticShot][1073741854,276,-700,2000,EzrealMysticShot][1073741853,842,773,2000,EzrealMysticShot][1073741853,923,691,2000,EzrealMysticShot][1073741854,-323,-284,2000,EzrealMysticShot]|ACT[no_op,move,auto,spell_0,spell_1,spell_2,spell_3,spell_4,spell_5]
+T14761|ME26,100,(6738,6796),L1,G35,K0D0|Q0W0E0R0|ENY59,100,(632,501),L1|PROJ[1073741854,-308,-199,2000,EzrealMysticShot][1073741854,289,-636,2000,EzrealMysticShot][1073741853,800,723,2000,EzrealMysticShot][1073741853,973,733,2000,EzrealMysticShot][1073741854,-372,-328,2000,EzrealMysticShot]|ACT[no_op,move,auto,spell_0,spell_1,spell_2,spell_3,spell_4,spell_5]
+T15026|ME26,100,(6738,6710),L1,G35,K0D0|Q0W0E0R0|ENY59,100,(718,587),L1|PROJ[1073741854,-306,-112,2000,EzrealMysticShot][1073741854,290,-548,2000,EzrealMysticShot][1073741853,799,808,2000,EzrealMysticShot][1073741853,974,821,2000,EzrealMysticShot][1073741854,-373,-243,2000,EzrealMysticShot]|ACT[no_op,move,auto,spell_0,spell_1,spell_2,spell_3,spell_4,spell_5]
+T15259|ME26,100,(6792,6657),L1,G35,K0D0|Q0W0E0R0|ENY59,100,(611,693),L1|PROJ[1073741854,-410,-101,2000,EzrealMysticShot][1073741854,222,-559,2000,EzrealMysticShot][1073741853,788,912,2000,EzrealMysticShot][1073741853,871,831,2000,EzrealMysticShot][1073741854,-377,-146,2000,EzrealMysticShot]|ACT[no_op,move,auto,spell_0,spell_1,spell_2,spell_3,spell_4,spell_5]
+T15525|ME26,100,(6853,6596),L1,G35,K0D0|Q0W0E0R0|ENY59,100,(550,668),L1|PROJ[1073741854,-472,-40,2000,EzrealMysticShot][1073741854,161,-498,2000,EzrealMysticShot][1073741853,727,973,2000,EzrealMysticShot][1073741853,809,892,2000,EzrealMysticShot][1073741854,-438,-84,2000,EzrealMysticShot]|ACT[no_op,move,auto,spell_0,spell_1,spell_2,spell_3,spell_4,spell_5]
+T15757|ME26,100,(6799,6649),L1,G35,K0D0|Q0W0E0R0|ENY59,100,(645,552),L1|PROJ[1073741854,-368,-51,2000,EzrealMysticShot][1073741854,228,-488,2000,EzrealMysticShot][1073741853,739,870,2000,EzrealMysticShot][1073741853,912,881,2000,EzrealMysticShot][1073741854,-433,-181,2000,EzrealMysticShot]|ACT[no_op,move,auto,spell_0,spell_1,spell_2,spell_3,spell_4,spell_5]
+T16023|ME26,100,(6738,6710),L1,G35,K0D0|Q0W0E0R0|ENY59,100,(645,552),L1|PROJ[1073741854,-308,-113,2000,EzrealMysticShot][1073741854,289,-549,2000,EzrealMysticShot][1073741853,800,809,2000,EzrealMysticShot][1073741853,973,820,2000,EzrealMysticShot][1073741854,-372,-242,2000,EzrealMysticShot]|ACT[no_op,move,auto,spell_0,spell_1,spell_2,spell_3,spell_4,spell_5]
+T16255|ME26,100,(6685,6763),L1,G35,K0D0|Q0W0E0R0|ENY59,100,(645,552),L1|PROJ[1073741854,-307,-210,2000,EzrealMysticShot][1073741854,328,-669,2000,EzrealMysticShot][1073741853,897,808,2000,EzrealMysticShot][1073741853,974,722,2000,EzrealMysticShot][1073741854,-268,-250,2000,EzrealMysticShot]|ACT[no_op,move,auto,spell_0,spell_1,spell_2,spell_3,spell_4,spell_5]
+T16519|ME26,100,(6624,6824),L1,G35,K0D0|Q0W0E0R0|ENY59,100,(645,552),L1|PROJ[1073741854,-245,-270,2000,EzrealMysticShot][1073741854,389,-729,2000,EzrealMysticShot][1073741853,958,747,2000,EzrealMysticShot][1073741853,1036,661,2000,EzrealMysticShot][1073741854,-207,-311,2000,EzrealMysticShot]|ACT[no_op,move,auto,spell_0,spell_1,spell_2,spell_3,spell_4,spell_5]
+T16751|ME27,100,(6571,6878),L1,G35,K0D0|Q0W0E0R0|ENY59,100,(752,445),L1|PROJ[1073741854,-141,-281,2000,EzrealMysticShot][1073741854,456,-718,2000,EzrealMysticShot][1073741853,968,642,2000,EzrealMysticShot][1073741853,1140,652,2000,EzrealMysticShot][1073741854,-204,-409,2000,EzrealMysticShot]|ACT[no_op,move,auto,spell_0,spell_1,spell_2,spell_3,spell_4,spell_5]
+T17015|ME27,100,(6631,6817),L1,G35,K0D0|Q0W0E0R0|ENY59,100,(631,566),L1|PROJ[1073741854,-200,-219,2000,EzrealMysticShot][1073741854,396,-655,2000,EzrealMysticShot][1073741853,906,702,2000,EzrealMysticShot][1073741853,1080,713,2000,EzrealMysticShot][1073741854,-266,-349,2000,EzrealMysticShot]|ACT[no_op,move,auto,spell_0,spell_1,spell_2,spell_3,spell_4,spell_5]
+T17280|ME27,100,(6692,6756),L1,G35,K0D0|Q0W0E0R0|ENY60,100,(571,627),L1|PROJ[1073741854,-260,-158,2000,EzrealMysticShot][1073741854,335,-594,2000,EzrealMysticShot][1073741853,845,762,2000,EzrealMysticShot][1073741853,1020,775,2000,EzrealMysticShot][1073741854,-327,-289,2000,EzrealMysticShot]|ACT[no_op,move,auto,spell_0,spell_1,spell_2,spell_3,spell_4,spell_5]
+T17512|ME27,100,(6692,6756),L1,G35,K0D0|Q0W0E0R0|ENY60,100,(624,573),L1|PROJ[1073741854,-310,-200,2000,EzrealMysticShot][1073741854,322,-658,2000,EzrealMysticShot][1073741853,887,812,2000,EzrealMysticShot][1073741853,970,732,2000,EzrealMysticShot][1073741854,-278,-245,2000,EzrealMysticShot]|ACT[no_op,move,auto,spell_0,spell_1,spell_2,spell_3,spell_4,spell_5]
+T17778|ME27,100,(6753,6695),L1,G35,K0D0|Q0W0E0R0|ENY60,100,(563,634),L1|PROJ[1073741854,-371,-139,2000,EzrealMysticShot][1073741854,261,-597,2000,EzrealMysticShot][1073741853,826,873,2000,EzrealMysticShot][1073741853,909,793,2000,EzrealMysticShot][1073741854,-339,-184,2000,EzrealMysticShot]|ACT[no_op,move,auto,spell_0,spell_1,spell_2,spell_3,spell_4,spell_5]
+T18010|ME27,100,(6807,6642),L1,G35,K0D0|Q0W0E0R0|ENY60,100,(456,741),L1|PROJ[1073741854,-373,-42,2000,EzrealMysticShot][1073741854,222,-477,2000,EzrealMysticShot][1073741853,729,875,2000,EzrealMysticShot][1073741853,907,891,2000,EzrealMysticShot][1073741854,-443,-176,2000,EzrealMysticShot]|ACT[no_op,move,auto,spell_0,spell_1,spell_2,spell_3,spell_4,spell_5]
+T18275|ME27,100,(6746,6703),L1,G35,K0D0|Q0W0E0R0|ENY60,100,(578,619),L1|PROJ[1073741854,-313,-104,2000,EzrealMysticShot][1073741854,282,-540,2000,EzrealMysticShot][1073741853,791,815,2000,EzrealMysticShot][1073741853,967,828,2000,EzrealMysticShot][1073741854,-381,-236,2000,EzrealMysticShot]|ACT[no_op,move,auto,spell_0,spell_1,spell_2,spell_3,spell_4,spell_5]
+T18507|ME27,100,(6704,6766),L1,G35,K0D0|Q0W0E0R0|ENY60,100,(662,494),L1|PROJ[1073741854,-322,-210,2000,EzrealMysticShot][1073741854,310,-668,2000,EzrealMysticShot][1073741853,876,803,2000,EzrealMysticShot][1073741853,958,722,2000,EzrealMysticShot][1073741854,-289,-254,2000,EzrealMysticShot]|ACT[no_op,move,auto,spell_0,spell_1,spell_2,spell_3,spell_4,spell_5]
+T18773|ME27,100,(6765,6705),L1,G35,K0D0|Q0W0E0R0|ENY60,100,(553,627),L1|PROJ[1073741854,-384,-149,2000,EzrealMysticShot][1073741854,249,-607,2000,EzrealMysticShot][1073741853,816,865,2000,EzrealMysticShot][1073741853,897,783,2000,EzrealMysticShot][1073741854,-350,-193,2000,EzrealMysticShot]|ACT[no_op,move,auto,spell_0,spell_1,spell_2,spell_3,spell_4,spell_5]
+T19004|ME27,100,(6765,6705),L1,G35,K0D0|Q0W0E0R0|ENY60,100,(553,702),L1|PROJ[1073741854,-333,-106,2000,EzrealMysticShot][1073741854,263,-543,2000,EzrealMysticShot][1073741853,773,814,2000,EzrealMysticShot][1073741853,947,826,2000,EzrealMysticShot][1073741854,-399,-237,2000,EzrealMysticShot]|ACT[no_op,move,auto,spell_0,spell_1,spell_2,spell_3,spell_4,spell_5]
+T19271|ME27,100,(6704,6766),L1,G35,K0D0|Q0W0E0R0|ENY60,100,(675,580),L1|PROJ[1073741854,-272,-167,2000,EzrealMysticShot][1073741854,324,-603,2000,EzrealMysticShot][1073741853,834,753,2000,EzrealMysticShot][1073741853,1008,765,2000,EzrealMysticShot][1073741854,-338,-298,2000,EzrealMysticShot]|ACT[no_op,move,auto,spell_0,spell_1,spell_2,spell_3,spell_4,spell_5]
+T19502|ME27,100,(6704,6841),L1,G35,K0D0|Q0W0E0R0|ENY60,100,(608,538),L1|PROJ[1073741854,-322,-285,2000,EzrealMysticShot][1073741854,310,-743,2000,EzrealMysticShot][1073741853,876,728,2000,EzrealMysticShot][1073741853,959,647,2000,EzrealMysticShot][1073741854,-289,-330,2000,EzrealMysticShot]|ACT[no_op,move,auto,spell_0,spell_1,spell_2,spell_3,spell_4,spell_5]
+T19767|ME27,100,(6775,6793),L1,G35,K0D0|Q0W0E0R0|ENY60,100,(597,525),L1|PROJ[1073741854,-393,-237,2000,EzrealMysticShot][1073741854,239,-695,2000,EzrealMysticShot][1073741853,804,775,2000,EzrealMysticShot][1073741853,888,695,2000,EzrealMysticShot][1073741854,-361,-283,2000,EzrealMysticShot]|ACT[no_op,move,auto,spell_0,spell_1,spell_2,spell_3,spell_4,spell_5]
+T20032|ME27,100,(6714,6854),L1,G35,K0D0|Q0W0E0R0|ENY60,100,(719,403),L1|PROJ[1073741854,-332,-297,2000,EzrealMysticShot][1073741854,300,-755,2000,EzrealMysticShot][1073741853,865,713,2000,EzrealMysticShot][1073741853,949,634,2000,EzrealMysticShot][1073741854,-301,-344,2000,EzrealMysticShot]|ACT[no_op,move,auto,spell_0,spell_1,spell_2,spell_3,spell_4,spell_5]
+T20264|ME27,100,(6768,6801),L1,G35,K0D0|Q0W0E0R0|ENY60,100,(612,509),L1|PROJ[1073741854,-334,-201,2000,EzrealMysticShot][1073741854,261,-636,2000,EzrealMysticShot][1073741853,768,716,2000,EzrealMysticShot][1073741853,946,731,2000,EzrealMysticShot][1073741854,-404,-335,2000,EzrealMysticShot]|ACT[no_op,move,auto,spell_0,spell_1,spell_2,spell_3,spell_4,spell_5]
+T20528|ME27,100,(6828,6740),L1,G35,K0D0|Q0W0E0R0|ENY60,100,(480,618),L1|PROJ[1073741854,-395,-141,2000,EzrealMysticShot][1073741854,200,-576,2000,EzrealMysticShot][1073741853,708,776,2000,EzrealMysticShot][1073741853,885,792,2000,EzrealMysticShot][1073741854,-465,-274,2000,EzrealMysticShot]|ACT[no_op,move,auto,spell_0,spell_1,spell_2,spell_3,spell_4,spell_5]
+T20760|ME27,100,(6881,6687),L1,G35,K0D0|Q0W0E0R0|ENY60,100,(374,724),L1|PROJ[1073741854,-499,-130,2000,EzrealMysticShot][1073741854,133,-588,2000,EzrealMysticShot][1073741853,698,881,2000,EzrealMysticShot][1073741853,782,801,2000,EzrealMysticShot][1073741854,-468,-177,2000,EzrealMysticShot]|ACT[no_op,move,auto,spell_0,spell_1,spell_2,spell_3,spell_4,spell_5]
+T21024|ME27,100,(6821,6748),L1,G35,K0D0|Q0W0E0R0|ENY60,100,(495,603),L1|PROJ[1073741854,-439,-192,2000,EzrealMysticShot][1073741854,193,-650,2000,EzrealMysticShot][1073741853,759,821,2000,EzrealMysticShot][1073741853,842,740,2000,EzrealMysticShot][1073741854,-406,-237,2000,EzrealMysticShot]|ACT[no_op,move,auto,spell_0,spell_1,spell_2,spell_3,spell_4,spell_5]
+T21256|ME28,100,(6768,6695),L1,G35,K0D0|Q0W0E0R0|ENY60,100,(548,731),L1|PROJ[1073741854,-335,-96,2000,EzrealMysticShot][1073741854,260,-532,2000,EzrealMysticShot][1073741853,769,823,2000,EzrealMysticShot][1073741853,945,837,2000,EzrealMysticShot][1073741854,-403,-228,2000,EzrealMysticShot]|ACT[no_op,move,auto,spell_0,spell_1,spell_2,spell_3,spell_4,spell_5]
+T21522|ME28,100,(6706,6756),L1,G35,K0D0|Q0W0E0R0|ENY60,100,(696,670),L1|PROJ[1073741854,-274,-158,2000,EzrealMysticShot][1073741854,321,-593,2000,EzrealMysticShot][1073741853,831,763,2000,EzrealMysticShot][1073741853,1006,775,2000,EzrealMysticShot][1073741854,-341,-288,2000,EzrealMysticShot]|ACT[no_op,move,auto,spell_0,spell_1,spell_2,spell_3,spell_4,spell_5]
+T21753|ME28,100,(6673,6823),L1,G35,K0D0|Q0W0E0R0|ENY61,100,(654,603),L1|PROJ[1073741854,-293,-269,2000,EzrealMysticShot][1073741854,341,-727,2000,EzrealMysticShot][1073741853,908,747,2000,EzrealMysticShot][1073741853,988,663,2000,EzrealMysticShot][1073741854,-257,-311,2000,EzrealMysticShot]|ACT[no_op,move,auto,spell_0,spell_1,spell_2,spell_3,spell_4,spell_5]
+T22019|ME28,100,(6673,6909),L1,G35,K0D0|Q0W0E0R0|ENY61,100,(583,564),L1|PROJ[1073741854,-292,-354,2000,EzrealMysticShot][1073741854,341,-812,2000,EzrealMysticShot][1073741853,908,660,2000,EzrealMysticShot][1073741853,989,578,2000,EzrealMysticShot][1073741854,-257,-398,2000,EzrealMysticShot]|ACT[no_op,move,auto,spell_0,spell_1,spell_2,spell_3,spell_4,spell_5]
+T22251|ME28,100,(6726,6856),L1,G35,K0D0|Q0W0E0R0|ENY61,100,(462,651),L1|PROJ[1073741854,-295,-258,2000,EzrealMysticShot][1073741854,302,-694,2000,EzrealMysticShot][1073741853,812,663,2000,EzrealMysticShot][1073741853,985,674,2000,EzrealMysticShot][1073741854,-360,-388,2000,EzrealMysticShot]|ACT[no_op,move,auto,spell_0,spell_1,spell_2,spell_3,spell_4,spell_5]
+T22516|ME28,100,(6787,6795),L1,G35,K0D0|Q0W0E0R0|ENY61,100,(470,660),L1|PROJ[1073741854,-357,-198,2000,EzrealMysticShot][1073741854,240,-634,2000,EzrealMysticShot][1073741853,751,725,2000,EzrealMysticShot][1073741853,924,735,2000,EzrealMysticShot][1073741854,-420,-326,2000,EzrealMysticShot]|ACT[no_op,move,auto,spell_0,spell_1,spell_2,spell_3,spell_4,spell_5]
+T22782|ME28,100,(6787,6709),L1,G35,K0D0|Q0W0E0R0|ENY61,100,(531,686),L1|PROJ[1073741854,-357,-112,2000,EzrealMysticShot][1073741854,240,-549,2000,EzrealMysticShot][1073741853,752,812,2000,EzrealMysticShot][1073741853,923,820,2000,EzrealMysticShot][1073741854,-420,-239,2000,EzrealMysticShot]|ACT[no_op,move,auto,spell_0,spell_1,spell_2,spell_3,spell_4,spell_5]
+T23014|ME28,100,(6821,6641),L1,G35,K0D0|Q0W0E0R0|ENY61,100,(551,700),L1|PROJ[1073741854,-443,-88,2000,EzrealMysticShot][1073741854,192,-547,2000,EzrealMysticShot][1073741853,762,931,2000,EzrealMysticShot][1073741853,838,844,2000,EzrealMysticShot][1073741854,-403,-127,2000,EzrealMysticShot]|ACT[no_op,move,auto,spell_0,spell_1,spell_2,spell_3,spell_4,spell_5]
+T23278|ME28,100,(6821,6641),L1,G35,K0D0|Q0W0E0R0|ENY61,100,(551,700),L1|PROJ[1073741854,-442,-88,2000,EzrealMysticShot][1073741854,192,-547,2000,EzrealMysticShot][1073741853,762,931,2000,EzrealMysticShot][1073741853,839,844,2000,EzrealMysticShot][1073741854,-403,-127,2000,EzrealMysticShot]|ACT[no_op,move,auto,spell_0,spell_1,spell_2,spell_3,spell_4,spell_5]
+T23510|ME28,100,(6776,6702),L1,G35,K0D0|Q0W0E0R0|ENY61,100,(630,572),L1|PROJ[1073741854,-345,-104,2000,EzrealMysticShot][1073741854,252,-540,2000,EzrealMysticShot][1073741853,763,818,2000,EzrealMysticShot][1073741853,935,829,2000,EzrealMysticShot][1073741854,-409,-233,2000,EzrealMysticShot]|ACT[no_op,move,auto,spell_0,spell_1,spell_2,spell_3,spell_4,spell_5]
+T23773|ME28,100,(6737,6778),L1,G35,K0D0|Q0W0E0R0|ENY61,100,(582,495),L1|PROJ[1073741854,-309,-183,2000,EzrealMysticShot][1073741854,289,-621,2000,EzrealMysticShot][1073741853,803,744,2000,EzrealMysticShot][1073741853,971,749,2000,EzrealMysticShot][1073741854,-368,-307,2000,EzrealMysticShot]|ACT[no_op,move,auto,spell_0,spell_1,spell_2,spell_3,spell_4,spell_5]
+T24005|ME28,100,(6790,6725),L1,G35,K0D0|Q0W0E0R0|ENY61,100,(476,602),L1|PROJ[1073741854,-414,-173,2000,EzrealMysticShot][1073741854,222,-633,2000,EzrealMysticShot][1073741853,793,848,2000,EzrealMysticShot][1073741853,867,759,2000,EzrealMysticShot][1073741854,-371,-210,2000,EzrealMysticShot]|ACT[no_op,move,auto,spell_0,spell_1,spell_2,spell_3,spell_4,spell_5]
+T24270|ME28,100,(6713,6763),L1,G35,K0D0|Q0W0E0R0|ENY61,100,(630,525),L1|PROJ[1073741854,-336,-211,2000,EzrealMysticShot][1073741854,299,-670,2000,EzrealMysticShot][1073741853,870,809,2000,EzrealMysticShot][1073741853,945,721,2000,EzrealMysticShot][1073741854,-295,-249,2000,EzrealMysticShot]|ACT[no_op,move,auto,spell_0,spell_1,spell_2,spell_3,spell_4,spell_5]
+T24503|ME28,100,(6646,6797),L1,G35,K0D0|Q0W0E0R0|ENY61,100,(765,457),L1|PROJ[1073741854,-217,-202,2000,EzrealMysticShot][1073741854,381,-639,2000,EzrealMysticShot][1073741853,894,725,2000,EzrealMysticShot][1073741853,1063,731,2000,EzrealMysticShot][1073741854,-277,-327,2000,EzrealMysticShot]|ACT[no_op,move,auto,spell_0,spell_1,spell_2,spell_3,spell_4,spell_5]
+</experience>
+
+<example>
+<thinking>
+During this episode, I constantly lost reward as I was hit by skillshots frequently due to being poor at dodging them.
+Therefore, I'm now going to try wiggling my character model rapidly moving back and forth before comitting to
+a skillshot, to make it harder for the enemy Ezreal to land a skillshot on me.
+<thinking>
+<policy>
+
+def act(self, obs):
+    import math # YOU MUST IMPORT THIS MODULE EVERY SINGLE TIME. DO NOT IMOPRT ANY OTHER MODULES
+    
+    # Get our champion and enemy champion info
+    my_champ = next(unit for unit in observation["champ_units"] if unit["my_team"] == 1)
+    enemy_champ = next(unit for unit in observation["champ_units"] if unit["my_team"] == 0)
+    nearby_projectiles = [p for p in observation["projectiles"] 
+                         if p["my_team"] == 0 and p["distance_to_me"] < 800]
+
+    # High priority: Dodge enemy skillshots (prevents HP loss which has high negative reward)
+    if nearby_projectiles:
+        proj = nearby_projectiles[0]
+        # Calculate perpendicular dodge direction
+        dodge_x = proj["dy_to_me"]
+        dodge_y = -proj["dx_to_me"]
+        magnitude = (dodge_x**2 + dodge_y**2)**0.5
+        if magnitude > 0:
+            dodge_x = (dodge_x/magnitude * 200) + my_champ["position"]["X"]
+            dodge_y = (dodge_y/magnitude * 200) + my_champ["position"]["Y"]
+            return (1, [dodge_y, dodge_x])
+
+    # Offensive opportunities (for kill rewards and HP damage)
+    if enemy_champ["distance_to_me"] < 600:
+        # Check if we have HP advantage
+        my_hp_percent = my_champ["current_hp"] / my_champ["max_hp"]
+        enemy_hp_percent = enemy_champ["current_hp"] / enemy_champ["max_hp"]
+        
+        if my_hp_percent > enemy_hp_percent + 0.2:  # We have significant HP advantage
+            # Cast Q if available and in range
+            if my_champ["q_cooldown"] == 0:
+                return (2, [[0], [enemy_champ["position"]["Y"], enemy_champ["position"]["X"]]])
+        else:
+            # Maintain safe distance if we don't have HP advantage
+            retreat_x = my_champ["position"]["X"] - enemy_champ["dx_to_me"]
+            retreat_y = my_champ["position"]["Y"] - enemy_champ["dy_to_me"]
+            return (1, [retreat_y, retreat_x])
+
+    # Resource management (MP has moderate reward weight)
+    if my_champ["current_mp"] / my_champ["max_mp"] < 0.3:
+        # Play conservatively when low on mana
+        safe_x = my_champ["position"]["X"] + (enemy_champ["dx_to_me"] * -1.5)
+        safe_y = my_champ["position"]["Y"] + (enemy_champ["dy_to_me"] * -1.5)
+        return (1, [safe_y, safe_x])
+
+    # Default behavior: Maintain optimal trading range
+    optimal_range = 500  # Adjust based on champion
+    if enemy_champ["distance_to_me"] > optimal_range:
+        # Move closer
+        approach_x = my_champ["position"]["X"] + enemy_champ["dx_to_me"] * 0.5
+        approach_y = my_champ["position"]["Y"] + enemy_champ["dy_to_me"] * 0.5
+        return (1, [approach_y, approach_x])
+    else:
+        # Orbit around enemy while in range
+        orbit_angle = math.atan2(enemy_champ["dy_to_me"], enemy_champ["dx_to_me"])
+        orbit_x = enemy_champ["position"]["X"] + math.cos(orbit_angle + math.pi/4) * optimal_range
+        orbit_y = enemy_champ["position"]["Y"] + math.sin(orbit_angle + math.pi/4) * optimal_range
+        return (1, [orbit_y, orbit_x])
+</policy>
+</example>
+
+<task>
+You must now return the new policy based on <example></example>.
+Simply infill and complete the tags below.
+DO NOT PROVIDE ANY PREAMBLE OR IRRELEVANT TEXT, FILL IN THE TEMPLATE AS REQUIRED.
+</task>
+
+<thinking>

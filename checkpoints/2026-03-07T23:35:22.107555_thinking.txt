@@ -1,0 +1,55 @@
+<thinking>
+Let me analyze the experience data carefully:
+
+1. **T0-T1251**: Bot is at (6350,6350), enemy at (1300,1300). Distance ~7100. Bot isn't moving at all - just sitting still. No reward change.
+
+2. **T1514**: Enemy R projectiles appear (EzrealTrueshotBarrage). Bot still sitting at (6350,6350).
+
+3. **T2006**: Bot finally starts moving slightly to (6416,6383). Projectiles getting closer.
+
+4. **T2268**: **HP drops from 100% to 64%!** Got hit by the enemy's R (TrueshotBarrage). Bot tried to dodge but was too late. Enemy also at 64% - likely our R hit them too? No, we didn't cast anything. Both took damage simultaneously - this is the mirror matchup.
+
+5. **T2531**: Bot at (6121,6718) - moved after getting hit. HP still 64%.
+
+6. **T3516**: Enemy HP drops to 30%! Our HP still 65%. Something hit the enemy.
+
+7. **T6019-T6511**: Bot fires Q (EzrealMysticShot appears from our side). Enemy Q also fired.
+
+8. **T6774**: **Our HP drops from 65% to 52%!** Got hit by enemy Q. Enemy drops to 17%.
+
+9. **T7264**: **Our HP drops from 52% to 38%!** Hit again. Enemy at 18%.
+
+10. **T7524**: Bot at (6760,7279) - E'd away? But enemy is at (979,623). Distance is huge (~8500+).
+
+11. **T7524-T17751**: Bot slowly walks toward enemy but NEVER actually engages. Enemy is at ~5-19% HP for most of this time. Bot has all abilities up (Q0W0E0R0) the ENTIRE time. Bot walks from ~(6760,7279) to ~(7808,8063) over thousands of timesteps while enemy is at the opposite corner near (500-1200, 500-1000).
+
+12. **T15032**: Our HP drops to 23%! Still walking slowly. Enemy at 5%.
+
+13. **T16769-T17031**: Our HP drops to 5%! Enemy at 6%. We're about to die.
+
+**Key Problems:**
+
+1. **NOT USING ABILITIES**: The bot has R ready and enemy is ~6000+ units away at very low HP. The R (TrueshotBarrage) has essentially global range. The bot should be using R to finish off the low HP enemy but it never does because the policy's R condition requires `enemy_dist < 4000`. The enemy is much farther than 4000.
+
+2. **NOT APPROACHING FAST ENOUGH**: The bot takes thousands of timesteps to slowly walk toward the enemy, gaining maybe 50 units per step. It should be moving more aggressively.
+
+3. **GETTING HIT BY SKILLSHOTS**: At T2268, the bot gets hit by the enemy R. At T6774 and T7264, it gets hit by enemy Q. The dodge logic isn't working well.
+
+4. **NOT USING E AGGRESSIVELY**: When enemy is at 5-17% HP, bot should E forward + Q/W to finish them.
+
+5. **DISTANCE CALCULATION IS WRONG?**: The enemy positions show coordinates like (1300,1300) vs our (6350,6350), distance ~7100. But the policy checks `enemy_dist > optimal_range` (850) and tries to approach, but the step_size is `min(500, enemy_dist - optimal_range + 300)` = 500 per step, with juke. But it only moves ~60 units per step in practice.
+
+6. **R RANGE TOO LOW**: R should be usable at much longer range, especially for execute.
+
+**Fixes needed:**
+
+1. **Increase R range for execute** - R is global, should be used at any range when enemy is low
+2. **Use R immediately when enemy is low** regardless of distance
+3. **Better approach speed** - move directly toward enemy without excessive juking when far away
+4. **Better dodge** - start dodging earlier, move perpendicular more decisively
+5. **Use E to close gap for execute** when enemy is very low
+6. **Don't stand still at start** - move toward enemy immediately
+7. **Cast Q on cooldown when in range**
+8. **Actually auto attack** - need to issue auto attack commands when in range
+
+Let me write an improved policy:

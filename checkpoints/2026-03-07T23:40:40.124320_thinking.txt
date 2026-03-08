@@ -1,0 +1,52 @@
+<thinking>
+Let me analyze the experience data carefully:
+
+1. **Early game (T0-T2002)**: Bot starts at 100% HP, enemy is far away (~6000+ units). Bot slowly moves toward enemy. No action seems to be taken - just walking forward. This is fine.
+
+2. **T2266**: First projectiles appear - two EzrealMysticShots at distances ~400 (262,300 and 328,328). Bot stays still at (6704,6685).
+
+3. **T2532**: HP drops from 100% to 86%! Bot got hit by a Q. Enemy also at 86% (mutual exchange). The bot didn't dodge.
+
+4. **T3027-T3523**: More projectiles incoming. Bot barely moves. HP drops from 86% to 72% at T3523. Got hit again.
+
+5. **T3523-T6281**: Bot is at 72-73% HP and slowly walking toward enemy. Enemy recovers to 87% then stabilizes around 73-74%. Many projectiles are flying but bot seems to be walking straight into them or not dodging effectively.
+
+6. **T7525-T12272**: Bot orbits/approaches but doesn't cast any spells! Q is ready (Q0), enemy is within range (~800 units), but the bot never fires Q. This is a huge issue - the bot has all abilities available but the approach code keeps triggering movement instead of casting spells.
+
+7. **T12502**: HP drops to 61%! Bot got hit by multiple projectiles. The approach/orbit pattern is predictable.
+
+8. **T13520**: HP drops to 43%! Still getting pummeled. Enemy at 72%.
+
+9. **T14777**: HP drops to 26%! 
+
+10. **T16257**: HP drops to 8%! Enemy R (EzrealTrueshotBarrage) appears at T16027.
+
+11. **T17271**: HP at 8%, about to die. Never cast a single spell the entire game.
+
+**Key Problems:**
+
+1. **Never casts spells**: The bot has Q/W/E/R ready the entire time but the policy's distance checks don't match the actual distances. Looking at enemy_dist - the enemy position shows dx/dy values like (590,628) which means distance ~860. Q range check is `enemy_dist < 1150`. But wait - the bot IS approaching. Let me re-check... 
+
+Actually, looking more carefully at the observation format: `ENY72,100,(590,628)` - these are (dx, dy) relative positions, so distance = sqrt(590² + 628²) ≈ 862. Q should fire at 1150 range... Unless `enemy_dist` in the code uses `enemy_champ["distance_to_me"]` which might be different.
+
+Wait, actually the approach code runs when `enemy_dist > optimal_range (900)`. When enemy_dist is ~860, it falls to the else clause (orbit). But Q should still fire since `enemy_dist < 1150`. Let me trace the code flow again...
+
+The dodge section triggers first if projectiles are within 900 distance. Looking at T4776+, there are MANY projectiles within 900. So the bot keeps trying to dodge and never reaches the Q casting code! The dodge logic returns immediately, preventing spell casting.
+
+2. **Dodging is ineffective**: Despite constantly trying to dodge, the bot keeps getting hit. The perpendicular dodge isn't working well - possibly because it dodges one projectile but walks into another.
+
+3. **Never uses abilities offensively**: Because projectile dodge always takes priority and there are always projectiles nearby.
+
+4. **Walking straight toward enemy**: The approach is too linear, making it easy to hit.
+
+**Fixes needed:**
+
+1. **Weave spell casts into dodging** - After dodging, if Q is ready and enemy is in range, cast Q at enemy. Don't just dodge every tick.
+2. **Better dodge logic** - Consider all nearby projectiles, not just closest. Pick a direction that avoids all of them.
+3. **Use E for gap close/escape wisely** - Currently E is barely used.
+4. **Cast Q while dodging** - Q can be cast while moving. Fire Q at enemy between dodge movements.
+5. **Priority should be: dodge VERY close projectiles > cast available spells > dodge distant projectiles > position**
+6. **The bot needs to actually fire back** - It's an Ezreal mirror, needs to trade.
+7. **Lead targets** - Predict where enemy will be when casting Q.
+
+Let me write a better policy:

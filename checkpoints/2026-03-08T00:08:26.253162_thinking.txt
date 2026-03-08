@@ -1,0 +1,89 @@
+<thinking>
+Let me analyze the experience data carefully.
+
+Key observations from the experience:
+
+1. **The bot NEVER casts Q, W, or any spell the entire game.** Looking at every single timestep, Q cooldown is always 0 (ready), W cooldown is always 0, E is always 0, R is always 0. Yet the bot never casts anything. HP stays around 79-83% for us and 79-83% for enemy. No kills, no deaths, 0 gold earned.
+
+2. **The enemy distance is always around 500-1000 units** (computed from dx/dy). For example at T8763: dx=417, dy=283, distance = sqrt(417²+283²) ≈ 504. At T6517: dx=1011, dy=-52, distance ≈ 1012. The bot seems to orbit at around 500-1000 range.
+
+3. **The bot's Q should be firing constantly** since Q is ready (cooldown=0) and enemy is within 1150 range. But looking at the projectile data, I see `EzrealMysticShot` projectiles from BOTH teams (my_team=0 and my_team=1 based on the owner IDs). Wait, the projectile format shows `[owner, dx, dy, speed, name]`. The projectiles with owner `1073741854` and `1073741853` - these seem to alternate. Let me look more carefully.
+
+Actually, looking at the projectile data, there are always pairs. These might be both our and enemy projectiles. But the policy filters by `my_team == 0` for enemy projectiles. The problem is the bot isn't casting spells.
+
+4. **Why isn't Q being cast?** Let me trace through the policy logic:
+   - Q is ready, mp > 5%
+   - Need `computed_dist < 1150 or enemy_dist < 1150`
+   - `computed_dist = sqrt(enemy_dx² + enemy_dy²)`
+   - At T8763: dx=417, dy=283 → computed_dist ≈ 504. This is < 1150!
+   - So Q should be cast... But `actual_target_x = my_x + enemy_dx`, `actual_target_y = my_y + enemy_dy`
+
+Wait - the policy uses `observation["champ_units"]` to get data. But what if `enemy_champ["dx_to_me"]` and `enemy_champ["dy_to_me"]` have different values than what's shown in the compact display?
+
+Actually, looking at the observation spec more carefully, the compact display shows `ENY80,100,(184,49)` where (184,49) might be (dx,dy) to me. The distance would be sqrt(184²+49²) ≈ 190 units. That's well within Q range of 1150.
+
+Wait, but the bot displays projectiles with dx/dy values of 400-700 range. If enemy is only 190 units away, that's very close.
+
+OK let me re-examine. The observation format shows `ENY` with position as `(dx_to_me, dy_to_me)` based on the spec: "Enemy at 50% HP, 80% mana, 333 units right and 36 units up". So the ENY values are dx and dy from our champion.
+
+At T8763: ENY at (417,283), distance = sqrt(417²+283²) ≈ 504.
+
+The policy computes Q targeting and should fire. BUT - there's a critical issue. Let me look at the action return format.
+
+The policy returns `cast_spell(0, actual_target_y, actual_target_x)` which returns `(2, [[0], [target_y, target_x]])`. This looks correct per the action spec.
+
+**Wait - I think I found the issue!** The policy accesses `observation["champ_units"]` but the actual observation might have different field names. Let me check... The policy uses `my_champ["dx_to_me"]` and `my_champ["dy_to_me"]` - but `dx_to_me` for MY champion doesn't make sense. It should be on the enemy champ.
+
+Actually looking more carefully, the policy does use `enemy_champ["dx_to_me"]` which is correct.
+
+Hmm, but the biggest issue is clearly that **the bot never casts any spells** despite them all being off cooldown. Maybe there's a bug where the condition is never met, or the return format is wrong.
+
+Wait - I bet the issue is the **projectile dodging is triggering every single frame**. Let me check: the policy checks `enemy_projectiles` with `distance_to_me < 350`. Looking at projectile data at T8763: projectiles have distances like sqrt(272²+249²)≈369, sqrt(202²+294²)≈357, sqrt(477²+307²)≈567. The first two are close to 350.
+
+Actually many projectiles have distances around 300-500. So the dodge logic is constantly triggering, preventing Q from ever being cast! The projectile check is Priority 4, but Q is Priority 1... 
+
+Oh wait, the priority order in the policy is:
+1. Cast Q (if ready and in range)
+2. Cast W
+3. Cast R
+4. Dodge projectiles
+5. Auto attack
+
+So Q should be checked first. Unless... the Q is being cast but the game isn't registering it? Or maybe the `enemy_dist` field name is wrong?
+
+Let me look at the actual field: `enemy_dist = enemy_champ["distance_to_me"]`. If this field doesn't exist, it would throw an error. But the bot seems to be running...
+
+Actually, the biggest clue is the HP changes. At T2267, both ME and ENY dropped from 100% to 86%. At T5268, ME dropped to 82% and ENY to 83%. Some Q's are landing. But then from T6023 onwards, ME stays at 79% and ENY at 79-80%. Both stop taking damage.
+
+This suggests the bot WAS casting Q early on (when close), but then started orbiting at a distance where the orbiting behavior dominates. Looking at the distances from T8000 onwards, enemy dx/dy shows distances of about 190 units (e.g., (184,49) → 190). That's well within Q range.
+
+**NEW THEORY**: The bot IS trying to cast Q, but the game server might be buffering/ignoring rapid spell casts. Or the observations show Q cooldown as 0 but it's actually on cooldown during the tick.
+
+Actually, I think the real problem is simpler. Looking at the experience from T8000-T24000 (about 16 seconds of game time), the bot is just orbiting endlessly. The enemy distance stays around 190 units. Q cooldown is always 0. The bot should be casting Q every frame.
+
+**The most likely explanation**: The bot IS casting Q (returning cast_spell), but it's targeting incorrectly, or there's a fundamental misunderstanding of the coordinate system.
+
+Look at positions: ME at (6910,6971) and ENY dx=184, dy=49. So enemy position = (6910+184, 6971+49) = (7094, 7020). The cast target would be (7094, 7020). That seems correct.
+
+Wait - `actual_target_y = my_y + enemy_dy` and `actual_target_x = my_x + enemy_dx`. With my_y=6910, my_x=6971, enemy_dy=184, enemy_dx=49... But are dx/dy in (y,x) or (x,y) format? The position format says (y,x). If enemy_dx is actually the x-component and enemy_dy is the y-component, then:
+- target_x = my_x + enemy_dx = 6971 + 49 = 7020
+- target_y = my_y + enemy_dy = 6910 + 184 = 7094
+
+This might be correct or might be swapped. Let me check the obs spec example: "Enemy at 50% HP... 333 units right and 36 units up". Position is (y,x). So dx=333 (right = +x) and dy=36 (up = +y). The field `dx_to_me` would be the x-difference, `dy_to_me` the y-difference.
+
+I think the real problem is the bot is casting Q but the projectile just misses because it's not leading the target. Also, both bots seem stuck in a loop doing the exact same movements.
+
+**Key problems to fix:**
+1. The bot is stuck in an endless orbit pattern - never dealing damage after initial exchange
+2. Q should be cast more aggressively with lead prediction
+3. The orbiting pattern is too predictable - the bot and enemy settle into equilibrium
+4. Need to actually close and trade, not just orbit forever at ~190 distance
+
+**New policy approach:**
+1. Always try to cast Q when ready - it's the primary damage tool
+2. Lead the target when casting Q (predict enemy movement)
+3. Use W after Q for combo damage
+4. Move between spell casts (kiting)
+5. Be more aggressive about engaging
+6. Better dodge logic that doesn't prevent attacking
+7. Use game_time to create varied movement patterns instead of predictable orbits

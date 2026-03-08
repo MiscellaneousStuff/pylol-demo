@@ -1,0 +1,51 @@
+<thinking>
+Let me analyze the experience data carefully:
+
+1. **Initial phase (T0-T1774)**: Bot starts at 100% HP, enemy at 100% HP. Bot slowly moves toward enemy. Both at full HP until around T2268.
+
+2. **T2268**: Projectiles appear (EzrealMysticShot). The bot is at position (6712, 6679), enemy at (575, 640) relative distance. Enemy projectiles incoming.
+
+3. **T2532**: Bot drops to 86% HP, enemy also drops to 86% HP. Both traded hits. Some reward gained from damaging enemy, but also lost from taking damage.
+
+4. **T3521-T5007**: Bot HP keeps dropping: 86% → 69% → 55%. Enemy HP drops too: 72% → 59% → 60%. Bot is taking MORE damage than dealing.
+
+5. **T6027-T7010**: Bot drops to 42% → 38% → 24%. Enemy stays at 56-57%. Bot is getting destroyed. The HP differential is massive - bot went from even to being at 24% while enemy is at 57%.
+
+6. **T7274 onwards**: Bot at 24-28% HP, enemy at 57-61% HP. Bot seems to just be moving around dodging/kiting but NOT casting any spells. All abilities show Q0W0E0R0 (all ready!) but the bot never casts them!
+
+**Key Issues Identified:**
+
+1. **CRITICAL BUG - Bot never casts spells after the initial engage**: Looking at the observations, the enemy distance (dx, dy) shows values like (575, 640), (471, 567), etc. The `enemy_dist = sqrt(575² + 640²) ≈ 860`. This is within Q range (1150) and W range (950). Yet the bot keeps moving instead of casting.
+
+Wait, let me look more carefully. The enemy position uses `dx_to_me` and `dy_to_me`. At T2268, enemy dx=575, dy=640, so distance ≈ 860. Q is ready (Q0), enemy_dist < 1150, mp > 0.05. So Q should fire. But the bot has projectiles nearby...
+
+Looking at T2268: projectiles [246,319] distance ~400 and [310,339] distance ~460. Neither is < 250, so imminent_threat is None. So the bot should cast Q. But then at T2532 both are at 86% HP, suggesting trade happened.
+
+After T5007: Bot is at 55% HP. Looking at T5271, enemy projectiles have distance [349,303]~462 and [238,283]~370 and another at [-438,-199]~480. None < 250. So Q should fire since it's ready and enemy_dist ≈ sqrt(471²+567²) ≈ 737 < 1150. 
+
+But wait - from T7274 onwards, the bot is at 24% HP and enemy at 57%. The low HP retreat condition kicks in: `my_hp_pct < 0.15` is False (24% > 15%). But enemy_hp_pct (57%) > my_hp_pct (24%) + 0.15 = 39%. So retreat doesn't trigger either (24% < 15% is false). 
+
+Actually wait: `if my_hp_pct < 0.15 and enemy_hp_pct > my_hp_pct + 0.15:` - 24% is NOT < 15%, so retreat doesn't trigger.
+
+So the bot should still be casting spells... but why does HP stay at 24-28% and enemy at 57-61%? Is the bot even hitting abilities?
+
+Looking at the projectile lists from T7274+, I see many `1073741854` (enemy team) and `1073741853` (my team) projectiles. So both sides ARE casting. But the bot's HP isn't going down further either.
+
+The real problem is **the bot lost the trade badly from T2532 to T7010** (86% → 24% while enemy went 86% → 57%). It's taking way too many hits.
+
+**Core problems:**
+1. **Dodging is terrible**: The 250 distance threshold for imminent_threat is way too small. Projectiles at 300-500 distance are about to hit but the bot doesn't dodge.
+2. **Bot doesn't retreat when losing trades**: At 42% HP vs 57% HP enemy, it should back off.
+3. **Lead targeting is bad**: The sinusoidal lead offset is basically random and won't help hit anything.
+4. **Approach is too aggressive**: Walking straight into skillshot range without dodging.
+5. **No auto-attacks being used**: The action space includes "auto" but the bot never uses auto attacks.
+
+**Key fixes needed:**
+1. Increase projectile dodge threshold significantly (to 500-600)
+2. Add proper retreat logic when HP disadvantaged
+3. Actually dodge projectiles - the current lateral movement pattern doesn't react to projectiles well
+4. Cast spells more intelligently, leading targets
+5. Consider using E (Arcane Shift) more aggressively for repositioning
+6. The retreat HP threshold of 15% is way too low - should be higher like 35%
+
+Let me write a new policy:

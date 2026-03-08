@@ -1,0 +1,49 @@
+<thinking>
+Let me analyze the experience data carefully.
+
+**Key Observations:**
+
+1. **The bot never casts any spells.** Looking at the entire experience, the bot's HP drops from 100% to ~50% over time, and the enemy's HP also drops similarly. But the bot has all abilities ready (Q0W0E0R0) the entire game and never uses them. The enemy distance is consistently around 1000-1500 units, which is within Q range (1150) for most of the game.
+
+2. **The bot gets hit by projectiles repeatedly.** At T2033, projectiles appear and by T2526, both champions drop to 86% HP. At T3021, more projectiles, and by T3517 both drop to ~72%. This pattern continues - the bot takes damage from EzrealMysticShot repeatedly.
+
+3. **The bot never engages.** It just orbits/zigzags at ~1000-1500 distance, never closing to cast Q (which has 1150 range). The enemy distance hovers between 900-1500, meaning Q would be in range frequently, but the bot only moves.
+
+4. **Why isn't it casting?** Looking at the policy: Q is cast when `enemy_dist < 1150`. The enemy distance is computed from `enemy_champ["distance_to_me"]`. The distances shown are ~900-1500 (the dx/dy values suggest distances of about 900-1500). When enemy is at (605, 632) relative, that's ~875 distance - Q should fire! But it seems like the bot is just moving.
+
+Wait - looking more carefully at the observations: the PROJ entries show `dx_to_me` and `dy_to_me` values. The enemy distances like (605, 632) would be sqrt(605² + 632²) ≈ 875. That's within Q range (1150). So Q should fire...
+
+But looking at the actual behavior - the bot position barely changes for many timesteps, suggesting it's stuck in the movement/dodge logic. The issue is that projectiles are ALWAYS present in later timesteps (there are always 4 projectiles visible), and the dodge logic triggers when projectiles are < 300 distance. But the projectile distances shown are typically 300-1100.
+
+Actually wait - the `distance_to_me` for projectiles isn't shown directly, we'd need to compute it from dx/dy. Looking at projectile entries like `[1073741854,605,632,2000,EzrealMysticShot]` - if dx=605, dy=632, distance = ~875. That's > 300, so dodge wouldn't trigger.
+
+So the bot should be hitting Priority 2 (cast offensive spells). Enemy dist ~875 < 1150, Q ready, mp > 0.05... it should cast Q! But it doesn't seem to be doing so based on the HP patterns - both champions lose HP at similar rates, suggesting mutual auto attacks or something.
+
+Actually wait - looking more carefully at the experience from T5264 onwards, the bot IS moving (position changes), suggesting it's executing movement commands. But it never casts spells despite being in range.
+
+Let me re-examine: maybe the `distance_to_me` field for enemy_champ is different from what I'm computing from dx/dy. The observation format shows ENY entries like `ENY47,100,(605,632),L1` - this means the enemy dx_to_me is 605 and dy_to_me is 632? Or position (605, 632)?
+
+Looking at the obs spec: "ENY50,80,(333,36),L1" - "(333,36)" means "333 units right and 36 units up". So enemy dx/dy to me.
+
+So enemy_dist = sqrt(605² + 632²) ≈ 875 units. Q range is 1150. It SHOULD be casting Q.
+
+But from T1771 to T5264, the bot position doesn't change (6697, 6683). It's standing still! And spells are available. This suggests the policy is returning something that doesn't actually move or cast.
+
+Oh! I see the issue. From T2033-T5264, the bot stands still while getting hit. The projectiles at distance ~875 are > 300, so no dodge triggers. Enemy dist ~875 < 1150 and Q ready... the policy should cast Q. Unless the `enemy_dist` calculation is wrong in the actual code.
+
+Actually - the real problem might be simpler. The bot is playing as Ezreal mirror match. Both sides fire Q at each other. The bot's Qs are landing (enemy HP drops too), but the bot fails to dodge enemy Qs.
+
+**Critical Issues:**
+1. **Bot stands completely still** from T1771-T5264 (multiple seconds!) while getting pelted by enemy Qs. It should be moving between spell casts.
+2. **Projectile dodging is terrible** - the 300 distance threshold is way too small. By the time a 2000 speed projectile is 300 units away, you have 0.15 seconds to react. It needs to dodge at 600+ range.
+3. **The bot never actually casts spells in the observed data** - or if it does, it immediately goes back to just moving. Actually looking at enemy HP dropping, maybe both are casting Qs. But the bot takes way too much damage by standing still.
+4. **No auto-attacks are ever used** - the bot should auto-attack when in range (~525 for Ezreal).
+
+**New Policy Priorities:**
+1. Dodge projectiles at larger range (600+) and perpendicular to projectile travel direction (not dx_to_me)
+2. Cast Q on cooldown when in range
+3. Use W for additional damage 
+4. Auto-attack when in range
+5. Maintain proper spacing (~800-900 range for Ezreal Q poke)
+6. Use E defensively for close projectiles or offensively for kills
+7. Always be moving between actions - never stand still
