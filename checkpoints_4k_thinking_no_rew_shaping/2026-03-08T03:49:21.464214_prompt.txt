@@ -1,0 +1,634 @@
+
+You are T1 Faker, the best league of legends player in the world.
+
+You are observing the behaviour of an autonomous League of Legends scripting bot.
+The bot is currently acting on a hand-crafted python based policy.
+You will be provided the observations, actions and calculated reward for each timestep in game.
+
+You must improve the policy of the agent based on its gathered experience playing the game.
+You must determine instances where either its reward dropped immediately, or it performed
+an action later down the line which caused its reward to drop (getting hit by an enemy projectile,
+dying, etc.)
+
+You must also utilise the <history></history> section which contains the <thinking/> history during
+the entire optimisation process. This contains descriptions, corrections and other observations
+of agent behaviour during the training process. You *MUST* use this information to avoid cyclically
+updating your policy and forgetting parts of the policy which have already been learned.
+You must also use the most recent game data you have been given AS WELL AS the information contained
+in <history/>.
+
+<game_context priority="CRUCIAL">
+- Cooldowns are disabled (meaning there are no cooldowns) during this demo.
+</game_context>
+
+<priority value='LIFE AND DEATH' Crucially, limit your thinking to under 4000 words. We want fast iteration.</priority>
+
+
+
+<observation-spec>
+
+The observation data represents a League of Legends game state. Let me explain the key parts:
+
+1. Time Format (T{seconds}):
+   Shows game time in seconds
+   
+2. Champion State (ME/ENY):
+   - Health/Mana as percentages
+   - Position as (y, x) coordinates
+   - Level and gold
+   - Kills/Deaths
+   
+3. Ability Status (QWER):
+   - Cooldowns in seconds
+   - 0 means ability is ready
+   
+4. Projectiles (PROJ):
+   - Each [owner,dx,dy,speed,name]
+   - dx/dy shows direction relative to player
+   - Negative dx means projectile moving left
+   - Negative dy means projectile moving down
+   
+5. Available Actions (ACT):
+   - List of currently possible actions
+   - move: Can move
+   - auto: Can auto attack
+   - q/w/e/r: Can cast abilities
+
+For example:
+T12262|ME80,100,(9553,9271),L1,G35,K0D0|Q0W0E0R0|ENY50,80,(333,36),L1|PROJ[1234,-100,50,2000,EzQ]|ACT[move,q]
+
+This shows:
+- 12262 seconds into game
+- I'm at 80% HP, full mana, position (9553,9271)
+- Level 1, 35 gold, no kills/deaths
+- All abilities ready (0 cooldown)
+- Enemy at 50% HP, 80% mana, 333 units right and 36 units up
+- One enemy projectile moving left and slightly up
+
+This format preserves all tactical information while being much more compact than raw JSON.
+
+</observation-spec>
+
+<action-spec>
+
+<spell_options>
+SPELL_OPTIONS = (
+    ("Q", 0),
+    ("W", 1),
+    ("E", 2),
+    ("R", 3),
+    ("Sum1", 4),
+    ("Sum2", 5)
+)
+</spell_options>
+<action_ids>
+0 - no_op
+1 - move
+2 - spell
+</action_ids>
+<arg_type>
+Point - (y, x) (Range between 0 and 16000 inclusive)
+</arg_type>
+<action_args>
+no_op - None
+move  - Point (y, x)
+spell - Spell Option, Point
+</action_args>
+
+<example>
+<action_name>spell</action_name>
+<action_id>2</action_id>
+<action_args>
+[[0],[0, 8000]]
+</action_args>
+</example>
+
+</action-spec>
+
+<current-policy>
+def act(self, observation):
+    import math
+
+    my_champ = next(unit for unit in observation["champ_units"] if unit["my_team"] == 1)
+    enemy_champ = next(unit for unit in observation["champ_units"] if unit["my_team"] == 0)
+
+    my_hp_pct = my_champ["current_hp"] / max(my_champ["max_hp"], 1)
+    enemy_hp_pct = enemy_champ["current_hp"] / max(enemy_champ["max_hp"], 1)
+    my_x = my_champ["position"]["X"]
+    my_y = my_champ["position"]["Y"]
+    enemy_dx = enemy_champ["dx_to_me"]
+    enemy_dy = enemy_champ["dy_to_me"]
+    enemy_dist = enemy_champ["distance_to_me"]
+    enemy_x = enemy_champ["position"]["X"]
+    enemy_y = enemy_champ["position"]["Y"]
+
+    q_ready = my_champ["q_cooldown"] == 0
+    w_ready = my_champ["w_cooldown"] == 0
+    e_ready = my_champ["e_cooldown"] == 0
+    r_ready = my_champ["r_cooldown"] == 0
+
+    game_time = observation["game_time"]
+
+    # Identify truly threatening enemy projectiles heading toward us
+    threatening = []
+    for p in observation["projectiles"]:
+        if p["my_team"] == 0:
+            dist = p["distance_to_me"]
+            # Only consider projectiles that are close enough to be a real threat
+            if dist < 500:
+                threatening.append(p)
+
+    # PRIORITY 0: Dodge close threatening projectiles FIRST (survival)
+    # This prevents the massive HP drops we've been seeing from enemy R
+    if threatening:
+        closest = min(threatening, key=lambda p: p["distance_to_me"])
+        pdx = closest["dx_to_me"]
+        pdy = closest["dy_to_me"]
+        # Move perpendicular to projectile direction
+        perp_x = -pdy
+        perp_y = pdx
+        mag = math.sqrt(perp_x ** 2 + perp_y ** 2)
+        if mag > 0:
+            perp_x /= mag
+            perp_y /= mag
+
+        # Use E to dodge if projectile is very close and E is ready
+        if closest["distance_to_me"] < 250 and e_ready:
+            e_x = my_x + perp_x * 475
+            e_y = my_y + perp_y * 475
+            return (2, [[2], [e_y, e_x]])
+
+        dodge_x = my_x + perp_x * 350
+        dodge_y = my_y + perp_y * 350
+        return (1, [dodge_y, dodge_x])
+
+    # PRIORITY 1: R is GLOBAL range - use it liberally, especially when far away
+    # No cooldowns means we can spam R for massive damage while approaching
+    if r_ready:
+        # Lead the target slightly when far away
+        angle_to = math.atan2(enemy_dy, enemy_dx)
+        # More lead at longer distances
+        lead_amount = min(enemy_dist * 0.1, 300)
+        lead_offset = math.sin(game_time * 0.017) * lead_amount
+        r_x = enemy_x + math.cos(angle_to + math.pi / 2) * lead_offset
+        r_y = enemy_y + math.sin(angle_to + math.pi / 2) * lead_offset
+        return (2, [[3], [r_y, r_x]])
+
+    # PRIORITY 2: Q spam when in range (1150 range)
+    if q_ready and enemy_dist < 1150:
+        angle_to = math.atan2(enemy_dy, enemy_dx)
+        # Vary aim to increase hit chance
+        lead_offset = math.sin(game_time * 0.013) * 130
+        q_x = enemy_x + math.cos(angle_to + math.pi / 2) * lead_offset
+        q_y = enemy_y + math.sin(angle_to + math.pi / 2) * lead_offset
+        return (2, [[0], [q_y, q_x]])
+
+    # PRIORITY 3: W for mark damage
+    if w_ready and enemy_dist < 1000:
+        angle_to = math.atan2(enemy_dy, enemy_dx)
+        lead_offset = math.cos(game_time * 0.011) * 100
+        w_x = enemy_x + math.cos(angle_to + math.pi / 2) * lead_offset
+        w_y = enemy_y + math.sin(angle_to + math.pi / 2) * lead_offset
+        return (2, [[1], [w_y, w_x]])
+
+    # PRIORITY 4: Use E to close gap when far away
+    if e_ready and enemy_dist > 1200 and my_hp_pct > 0.25:
+        angle_to = math.atan2(enemy_dy, enemy_dx)
+        e_x = my_x + math.cos(angle_to) * 475
+        e_y = my_y + math.sin(angle_to) * 475
+        return (2, [[2], [e_y, e_x]])
+
+    # PRIORITY 5: Movement/Positioning
+    if enemy_dist > 1000:
+        # Approach enemy directly but with slight juke to avoid skillshots
+        angle_to = math.atan2(enemy_dy, enemy_dx)
+        juke = math.sin(game_time * 0.009) * math.pi / 6
+        move_angle = angle_to + juke
+        mx = my_x + math.cos(move_angle) * 400
+        my = my_y + math.sin(move_angle) * 400
+        return (1, [my, mx])
+
+    if enemy_dist < 350:
+        # Too close, kite back slightly
+        angle_away = math.atan2(-enemy_dy, -enemy_dx)
+        mx = my_x + math.cos(angle_away) * 350
+        my = my_y + math.sin(angle_away) * 350
+        return (1, [my, mx])
+
+    # In optimal range (350-1000): unpredictable juking movement
+    angle_to = math.atan2(enemy_dy, enemy_dx)
+    t = game_time
+    juke1 = math.sin(t * 0.013) * 0.8
+    juke2 = math.sin(t * 0.0071 + 1.9) * 0.5
+    juke3 = math.sin(t * 0.023 + 0.5) * 0.3
+    combined = juke1 + juke2 + juke3
+    orbit_angle = angle_to + (math.pi / 2) * combined
+    mx = my_x + math.cos(orbit_angle) * 280
+    my = my_y + math.sin(orbit_angle) * 280
+    return (1, [my, mx])
+</current-policy>
+
+<experience>
+T33|ME88,100,(26,280),L1,G35,K0D0|Q0W0E0R0|ENY88,100,(13901,13895),L1|PROJ|ACT[no_op,move,auto,spell_0,spell_1,spell_2,spell_3,spell_4,spell_5]
+T0|ME100,100,(6350,6350),L1,G35,K0D0|Q0W0E0R0|ENY100,100,(1300,1300),L1|PROJ|ACT[no_op,move,auto,spell_0,spell_1,spell_2,spell_3,spell_4,spell_5]
+T265|ME100,100,(6350,6350),L1,G35,K0D0|Q0W0E0R0|ENY100,100,(1300,1300),L1|PROJ|ACT[no_op,move,auto,spell_0,spell_1,spell_2,spell_3,spell_4,spell_5]
+T526|ME100,100,(6350,6350),L1,G35,K0D0|Q0W0E0R0|ENY100,100,(1300,1300),L1|PROJ|ACT[no_op,move,auto,spell_0,spell_1,spell_2,spell_3,spell_4,spell_5]
+T757|ME100,100,(6350,6350),L1,G35,K0D0|Q0W0E0R0|ENY100,100,(1300,1300),L1|PROJ|ACT[no_op,move,auto,spell_0,spell_1,spell_2,spell_3,spell_4,spell_5]
+T1020|ME100,100,(6350,6350),L1,G35,K0D0|Q0W0E0R0|ENY100,100,(1300,1300),L1|PROJ|ACT[no_op,move,auto,spell_0,spell_1,spell_2,spell_3,spell_4,spell_5]
+T1282|ME100,100,(6350,6350),L1,G35,K0D0|Q0W0E0R0|ENY100,100,(1300,1300),L1|PROJ[1073741854,1300,1300,2000,EzrealTrueshotBarrage][1073741853,0,0,2000,EzrealTrueshotBarrage]|ACT[no_op,move,auto,spell_0,spell_1,spell_2,spell_3,spell_4,spell_5]
+T1511|ME100,100,(6350,6350),L1,G35,K0D0|Q0W0E0R0|ENY100,100,(1300,1300),L1|PROJ[1073741854,974,974,2000,EzrealTrueshotBarrage][1073741853,325,325,2000,EzrealTrueshotBarrage]|ACT[no_op,move,auto,spell_0,spell_1,spell_2,spell_3,spell_4,spell_5]
+T1774|ME100,100,(6350,6350),L1,G35,K0D0|Q0W0E0R0|ENY100,100,(1300,1300),L1|PROJ[1073741854,603,603,2000,EzrealTrueshotBarrage][1073741853,696,696,2000,EzrealTrueshotBarrage]|ACT[no_op,move,auto,spell_0,spell_1,spell_2,spell_3,spell_4,spell_5]
+T2006|ME100,100,(6350,6350),L1,G35,K0D0|Q0W0E0R0|ENY100,100,(1300,1300),L1|PROJ[1073741854,276,276,2000,EzrealTrueshotBarrage][1073741853,1023,1023,2000,EzrealTrueshotBarrage]|ACT[no_op,move,auto,spell_0,spell_1,spell_2,spell_3,spell_4,spell_5]
+T2268|ME64,100,(6685,6685),L1,G35,K0D0|Q0W0E0R0|ENY64,100,(629,629),L1|PROJ[1073741854,-431,-431,2000,EzrealTrueshotBarrage][1073741853,1061,1061,2000,EzrealTrueshotBarrage]|ACT[no_op,move,auto,spell_0,spell_1,spell_2,spell_3,spell_4,spell_5]
+T2532|ME64,100,(6685,6685),L1,G35,K0D0|Q0W0E0R0|ENY64,100,(629,629),L1|PROJ[1073741854,-802,-802,2000,EzrealTrueshotBarrage][1073741853,1432,1432,2000,EzrealTrueshotBarrage][1073741854,629,629,2000,EzrealTrueshotBarrage][1073741853,0,0,2000,EzrealTrueshotBarrage]|ACT[no_op,move,auto,spell_0,spell_1,spell_2,spell_3,spell_4,spell_5]
+T2760|ME65,100,(6685,6685),L1,G35,K0D0|Q0W0E0R0|ENY65,100,(629,629),L1|PROJ[1073741854,-1126,-1126,2000,EzrealTrueshotBarrage][1073741853,1756,1756,2000,EzrealTrueshotBarrage][1073741854,297,313,2000,EzrealTrueshotBarrage][1073741853,331,315,2000,EzrealTrueshotBarrage]|ACT[no_op,move,auto,spell_0,spell_1,spell_2,spell_3,spell_4,spell_5]
+T3022|ME30,100,(6685,6685),L1,G35,K0D0|Q0W0E0R0|ENY30,100,(629,629),L1|PROJ[1073741854,-1495,-1495,2000,EzrealTrueshotBarrage][1073741853,2125,2125,2000,EzrealTrueshotBarrage][1073741854,-80,-45,2000,EzrealTrueshotBarrage][1073741853,710,674,2000,EzrealTrueshotBarrage][1073741853,276,364,2000,EzrealMysticShot][1073741854,353,265,2000,EzrealMysticShot]|ACT[no_op,move,auto,spell_0,spell_1,spell_2,spell_3,spell_4,spell_5]
+T3251|ME16,100,(6726,6622),L1,G35,K0D0|Q0W0E0R0|ENY16,100,(546,753),L1|PROJ[1073741854,-1861,-1758,2000,EzrealTrueshotBarrage][1073741853,2408,2512,2000,EzrealTrueshotBarrage][1073741854,-455,-299,2000,EzrealTrueshotBarrage][1073741853,1001,1053,2000,EzrealTrueshotBarrage]|ACT[no_op,move,auto,spell_0,spell_1,spell_2,spell_3,spell_4,spell_5]
+T3514|ME16,100,(6655,6670),L1,G35,K0D0|Q0W0E0R0|ENY16,100,(688,658),L1|PROJ[1073741854,-2162,-2177,2000,EzrealTrueshotBarrage][1073741853,2851,2836,2000,EzrealTrueshotBarrage][1073741854,-764,-709,2000,EzrealTrueshotBarrage][1073741853,1453,1367,2000,EzrealTrueshotBarrage]|ACT[no_op,move,auto,spell_0,spell_1,spell_2,spell_3,spell_4,spell_5]
+T3777|ME16,100,(6655,6670),L1,G35,K0D0|Q0W0E0R0|ENY16,100,(688,658),L1|PROJ[1073741854,-2533,-2548,2000,EzrealTrueshotBarrage][1073741853,3223,3208,2000,EzrealTrueshotBarrage][1073741854,-1145,-1071,2000,EzrealTrueshotBarrage][1073741853,1834,1729,2000,EzrealTrueshotBarrage]|ACT[no_op,move,auto,spell_0,spell_1,spell_2,spell_3,spell_4,spell_5]
+T4006|ME16,100,(6655,6670),L1,G35,K0D0|Q0W0E0R0|ENY16,100,(688,658),L1|PROJ[1073741854,-2858,-2873,2000,EzrealTrueshotBarrage][1073741853,3547,3532,2000,EzrealTrueshotBarrage][1073741854,-1478,-1387,2000,EzrealTrueshotBarrage][1073741853,2166,2046,2000,EzrealTrueshotBarrage]|ACT[no_op,move,auto,spell_0,spell_1,spell_2,spell_3,spell_4,spell_5]
+T4268|ME16,100,(6655,6670),L1,G35,K0D0|Q0W0E0R0|ENY16,100,(688,658),L1|PROJ[1073741854,-3228,-3243,2000,EzrealTrueshotBarrage][1073741853,3918,3903,2000,EzrealTrueshotBarrage][1073741854,-1858,-1748,2000,EzrealTrueshotBarrage][1073741853,2546,2406,2000,EzrealTrueshotBarrage]|ACT[no_op,move,auto,spell_0,spell_1,spell_2,spell_3,spell_4,spell_5]
+T4531|ME16,100,(6655,6670),L1,G35,K0D0|Q0W0E0R0|ENY16,100,(688,658),L1|PROJ[1073741854,-3600,-3615,2000,EzrealTrueshotBarrage][1073741853,4290,4275,2000,EzrealTrueshotBarrage][1073741854,-2239,-2110,2000,EzrealTrueshotBarrage][1073741853,2927,2769,2000,EzrealTrueshotBarrage][1073741854,688,658,2000,EzrealTrueshotBarrage][1073741853,0,0,2000,EzrealTrueshotBarrage]|ACT[no_op,move,auto,spell_0,spell_1,spell_2,spell_3,spell_4,spell_5]
+T4761|ME17,100,(6655,6670),L1,G35,K0D0|Q0W0E0R0|ENY17,100,(688,658),L1|PROJ[1073741854,-3926,-3941,2000,EzrealTrueshotBarrage][1073741853,4615,4600,2000,EzrealTrueshotBarrage][1073741854,-2573,-2428,2000,EzrealTrueshotBarrage][1073741853,3261,3086,2000,EzrealTrueshotBarrage][1073741854,364,331,2000,EzrealTrueshotBarrage][1073741853,324,327,2000,EzrealTrueshotBarrage]|ACT[no_op,move,auto,spell_0,spell_1,spell_2,spell_3,spell_4,spell_5]
+</experience>
+
+<history>
+Looking at the experience data, I can see several critical issues:
+
+1. **Both champions are Ezreal** (mirror match) - I can see EzrealMysticShot projectiles.
+
+2. **The bot is walking straight at the enemy** - My position goes from (6350,6350) toward the enemy at ~(1300,1300), steadily approaching. The enemy position relative to me starts at ~(1300,1300) dx/dy and shrinks to (30,30).
+
+3. **HP drops from 100% to 6%** - The bot is getting hit by every single Q (EzrealMysticShot) because it walks in a straight line directly toward the enemy. Both champions trade evenly since they walk at each other.
+
+4. **The current policy is bizarre** - It alternates between moving toward enemy and casting Q based on game_time modulo. The position format is also wrong - it passes `[enemy_champ_x, enemy_champ_y]` but the action spec says Point is `(y, x)`.
+
+5. **No dodging at all** - Multiple projectiles are visible in observations but the bot never tries to dodge them. The projectiles have positive dx/dy values (coming toward me) and the bot walks right into them.
+
+6. **The bot never uses W, E, R** - Only Q is cast occasionally via the modulo logic.
+
+Key improvements needed:
+- **Dodge projectiles** - Move perpendicular to incoming projectiles
+- **Use all abilities** - W (Essence Flux), E (Arcane Shift for mobility/dodge), R (Trueshot Barrage)
+- **Don't walk in a straight line** - Juke/wiggle to avoid skillshots
+- **Maintain proper range** - Don't walk directly on top of the enemy
+- **Fix coordinate ordering** - Actions use (y, x) format
+- **Spam abilities since cooldowns are disabled** - This is huge! No cooldowns means we should be casting Q constantly while dodging
+
+Since cooldowns are disabled, the optimal strategy is to spam Q while dodging enemy Q's. E can be used for repositioning/dodging. We should maintain a range where we can hit Q but also have time to react to enemy Q.
+---
+<thinking>
+Let me analyze the experience data carefully:
+
+1. **The bot starts at (6350,6350), enemy at (1300,1300)** - they're far apart (~7000 units)
+2. **The bot slowly approaches** - position changes gradually toward enemy
+3. **At T2528, first projectiles appear** - both Q's fired, and at T2761 both drop to 86% HP (both got hit)
+4. **After that initial exchange, HP barely changes** - goes from 86% to ~91% over time (natural regen), meaning the bot IS dodging projectiles somewhat
+5. **But the bot NEVER CASTS ANY ABILITIES after the initial exchange** - This is the critical problem!
+
+Looking at the projectile data more carefully: After T3518, there are always 4 projectiles (2 pairs of Q's from each side). The bot's Q and W projectiles AND enemy projectiles are all visible. The dx/dy values on many enemy projectiles are large negative numbers (already past the bot), meaning they already missed.
+
+**Key Issues:**
+1. **The bot stopped casting abilities entirely after the first exchange** - It's only dodging/moving. Enemy dist stays around 500-800 range but the bot never casts Q, W, or R.
+2. Looking at the policy: when `nearby_projectiles` exist (which is ALWAYS since there are always projectiles flying around from both sides), it enters the dodge block and NEVER gets to the attack code. The dodge check at distance < 900 catches everything.
+3. The bot E-shifts away when projectiles are < 400, which teleports it far away, then it has to re-approach.
+4. The enemy is slowly regenerating HP while we don't deal damage.
+
+**Root Cause Analysis:**
+- The projectile filter `distance_to_me < 900` is too generous - it catches projectiles that have already passed or aren't threatening
+- The bot needs to distinguish between projectiles heading TOWARD it vs already past it
+- The bot should be able to attack AND dodge - not just dodge exclusively
+- With NO COOLDOWNS, the bot should be spamming Q/W constantly while dodging
+
+**What the ideal Ezreal play looks like:**
+1. Maintain ~700-900 range (Q range is ~1150)
+2. Spam Q constantly (no cooldowns!)
+3. Use W to mark, then Q to proc it for bonus damage
+4. Sidestep enemy Q's by moving perpendicular
+5. Use E to dodge only critical skillshots, or to reposition aggressively
+6. Use R when enemy is low
+
+**Key fixes needed:**
+1. Filter projectiles better - only dodge ones actually heading toward us and close
+2. Cast Q/W EVERY frame if possible, not just when no projectiles exist
+3. Interleave attacking and dodging - cast spells TOWARD enemy while moving to dodge
+4. The bot should prioritize casting Q even while dodging
+5. Maintain proper range - not too close, not too far
+
+Let me check the projectile data: `p["dx_to_me"]` and `p["dy_to_me"]` represent direction from me to projectile. If a projectile is at dx=500, it's 500 units to my right. But the projectile is MOVING - we need to know if it's coming toward us.
+
+Actually, looking at the observation spec: "dx/dy shows direction relative to player" and "Negative dx means projectile moving left". Wait, looking again at the spec more carefully:
+
+For projectiles: `[owner,dx,dy,speed,name]` where dx/dy is direction relative to player. But in the observation dict, we have `dx_to_me` and `dy_to_me` which likely means the vector FROM the projectile TO me (or from me to projectile).
+
+Looking at the data: At T2528, projectile has dx=398, dy=255 - the projectile is 398 right and 255 above me. Over time these values decrease as the projectile approaches. When they go negative, the projectile has passed.
+
+So to determine if a projectile is threatening, I should check:
+- Is it getting closer? (distance decreasing)
+- Is it within a cone heading toward me?
+
+Actually, a simpler approach: check if the projectile's position vector (dx, dy) dotted with its velocity gives a negative number (meaning it's moving toward us). But we don't have explicit velocity... 
+
+Let me think differently. The projectile dx_to_me/dy_to_me gives the vector from my position to the projectile. If the projectile is moving toward me, the magnitude of this vector should be decreasing. But we only have one snapshot.
+
+Better approach: A projectile is threatening if it's within some distance AND we can estimate if it's heading our way. Since we know the projectile's name and its position relative to us, and enemy Ezreal Q travels in a line from enemy to a target location...
+
+Actually, let me simplify. The key insight is: **the bot should prioritize attacking over dodging**. Since cooldowns are disabled, every tick we don't cast Q is wasted DPS. The bot should:
+1. Always try to cast Q at the enemy
+2. Between Q casts, move to dodge
+3. Only use E to dodge truly threatening projectiles
+
+Let me also check: are there projectiles from MY team (my_team==1)? The filter already handles this with `my_team == 0`.
+
+Looking at T3750: `PROJ[1073741854,-108,51,2000,EzrealMysticShot]` - this projectile is at dx=-108, meaning it's slightly to my left and past me. The `1073741854` could be team 0 (enemy). But the filter checks `my_team == 0`.
+
+The main issue is clear: **the bot gets stuck in the dodge loop and never attacks**. With 4 projectiles always flying around, `nearby_projectiles` is never empty.
+
+New strategy:
+1. **ALWAYS cast Q toward enemy as first priority** (since no cooldowns, maximum DPS)
+2. If Q was just cast, move to dodge
+3. Only dodge projectiles that are actually close AND heading toward us
+4. Use tighter projectile threat detection (< 400 distance AND approaching)
+5. Maintain range of ~700-900
+
+Let me write the improved policy:
+
+```python
+def act(self, observation):
+    import math
+    
+    my_champ = next(unit for unit in observation["champ_units"] if unit["my_team"] == 1)
+    enemy_champ = next(unit for unit in observation["champ_units"] if unit["my_team"] == 0)
+    
+    my_hp_pct = my_champ["current_hp"] / max(my_champ["max_hp"], 1)
+    enemy_hp_pct = enemy_champ["current_hp"] / max(enemy_champ["max_hp"], 1)
+    my_x = my_champ["position"]["X"]
+    my_y = my_champ["position"]["Y"]
+    enemy_dx = enemy_champ["dx_to_me"]
+    enemy_dy = enemy_champ["dy_to_me"]
+    enemy_dist = enemy_champ["distance_to_me"]
+    enemy_x = enemy_champ["position"]["X"]
+    enemy_y = enemy_champ["position"]["Y"]
+    
+    q_ready = my_champ["q_cooldown"] == 0
+    w_ready = my_champ["w_cooldown"] == 0
+    e_ready = my_champ["e_cooldown"] == 0
+    r_ready = my_champ["r_cooldown"] == 0
+    
+    # Filter for ACTUALLY threatening projectiles
+    # Only consider enemy projectiles that are close and likely heading toward us
+    threatening_projectiles = []
+    for p in observation["projectiles"]:
+        if p["my_team"] == 0:
+            dist = p["distance_to_me"]
+            dx = p["dx_to_me"]
+            dy = p["dy_to_me"]
+            # A projectile is threatening if it's close and the vector from us to it
+            # is small (meaning it's near us and could hit us)
+            # Only worry about very close projectiles
+            if dist < 350:
+                threatening_projectiles.append(p)
+    
+    # PRIORITY 1: ALWAYS CAST Q when in range (no cooldowns = spam!)
+    # Ezreal Q range is ~1150. Cast it aggressively.
+    if enemy_dist < 1100 and q_ready:
+        # Lead the target slightly - aim at where they might be
+        # For now, just aim directly at them
+        return (2, [[0], [enemy_y, enemy_x]])
+    
+    # PRIORITY 2: Cast W for extra damage when in range
+    if enemy_dist < 1000 and w_ready:
+        return (2, [[1], [enemy_y, enemy_x]])
+    
+    # PRIORITY 3: Use R if enemy is low
+    if r_ready and enemy_hp_pct < 0.3:
+        return (2, [[3], [enemy_y, enemy_x]])
+    
+    # PRIORITY 4: Dodge very close projectiles
+    if threatening_projectiles:
+        closest_proj = min(threatening_projectiles, key=lambda p: p["distance_to_me"])
+        proj_dx = closest_proj["dx_to_me"]
+        proj_dy = closest_proj["dy_to_me"]
+        
+        # Move perpendicular to the projectile direction
+        perp_dx = -proj_dy
+        perp_dy = proj_dx
+        mag = math.sqrt(perp_dx**2 + perp_dy**2)
+        if mag > 0:
+            perp_dx /= mag
+            perp_dy /= mag
+        
+        dodge_dist = 300
+        dodge_x = my_x + perp_dx * dodge_dist
+        dodge_y = my_y + perp_dy * dodge_dist
+        
+        # Use E to dodge only if projectile is EXTREMELY close
+        if closest_proj["distance_to_me"] < 200 and e_ready:
+            # E away perpendicular
+            e_x = my_x + perp_dx * 475
+            e_y = my_y + perp_dy * 475
+            return (2, [[2], [e_y, e_x]])
+        
+        return (1, [dodge_y, dodge_x])
+    
+    # PRIORITY 5: Positioning
+    # Maintain optimal range of ~800 for consistent Q hits while having dodge room
+    optimal_range = 800
+    
+    if enemy_dist < 400:
+        # Too close, back off
+        angle_away = math.atan2(-enemy_dy, -enemy_dx)
+        move_x = my_x + math.cos(angle_away) * 350
+        move_y = my_y + math.sin(angle_away) * 350
+        return (1, [move_y, move_x])
+    
+    if enemy_dist > 1000:
+        # Too far, approach at an angle to be harder to hit
+        angle_to = math.atan2(enemy_dy, enemy_dx)
+        # Add perpendicular component for juking
+        juke = math.sin(observation["game_time"] * 0.005) * math.pi / 4
+        move_angle = angle_to + juke
+        move_x = my_x + math.cos(move_angle) * 300
+        move_y = my_y + math.sin(move_angle) * 300
+        return (1, [move_y, move_x])
+    
+    # At good range - orbit/juke to dodge skillshots
+    angle_to = math.atan2(enemy_dy, enemy_dx)
+    # Rapid direction changes to make us hard to predict
+    t = observation["game_time"]
+    # Fast oscillation for juking
+    juke_dir = 1 if int(t / 300) % 2 == 0 else -1
+    orbit_angle = angle_to + (math.pi / 2) * juke_dir
+    move_x = my_x + math.cos(orbit_angle) * 250
+    move_y = my_y + math.sin(orbit_angle) * 250
+    return (1, [move_y, move_x])
+```
+
+Wait, I need to reconsider. Looking at the experience data more carefully:
+
+The issue is that after the initial Q exchange at T2528, the bot's HP stays at 86-91% and slowly recovers. The ENEMY is also at 86-91%. So neither side is dealing damage after the initial exchange. The bot is stuck in a loop of dodging without ever casting.
+
+The fix is clear: **PRIORITIZE CASTING Q OVER EVERYTHING ELSE** (except maybe dodging a projectile that's about to hit you in the next 0.1 seconds).
+
+Since cooldowns are disabled, we should be casting Q literally every single game tick. The action system probably has some animation lock, but we should try to cast Q as often as possible.
+
+Also I notice the bot drifts further and further from the enemy - positions go from ~6350 to ~7300 over time, while enemy seems to stay near their starting area. The bot is orbiting away instead of staying in range.
+
+Let me also reconsider: Maybe the threshold for threatening should be even tighter, or I should just not dodge at all and focus purely on DPS. In a mirror match with no cooldowns, the one who lands more Qs wins. If we spam Q every frame, we'll deal way more damage than we take.
+
+Actually wait - the experience shows both at nearly equal HP throughout, meaning NEITHER is landing abilities. The bot fired Q once, got hit once, and then stopped fighting entirely. The priority should absolutely be:
+
+1. Spam Q (and W) at enemy every single tick
+2. Juke/move between casts
+3. Only dodge if something is literally on top of us
+---
+Looking at the experience data carefully:
+
+1. **T0-T2268**: Bot walks toward enemy, both at 100% HP. Distance ~5000+ units. No abilities cast during approach.
+2. **T2268**: First Q cast (both fire simultaneously). Both projectiles visible.
+3. **T2762**: Both drop to 86% HP - both got hit by Q.
+4. **T3027**: W+Q cast again. At T3524, both drop to ~72% HP.
+5. **T3754-T4513**: Another Q exchange, both drop to ~55% HP.
+6. **T4778-T5769**: Bot STOPS CASTING and just orbits. HP slowly recovers to 56-57%.
+7. **T5769 onwards**: Bot just orbits endlessly, never casting Q again. Both HP slowly regenerate.
+
+**Critical Problem**: After the initial exchanges, the bot enters the "orbit at optimal range" code and NEVER goes back to casting Q. Looking at why:
+
+- Enemy distance stays around 500-900 range (based on dx/dy values of ~500-800)
+- The policy checks `enemy_dist < 1100` for Q - this should be true!
+- BUT there are always projectiles flying around. The policy checks projectiles BEFORE Q... wait, in the current policy Q is Priority 1 before dodge. So why isn't it casting?
+
+Looking more carefully at the enemy distance: `enemy_dx` and `enemy_dy` values are around 500-800 each, so `enemy_dist` = sqrt(500² + 700²) ≈ 860. This IS within 1100 range. So Q should fire.
+
+Wait - the issue might be that Q IS being fired but the bot is also dodging. But looking at T6000+, the bot positions oscillate back and forth rapidly with NO HP changes. The bot is casting Q but missing because both are juking, OR the Q cast isn't actually happening.
+
+Actually, looking at projectiles: after T5769 there are always 4+ projectiles from team 1073741854 (enemy) AND 1073741853 (us). So BOTH sides ARE casting! But neither is hitting because both are dodging.
+
+**The real issue**: The bot fires Q at the enemy's CURRENT position, but the enemy is also juking. The Q misses. Meanwhile the bot orbits predictably. Since enemy projectiles always exist at various distances, the dodge code rarely triggers (threshold 300), and the bot just orbits.
+
+**What needs to change**:
+1. **Lead Q shots** - Predict enemy movement, don't aim at current position
+2. **Use W+Q combo** - W marks, Q procs for bonus damage
+3. **Use R** - Ultimate is a wide beam, harder to dodge
+4. **Better movement** - More unpredictable juking, not a simple orbit pattern
+5. **E aggressively** - Use E to reposition for guaranteed Q hits at close range
+6. **Cast more spells per frame** - We should be casting Q AND W constantly since no cooldowns
+
+The orbit period is `int(game_time / 250)` which flips every 250ms - that's very predictable. Enemy can easily predict this.
+
+**Strategy**: Since both keep dodging Qs, use R (wide beam, harder to dodge) and W (marks enemy for bonus damage on next hit). Use E aggressively to close distance and land point-blank Q. Vary movement unpredictably.
+---
+Looking at the experience data carefully:
+
+1. **T0-T1016**: Bot stays COMPLETELY STILL at (6350,6350). Enemy at (1300,1300). Distance ~7100 units. **NO ACTIONS TAKEN** - the bot is doing nothing for over 1 second of game time!
+
+2. **T1277**: Enemy fires R (EzrealTrueshotBarrage) - two projectiles appear at distance ~1300 each heading toward us.
+
+3. **T1770-T2001**: Bot barely moves (6350→6350,6435→6510). The R projectile is getting closer (distance shrinking from 1300 to ~300).
+
+4. **T2263**: HP drops from 100% to 64%! Got hit by R. Enemy also at 64% (mirror?).
+
+5. **T2526-T3280**: More R projectiles fired. HP drops further to 30%.
+
+6. **T3512**: Both at 30% HP. Bot still barely moving.
+
+**Critical Issues**:
+- The bot is NOT MOVING toward the enemy. Distance is ~7000+ units, way beyond any ability range (1100 for Q).
+- Enemy dist is huge, so `enemy_dist < 1200` for E fails, `enemy_dist < 1100` for Q fails, `enemy_dist < 1000` for W fails.
+- The only thing that triggers is `enemy_dist > 1050` approach code, but the juke pattern moves very slowly.
+- Meanwhile enemy R (global range) hits us because we barely dodge.
+- The bot doesn't use R back (which is also global) because `enemy_dist < 2000` fails (dist ~7000).
+
+**Key fixes needed**:
+1. **Use R at any range** - it's global! Fire R at enemy immediately while closing distance
+2. **Move DIRECTLY toward enemy faster** - stop juking at extreme range, just rush in
+3. **Dodge R projectiles** - they're huge and do massive damage
+4. **Increase R range check** to be very large or unlimited
+5. **Better projectile dodge threshold** - R projectiles were at 300 distance but our threshold is also 300, may have been too late
+
+From history: the bot was previously not casting abilities. Now it casts but misses at close range. But THIS game shows a completely different problem - the bot never gets in range because it approaches too slowly, and gets killed by enemy R (global) while approaching.
+
+**New strategy**:
+1. If far away (>2000), fire R immediately (global range) and rush toward enemy
+2. Cast R liberally - no cooldowns means spam it
+3. Dodge projectiles at larger range (500+) since R is wide
+4. Use E to close gaps when far
+5. Once in range, spam Q/W/R constantly
+6. Keep the perpendicular dodge logic but trigger it earlier
+</history>
+
+<example>
+<thinking>
+During this episode, I constantly lost reward as I was hit by skillshots frequently due to being poor at dodging them.
+Therefore, I'm now going to try wiggling my character model rapidly moving back and forth before comitting to
+a skillshot, to make it harder for the enemy Ezreal to land a skillshot on me.
+<thinking>
+<policy>
+
+def act(self, obs):
+    import math # YOU MUST IMPORT THIS MODULE EVERY SINGLE TIME. DO NOT IMOPRT ANY OTHER MODULES
+    
+    # Get our champion and enemy champion info
+    my_champ = next(unit for unit in observation["champ_units"] if unit["my_team"] == 1)
+    enemy_champ = next(unit for unit in observation["champ_units"] if unit["my_team"] == 0)
+    nearby_projectiles = [p for p in observation["projectiles"] 
+                         if p["my_team"] == 0 and p["distance_to_me"] < 800]
+
+    # High priority: Dodge enemy skillshots (prevents HP loss which has high negative reward)
+    if nearby_projectiles:
+        proj = nearby_projectiles[0]
+        # Calculate perpendicular dodge direction
+        dodge_x = proj["dy_to_me"]
+        dodge_y = -proj["dx_to_me"]
+        magnitude = (dodge_x**2 + dodge_y**2)**0.5
+        if magnitude > 0:
+            dodge_x = (dodge_x/magnitude * 200) + my_champ["position"]["X"]
+            dodge_y = (dodge_y/magnitude * 200) + my_champ["position"]["Y"]
+            return (1, [dodge_y, dodge_x])
+
+    # Offensive opportunities (for kill rewards and HP damage)
+    if enemy_champ["distance_to_me"] < 600:
+        # Check if we have HP advantage
+        my_hp_percent = my_champ["current_hp"] / my_champ["max_hp"]
+        enemy_hp_percent = enemy_champ["current_hp"] / enemy_champ["max_hp"]
+        
+        if my_hp_percent > enemy_hp_percent + 0.2:  # We have significant HP advantage
+            # Cast Q if available and in range
+            if my_champ["q_cooldown"] == 0:
+                return (2, [[0], [enemy_champ["position"]["Y"], enemy_champ["position"]["X"]]])
+        else:
+            # Maintain safe distance if we don't have HP advantage
+            retreat_x = my_champ["position"]["X"] - enemy_champ["dx_to_me"]
+            retreat_y = my_champ["position"]["Y"] - enemy_champ["dy_to_me"]
+            return (1, [retreat_y, retreat_x])
+
+    # Resource management (MP has moderate reward weight)
+    if my_champ["current_mp"] / my_champ["max_mp"] < 0.3:
+        # Play conservatively when low on mana
+        safe_x = my_champ["position"]["X"] + (enemy_champ["dx_to_me"] * -1.5)
+        safe_y = my_champ["position"]["Y"] + (enemy_champ["dy_to_me"] * -1.5)
+        return (1, [safe_y, safe_x])
+
+    # Default behavior: Maintain optimal trading range
+    optimal_range = 500  # Adjust based on champion
+    if enemy_champ["distance_to_me"] > optimal_range:
+        # Move closer
+        approach_x = my_champ["position"]["X"] + enemy_champ["dx_to_me"] * 0.5
+        approach_y = my_champ["position"]["Y"] + enemy_champ["dy_to_me"] * 0.5
+        return (1, [approach_y, approach_x])
+    else:
+        # Orbit around enemy while in range
+        orbit_angle = math.atan2(enemy_champ["dy_to_me"], enemy_champ["dx_to_me"])
+        orbit_x = enemy_champ["position"]["X"] + math.cos(orbit_angle + math.pi/4) * optimal_range
+        orbit_y = enemy_champ["position"]["Y"] + math.sin(orbit_angle + math.pi/4) * optimal_range
+        return (1, [orbit_y, orbit_x])
+</policy>
+</example>
+
+<task>
+You must now return the new policy based on <example></example>.
+Simply infill and complete the tags below.
+DO NOT PROVIDE ANY PREAMBLE OR IRRELEVANT TEXT, FILL IN THE TEMPLATE AS REQUIRED.
+</task>
+
+<thinking>

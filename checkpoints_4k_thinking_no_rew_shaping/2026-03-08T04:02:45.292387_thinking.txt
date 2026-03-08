@@ -1,0 +1,31 @@
+Looking at the latest experience data carefully:
+
+1. **T0-T756**: Bot at (6350,6350), enemy at (1300,1300). Distance ~7100. Bot doesn't move for 756ms.
+2. **T1018**: Bot moved to (6685,6685). Projectiles appear - R fired by both sides.
+3. **T1280-1509**: R projectiles approaching. Bot barely moves.
+4. **T1770**: HP drops from 100% to 64%! Hit by enemy R. Enemy also 64%.
+5. **T2000-2264**: More exchanges, both drop to 51%.
+6. **T4530**: Both drop to 17%! Massive damage from R exchanges.
+7. **T4761-T24529**: Both hover at 17-21% HP for the ENTIRE remaining 20 seconds. Neither side kills the other.
+
+**Critical problems identified:**
+
+1. **Bot gets stuck in stalemate** - After initial R exchanges, both are low HP. Neither finishes the kill.
+2. **R spam causes equal trading** - Both fire R at each other, both get hit equally. No advantage.
+3. **Bot never closes distance** - Enemy is ~5000+ units away. Bot reaches ~6400 area but enemy stays at ~1200. The distance between them remains ~5000+ units. The dx/dy values of 1000-1500 confirm this.
+4. **Bot orbits at extreme range** - At 5000+ distance, Q (1100 range) can't reach. Only R (global) hits.
+5. **The bot NEVER gets into Q range** - It approaches slightly then stops and orbits. Need to actually close the gap.
+
+**The distance is the key issue.** Looking at positions: bot is at ~(6400,6250), enemy at ~(1200,1450). That's sqrt(5200² + 4800²) ≈ 7076 units! Way beyond Q range. The bot's juke approach barely closes the gap.
+
+The fix: **Move DIRECTLY toward enemy much more aggressively. Stop orbiting at extreme range. Use E to close gap. Get into Q range (1100) ASAP.**
+
+Also, R spam at long range just results in equal trades. Better to save R for when we're closer and can follow up with Q/W.
+
+Key changes:
+1. **Rush toward enemy** - No juking at extreme range, just beeline
+2. **Use E to close gap** when >1500 distance
+3. **Only start orbiting when within 1200** (Q range)
+4. **Cast R while approaching** but not as primary strategy
+5. **Once in range, Q is primary DPS** with movement between casts
+6. **Dodge only truly threatening close projectiles**

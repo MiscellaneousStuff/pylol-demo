@@ -1,0 +1,29 @@
+Looking at the experience data, I can analyze what's happening:
+
+1. **We're playing Ezreal** (mirror match - both firing EzrealMysticShot projectiles)
+2. **Enemy starts at ~(1300,1300), we start at ~(6350,6350)** - we're far apart initially
+3. **The bot walks straight at the enemy** while alternating between move and Q cast (based on the time modulo pattern)
+4. **Both champions take equal damage** - HP drops symmetrically (100→88→72→59→32→19→5%), meaning we're trading evenly
+5. **Neither champion dies** - both end at ~5-6% HP
+6. **The problem**: We walk in a straight line toward the enemy, making us extremely easy to hit with skillshots. The enemy Ezreal Qs are all coming from the same diagonal direction and we never dodge.
+7. **Projectiles have dx,dy values** that show they're traveling along the diagonal toward us - we need to dodge perpendicular to this.
+8. **Position format note**: The action takes (y, x) but position dict has X and Y. Enemy is at lower coordinates than us.
+
+Key issues with current policy:
+- Walking straight at enemy = easy skillshot target
+- Simple time-modulo alternation between move and Q is terrible
+- No dodging at all
+- No use of W, E, R abilities (Ezreal E is a blink/dash - great for dodging and repositioning!)
+- Need to sidestep between Q casts
+
+Strategy improvements:
+1. **Dodge projectiles** by moving perpendicular to their travel direction
+2. **Use all abilities** - Q for poke, W for damage buff, E for blink/reposition, R for long range damage
+3. **Approach at an angle** instead of straight line
+4. **Weave between casting and dodging** - cast Q at enemy, then immediately sidestep
+5. **Use E aggressively** to close distance or dodge while dealing damage
+6. **Prioritize killing the enemy** - we need to land our skills while dodging theirs
+
+Since cooldowns are disabled, we should spam abilities as much as possible! E (Arcane Shift) is a blink that does damage, and with no cooldowns we can spam it toward the enemy for massive damage + repositioning.
+
+With no cooldowns, the optimal strategy is likely to spam E (Arcane Shift) directly on the enemy - it's a targeted blink that deals damage, and we can use it to constantly reposition making us hard to hit while dealing consistent damage.

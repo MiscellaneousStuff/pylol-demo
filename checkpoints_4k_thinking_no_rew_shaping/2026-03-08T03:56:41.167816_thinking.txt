@@ -1,0 +1,30 @@
+Looking at the experience data carefully:
+
+1. **T0-T526**: Bot at (6350,6350), enemy at (1300,1300). Distance ~7100. Bot starts moving toward enemy.
+2. **T1018-1281**: Projectiles appear - both fire Q and R simultaneously. Bot still at (6685,6685).
+3. **T1769**: HP drops from 100% to 51%! Got hit by R AND Q. Enemy at 65%. We took WAY more damage.
+4. **T1769-T8778**: HP stays at 51-52%, enemy at 65-66%. Bot orbits around 6500-6800 range but NEVER DEALS DAMAGE. Enemy slowly regens.
+5. **T8778**: HP drops to 17%! Got hit by another R. Enemy still at 66%.
+6. **T8778-T24520**: HP stays at 17-21% (regen), enemy at 67-70%. Bot just orbits, never attacking.
+
+**Critical Problems:**
+
+1. **The bot NEVER CASTS ABILITIES after initial exchange** - Looking at tick logic: `tick = int(game_time / 250)`, and `tick % 2 == 0` for casting. But game_time values are like 1769, 2032... so tick = 7, 8, etc. Even ticks should cast. But enemy_dist based on dx/dy ~(300-600) means dist ~400-700, well within Q range (1150). So WHY isn't Q being cast?
+
+2. **The dodge block catches everything** - There are ALWAYS projectiles within 600 distance (the `threatening` filter). Looking at data: every observation has projectiles with dx/dy of 200-500, meaning distances of 300-700. Many are within 600. So the bot ALWAYS enters the dodge block and NEVER reaches the cast phase.
+
+3. **Many "threatening" projectiles are already PAST us** - Projectiles with large negative dx/dy values (like -10000) are far past. But some projectiles at dx=253, dy=257 (dist ~360) trigger the dodge. These might be our OWN projectiles being misidentified, or enemy projectiles that already passed.
+
+4. **The dodge is ineffective** - HP dropped from 51% to 17% at T8778 despite constant dodging. The perpendicular dodge doesn't work well against R (wide beam).
+
+**Key Fixes:**
+
+1. **Filter projectiles MUCH more aggressively** - Only dodge projectiles heading TOWARD us (positive dot product with enemy direction) AND very close (<400)
+2. **NEVER let dodge completely block ability casting** - Cast Q FIRST, then dodge. DPS > dodging.
+3. **Use E offensively** - E into range, cast Q point-blank
+4. **Spam Q as TOP priority** when in range - Q every tick, no alternation needed
+5. **Move/dodge ONLY when Q is on animation cooldown** (even though cooldowns are "disabled", there's likely a cast time)
+
+The fundamental insight: with no cooldowns, the winner is whoever lands more Qs. Standing still dodging = 0 DPS = losing. We must prioritize Q spam.
+
+New approach: Cast Q EVERY TICK at enemy when in range. Only dodge if a projectile is < 300 distance. Use the tick alternation ONLY for R (not Q). Approach aggressively with E when far.

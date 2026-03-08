@@ -1,0 +1,265 @@
+<thinking>
+Let me analyze the experience data carefully:
+
+1. **We're Ezreal vs Ezreal** - mirror match
+2. **Start at (6350,6350), enemy at (1300,1300)** - ~7100 units apart
+3. **HP timeline for us**: 100% → 96% → 92% → 89% → 88% → 85% → 81% → 78% → 77% → 75% → 72% → 71% → 68% → 64% → 65% → 62% → 61%
+4. **HP timeline for enemy**: 100% → 96% → 92% → 88% → 84% → 81% → 80% → 77% → 74% → 73% → 70% → 66% → 53% → 52% → 50% → 49% → 46% → 43% → 42% → 30% → 29%
+
+So enemy goes down to 29-30% while we're at 61-62%. That's actually decent - we're winning! But we could do better.
+
+5. **Position analysis**: 
+   - We start at (6350,6350) and move to around (7100-7400, 6800-7500)
+   - Enemy dx/dy values range from -200 to -900, meaning the enemy is within ~500-900 units for most of the mid-late game
+   - So we ARE closing distance somewhat
+
+6. **The problem**: Looking at the observations, the enemy distance stays at ~400-800 units for most of the fight. We deal damage but also take damage. The bot cycles between abilities and movement but the movement pattern is predictable.
+
+7. **Key observations from data**:
+   - From T1017 to T1279, we moved and took some hits
+   - We use E blinks which get us closer, then orbit
+   - The tick-based cycling (tick % 6 for close range, tick % 4 for medium) means we sometimes stand still casting multiple spells before moving
+   - Projectiles are frequently within 300-600 range but we don't always dodge them
+
+8. **What's working**: We ARE dealing more damage to the enemy than they deal to us (enemy at 29% vs us at 62%). The E blinks and ability spam is effective.
+
+9. **What's NOT working**:
+   - We still take too much damage (lost 38% HP)
+   - The movement pattern between casts is too predictable
+   - We sometimes use E to blink AWAY or at weird angles instead of continuing to deal damage
+   - The dodge detection at 600 range is catching projectiles that won't hit us
+   - We're not maximizing DPS - too much time spent moving vs casting
+
+10. **From history**: Previous iterations showed:
+   - Don't just spam R from long range
+   - Need to close distance
+   - Need to dodge between casts
+   - E blink is great for repositioning AND damage
+   - Orbit enemy at ~500 range
+   - Interleave dodge and cast
+
+**New strategy improvements**:
+
+1. **Better projectile dodging**: Only dodge projectiles that are actually heading toward us (check if dx/dy direction is toward us). Currently we dodge all nearby projectiles even if they're moving away.
+
+2. **More aggressive ability usage**: With no cooldowns, we should cast an ability almost every tick, only moving to dodge when actually threatened.
+
+3. **Smarter E usage**: Don't waste E for repositioning when we could use it for damage. E toward enemy for damage, then move to dodge.
+
+4. **Better approach**: Move toward enemy quickly at start, then orbit at ~400-500 range while spamming Q/W/E/R.
+
+5. **Projectile heading check**: A projectile is dangerous if it's moving toward us. We can check this by seeing if the dx/dy values are decreasing over time, or by checking the dot product of projectile velocity with the direction from projectile to us.
+
+Actually, let me reconsider the projectile data format. The projectile has `dx_to_me` and `dy_to_me` which is the position of the projectile relative to us. If a projectile's `distance_to_me` is small and the projectile name suggests it's an enemy attack, we should dodge.
+
+But we need to know if it's heading TOWARD us. The projectile has a `speed` field. If the projectile distance is decreasing, it's heading toward us. But we only have one snapshot. 
+
+However, we can use the projectile direction. The projectile data includes `dx_to_me` and `dy_to_me`. If these values are small (close to 0), the projectile is right on top of us. We should dodge when projectiles are close AND heading toward us.
+
+Actually, looking at the observation spec more carefully: "dx/dy shows direction relative to player" and "Negative dx means projectile moving left". Wait, that's for the compact format. In the actual data, `dx_to_me` and `dy_to_me` are likely the displacement from us to the projectile.
+
+Let me look at the data: At T526, enemy is at position offset (629,629) from us. Projectiles have dx_to_me of -335,-335 and 965,965. So one projectile is between us and enemy (negative = toward enemy from us), and one is beyond us (positive). This makes sense - one is coming toward us, one is going away.
+
+So a projectile with small absolute dx_to_me/dy_to_me is close to us. A projectile heading toward us would have dx_to_me that's decreasing toward 0.
+
+For dodge logic: if `distance_to_me < 500` and the projectile is from enemy (`my_team == 0`), dodge perpendicular.
+
+Let me also think about what the projectile velocity means. If the projectile position relative to us is (dx, dy), and the projectile is from the enemy (who is at negative position from us), then a projectile traveling toward us would have dx_to_me decreasing. We can't know this from one frame, but we know enemy projectiles travel FROM enemy TOWARD us generally.
+
+**New policy design**:
+
+```python
+def act(self, observation):
+    import math
+    
+    my_champ = next(unit for unit in observation["champ_units"] if unit["my_team"] == 1)
+    enemy_champ = next(unit for unit in observation["champ_units"] if unit["my_team"] == 0)
+    
+    my_hp_pct = my_champ["current_hp"] / max(my_champ["max_hp"], 1)
+    enemy_hp_pct = enemy_champ["current_hp"] / max(enemy_champ["max_hp"], 1)
+    my_x = my_champ["position"]["X"]
+    my_y = my_champ["position"]["Y"]
+    enemy_dx = enemy_champ["dx_to_me"]
+    enemy_dy = enemy_champ["dy_to_me"]
+    enemy_dist = enemy_champ["distance_to_me"]
+    enemy_x = enemy_champ["position"]["X"]
+    enemy_y = enemy_champ["position"]["Y"]
+    angle_to_enemy = math.atan2(enemy_dy, enemy_dx)
+    game_time = observation["game_time"]
+    tick = int(game_time / 250)
+    
+    # Enemy projectiles
+    enemy_projectiles = sorted(
+        [p for p in observation["projectiles"] if p["my_team"] == 0],
+        key=lambda p: p["distance_to_me"]
+    )
+    
+    # Check for dangerous projectiles - ones that are close and likely heading toward us
+    # A projectile from enemy heading to us will have dx_to_me and dy_to_me that are 
+    # in the general direction FROM enemy to us (since it was shot at us)
+    dangerous_projectiles = []
+    for p in enemy_projectiles:
+        dist = p["distance_to_me"]
+        if dist < 500:
+            dangerous_projectiles.append(p)
+    
+    # Helper: dodge perpendicular to projectile
+    def get_dodge_pos(proj, dodge_dist=300):
+        pdx = proj["dx_to_me"]
+        pdy = proj["dy_to_me"]
+        # Direction from enemy to us (projectile travel direction)
+        # Perpendicular options
+        perp1_x, perp1_y = -pdy, pdx
+        perp2_x, perp2_y = pdy, -pdx
+        
+        mag = math.sqrt(perp1_x**2 + perp1_y**2)
+        if mag < 1:
+            # Projectile is on us, just move sideways
+            return my_x + dodge_dist, my_y
+        
+        opt1_x = my_x + (perp1_x / mag) * dodge_dist
+        opt1_y = my_y + (perp1_y / mag) * dodge_dist
+        opt2_x = my_x + (perp2_x / mag) * dodge_dist
+        opt2_y = my_y + (perp2_y / mag) * dodge_dist
+        
+        # Pick direction that keeps us at reasonable range from enemy
+        dist1 = math.sqrt((opt1_x - enemy_x)**2 + (opt1_y - enemy_y)**2)
+        dist2 = math.sqrt((opt2_x - enemy_x)**2 + (opt2_y - enemy_y)**2)
+        
+        # Prefer staying near combat range (~400-600)
+        target_range = 500
+        score1 = abs(dist1 - target_range)
+        score2 = abs(dist2 - target_range)
+        
+        if score1 < score2:
+            return max(200, min(15800, opt1_x)), max(200, min(15800, opt1_y))
+        else:
+            return max(200, min(15800, opt2_x)), max(200, min(15800, opt2_y))
+    
+    # PRIORITY 1: Dodge very close projectiles with E blink
+    if dangerous_projectiles and dangerous_projectiles[0]["distance_to_me"] < 250:
+        # Emergency E blink dodge - blink perpendicular but toward enemy
+        p = dangerous_projectiles[0]
+        dx, dy = get_dodge_pos(p, 475)
+        return (2, [[2], [dy, dx]])
+    
+    # PRIORITY 2: Dodge close projectiles by walking
+    if dangerous_projectiles and dangerous_projectiles[0]["distance_to_me"] < 450:
+        p = dangerous_projectiles[0]
+        dx, dy = get_dodge_pos(p, 350)
+        return (1, [dy, dx])
+    
+    # PRIORITY 3: Close range combat (< 550) - spam abilities and dodge
+    if enemy_dist < 550:
+        cycle = tick % 5
+        if cycle == 0:
+            # Q at enemy
+            return (2, [[0], [enemy_y, enemy_x]])
+        elif cycle == 1:
+            # E blink to flanking position (deals damage + repositions)
+            orbit_angle = angle_to_enemy + (math.pi / 2 if tick % 8 < 4 else -math.pi / 2)
+            e_x = my_x + math.cos(orbit_angle) * 300
+            e_y = my_y + math.sin(orbit_angle) * 300
+            e_x = max(200, min(15800, e_x))
+            e_y = max(200, min(15800, e_y))
+            return (2, [[2], [e_y, e_x]])
+        elif cycle == 2:
+            # W at enemy
+            return (2, [[1], [enemy_y, enemy_x]])
+        elif cycle == 3:
+            # Sidestep/orbit
+            orbit_angle = angle_to_enemy + (math.pi / 2 if tick % 6 < 3 else -math.pi / 2)
+            move_x = my_x + math.cos(orbit_angle) * 250
+            move_y = my_y + math.sin(orbit_angle) * 250
+            move_x = max(200, min(15800, move_x))
+            move_y = max(200, min(15800, move_y))
+            return (1, [move_y, move_x])
+        else:
+            # R at enemy
+            return (2, [[3], [enemy_y, enemy_x]])
+    
+    # PRIORITY 4: Medium range (550-900) - poke and approach
+    if enemy_dist < 900:
+        cycle = tick % 4
+        if cycle == 0:
+            # Q at enemy
+            return (2, [[0], [enemy_y, enemy_x]])
+        elif cycle == 1:
+            # Zigzag approach toward enemy
+            zigzag = math.pi / 4 if tick % 6 < 3 else -math.pi / 4
+            move_x = my_x + math.cos(angle_to_enemy + zigzag) * 350
+            move_y = my_y + math.sin(angle_to_enemy + zigzag) * 350
+            move_x = max(200, min(15800, move_x))
+            move_y = max(200, min(15800, move_y))
+            return (1, [move_y, move_x])
+        elif cycle == 2:
+            # E blink toward enemy to close gap + damage
+            offset = math.pi / 6 if tick % 4 < 2 else -math.pi / 6
+            blink_x = my_x + math.cos(angle_to_enemy + offset) * 475
+            blink_y = my_y + math.sin(angle_to_enemy + offset) * 475
+            blink_x = max(200, min(15800, blink_x))
+            blink_y = max(200, min(15800, blink_y))
+            return (2, [[2], [blink_y, blink_x]])
+        else:
+            # W at enemy
+            return (2, [[1], [enemy_y, enemy_x]])
+    
+    # PRIORITY 5: Long range (> 900) - close distance FAST
+    cycle = tick % 3
+    if cycle == 0:
+        # E blink toward enemy
+        blink_x = my_x + math.cos(angle_to_enemy) * 475
+        blink_y = my_y + math.sin(angle_to_enemy) * 475
+        blink_x = max(200, min(15800, blink_x))
+        blink_y = max(200, min(15800, blink_y))
+        return (2, [[2], [blink_y, blink_x]])
+    elif cycle == 1:
+        # Q at enemy while approaching
+        return (2, [[0], [enemy_y, enemy_x]])
+    else:
+        # Move toward enemy with slight zigzag
+        zigzag = math.pi / 5 if tick % 4 < 2 else -math.pi / 5
+        move_x = my_x + math.cos(angle_to_enemy + zigzag) * 500
+        move_y = my_y + math.sin(angle_to_enemy + zigzag) * 500
+        move_x = max(200, min(15800, move_x))
+        move_y = max(200, min(15800, move_y))
+        return (1, [move_y, move_x])
+```
+
+Wait, let me reconsider. Looking at the experience again, the bot IS getting close and dealing damage. The enemy drops from 100% to 29% while we only drop to 61%. That's actually a significant lead. The main issues are:
+
+1. We still take ~39% damage unnecessarily
+2. We don't close out the kill
+3. There's a lot of time wasted orbiting at medium range
+
+The enemy distance (from dx/dy) shows values like (-400,-300) which means ~500 range. We're in combat range for much of the fight. The problem is that projectiles still hit us because:
+- Our dodge detection is catching projectiles but not effectively dodging them
+- The perpendicular dodge is sometimes moving us INTO other projectiles
+- We sometimes E blink into bad positions
+
+Key improvement needed: **More aggressive damage output + smarter dodging**
+
+Looking at what projectiles actually hit us:
+- At T1279: HP drops from 100% to 96% (hit by something)
+- At T6022: HP drops from 89% to 85% 
+- At T8267: HP drops from 81% to 77%
+- At T12750: 75% to 71%
+- At T16251: 72% to 68%
+- At T17274: 68% to 64%
+
+These are gradual drops, suggesting we're getting hit by individual Q's rather than massive combos. We need better dodging of Q specifically.
+
+The biggest improvement I can see: when we're at 500+ range, we should be casting Q/W/R at the enemy and dodging. When we're closer, we should E aggressively for burst damage.
+
+Also I notice the bot sometimes E's AWAY from the enemy (at T7771 we go from (7326,7173) to (7102,7585) - moving further in Y). This wastes our E and gives the enemy free time.
+
+Let me refine: E should ALWAYS be used aggressively (toward/onto enemy) for damage, never for escape unless HP is critically low. For dodging, use walk movement.
+
+Also, I should add auto attacks! The ACT list includes "auto" - we should be auto-attacking between abilities for more DPS.
+
+Let me redesign with these principles:
+1. Always cast abilities at enemy - prioritize Q (fast, long range), then W, then R
+2. Between casts, walk-dodge perpendicular to closest projectile, or walk toward enemy
+3. Use E aggressively to close gap and deal damage, never defensively
+4. Add auto-attacks when in range (~550 for Ezreal)
+5. Only dodge-walk when projectiles are actually close (<400)

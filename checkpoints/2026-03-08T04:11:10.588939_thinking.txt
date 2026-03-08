@@ -1,0 +1,31 @@
+Looking at the experience data carefully:
+
+1. **We're Ezreal vs Ezreal** - mirror match
+2. **Start at (6350,6350), enemy at (1300,1300)** - ~7100 units apart
+3. **HP timeline**: We go from 100% → 96% → 78% → 74% → 60% → 57% → 53% → 50% → 11% → 7% → 4%. Enemy goes from 100% → 96% → 88% → 89% → 85% → 81% → 78% → 64% → 56% → 42% → 39% → 35% → 31%.
+4. **We're dying much faster than the enemy** - we drop to 4% while enemy is still at 31%. We're getting hit by WAY more projectiles.
+5. **Position analysis**: We move from (6350,6350) to around (7000-7200, 6800-7300). We're moving AWAY from the enemy or barely closing! Enemy is at ~(1300,1300) area and moves slightly.
+6. **Distance never closes** - enemy dx/dy values show distances of 200-700 at times but those are RELATIVE. The actual positions show we're still ~7000 units apart.
+
+Wait, looking more carefully at T2265: enemy position shows (-42,-42) - that's dx_to_me and dy_to_me, meaning the enemy is VERY close! Then at T2529 enemy is at (-244,349). So actually the bot IS closing distance at some point via E blinks.
+
+The big HP drops happen around T7270 where we go from 50% to 11% - a MASSIVE drop. This coincides with a flood of projectiles. The enemy also drops from 42% to 35%.
+
+Key issues:
+1. **We're getting hit by too many projectiles** - not dodging effectively
+2. **The E blink puts us right on top of the enemy** where we eat all their abilities
+3. **At close range, we trade poorly** - enemy hits us more than we hit them
+4. **The dodge threshold of 400 is too small** - projectiles at 400+ still hit us
+5. **When we E blink in, we're surrounded by projectiles and can't escape**
+
+Strategy changes needed:
+1. **Dodge MORE aggressively** - increase projectile detection range to 600+
+2. **Don't E directly onto enemy** - E to a flanking position 
+3. **Prioritize dodging over attacking** when HP is low
+4. **Use movement to approach, not just E blinks**
+5. **After casting, immediately dodge** rather than standing still casting next spell
+6. **Kite/orbit the enemy** at ~500 range instead of face-tanking
+
+The cycle-based approach (tick % 5) means we cast 4 spells then dodge, but during those 4 casts we're standing still getting hit. Need to interleave dodge movements between every cast.
+
+New approach: Every other tick should be a dodge/reposition movement. Cast → dodge → cast → dodge. And when projectiles are close, ALWAYS dodge first.

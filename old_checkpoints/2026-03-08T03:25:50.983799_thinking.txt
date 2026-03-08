@@ -1,0 +1,32 @@
+Looking at the experience data, the critical problem is crystal clear:
+
+**The bot NEVER casts any spells or deals any damage for the entire 24+ second episode.** Both champions stay at 96-100% HP, 0 kills, 0 deaths, 35 gold. The bot has Q0W0E0R0 (all abilities ready) the ENTIRE time but never uses them.
+
+**Why?** The enemy is at ~600-900 distance (computed from dx/dy values like (541,538) = ~763 units). This is within Q range (1050). But the policy's dodge logic triggers on every frame because there are ALWAYS projectiles visible within the threshold distance. The bot perpetually dodges and never reaches spell casting code.
+
+**From history, this has been the SAME problem across ALL iterations:**
+1. Dodge priority is too high and always triggers
+2. Projectiles persist in observations even when not threatening
+3. Bot never reaches spell casting code
+
+**The fix must:**
+1. CAST SPELLS FIRST - Q is the #1 priority when ready and in range
+2. Only dodge projectiles that are VERY close (<250 units) - truly imminent threats
+3. Alternate cast/move using tick counter to ensure movement between casts
+4. Close distance aggressively when far away
+5. Use auto-attacks when close and spells on CD
+6. The alternating pattern: even ticks = cast spell, odd ticks = move/dodge
+
+The key insight: casting Q is instant - the bot should cast Q then move next tick. The `is_cast_tick` pattern from the current policy was the right idea but imminent_proj detection was too aggressive (250 range catches too many) OR the projectiles at 250+ range were triggering something else.
+
+Looking at the current policy more carefully - the `imminent_proj` check uses `20 < pdist < 250`. At T6000, projectile at (-19,-38) has distance ~42 which IS < 250. This would trigger dodge on odd ticks. But on even ticks, Q should cast... unless there's a bug in the cast_tick logic.
+
+Wait - the current policy's `is_cast_tick` uses `self._tick_count % 2 == 0`. If tick 1 is cast (even=False, odd), tick 2 is cast (even=True)... Actually `_tick_count` starts at 0 and increments. Tick 1: %2=1 (odd, not cast). Tick 2: %2=0 (even, cast). So half the time it should cast.
+
+But looking at the Q section: it checks `q_ready and enemy_dist < 1050 and my_mp_pct > 0.05`. The enemy_dist from the data is consistently 600-900. Q0 means ready. MP is 100%. So it SHOULD cast on even ticks.
+
+Unless `enemy_dist` computed from `math.sqrt(enemy_dx**2 + enemy_dy**2)` gives a different value than expected. Let me check: ENY at (541,538) → sqrt(541²+538²) = sqrt(292681+289444) = sqrt(582125) ≈ 763. That's < 1050. Should cast.
+
+Maybe the issue is the `imminent_proj` check returning a projectile on EVERY frame, and on odd ticks the dodge triggers. But on even ticks, Q should still cast... Unless imminent_proj triggers BEFORE the cast_tick check because of Priority 4 vs Priority 3 ordering. Looking at the code: Priority 3 (cast tick) runs before Priority 4 (dodge). So on cast ticks, Q should fire first.
+
+I think the actual issue might be that `enemy_dist` is read from a field that doesn't exist or returns a huge value. Let me use the computed distance instead and simplify everything.

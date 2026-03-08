@@ -1,0 +1,331 @@
+
+You are T1 Faker, the best league of legends player in the world.
+
+You are observing the behaviour of an autonomous League of Legends scripting bot.
+The bot is currently acting on a hand-crafted python based policy.
+You will be provided the observations, actions and calculated reward for each timestep in game.
+
+You must improve the policy of the agent based on its gathered experience playing the game.
+You must determine instances where either its reward dropped immediately, or it performed
+an action later down the line which caused its reward to drop (getting hit by an enemy projectile,
+dying, etc.). The objective of the task is to gain the most reward possible AND to kill the enemy
+champion WITHOUT being killed ourselves. PRIORITISE ATTEMPTING TO KILL THE ENEMY CHAMPION FIRST.
+
+You must also utilise the <history></history> section which contains the <thinking/> history during
+the entire optimisation process. This contains descriptions, corrections and other observations
+of agent behaviour during the training process. You *MUST* use this information to avoid cyclically
+updating your policy and forgetting parts of the policy which have already been learned.
+You must also use the most recent game data you have been given AS WELL AS the information contained
+in <history/>.
+
+<game_context priority="CRUCIAL">
+- Cooldowns are disabled (meaning there are no cooldowns) during this demo.
+</game_context>
+
+<priority value='LIFE AND DEATH' Crucially, limit your thinking to under 4000 words. We want fast iteration.</priority>
+
+
+
+<observation-spec>
+
+The observation data represents a League of Legends game state. Let me explain the key parts:
+
+1. Time Format (T{seconds}):
+   Shows game time in seconds
+   
+2. Champion State (ME/ENY):
+   - Health/Mana as percentages
+   - Position as (y, x) coordinates
+   - Level and gold
+   - Kills/Deaths
+   
+3. Ability Status (QWER):
+   - Cooldowns in seconds
+   - 0 means ability is ready
+   
+4. Projectiles (PROJ):
+   - Each [owner,dx,dy,speed,name]
+   - dx/dy shows direction relative to player
+   - Negative dx means projectile moving left
+   - Negative dy means projectile moving down
+   
+5. Available Actions (ACT):
+   - List of currently possible actions
+   - move: Can move
+   - auto: Can auto attack
+   - q/w/e/r: Can cast abilities
+
+For example:
+T12262|ME80,100,(9553,9271),L1,G35,K0D0|Q0W0E0R0|ENY50,80,(333,36),L1|PROJ[1234,-100,50,2000,EzQ]|ACT[move,q]
+
+This shows:
+- 12262 seconds into game
+- I'm at 80% HP, full mana, position (9553,9271)
+- Level 1, 35 gold, no kills/deaths
+- All abilities ready (0 cooldown)
+- Enemy at 50% HP, 80% mana, 333 units right and 36 units up
+- One enemy projectile moving left and slightly up
+
+This format preserves all tactical information while being much more compact than raw JSON.
+
+</observation-spec>
+
+<action-spec>
+
+<spell_options>
+SPELL_OPTIONS = (
+    ("Q", 0),
+    ("W", 1),
+    ("E", 2),
+    ("R", 3),
+    ("Sum1", 4),
+    ("Sum2", 5)
+)
+</spell_options>
+<action_ids>
+0 - no_op
+1 - move
+2 - spell
+</action_ids>
+<arg_type>
+Point - (y, x) (Range between 0 and 16000 inclusive)
+</arg_type>
+<action_args>
+no_op - None
+move  - Point (y, x)
+spell - Spell Option, Point
+</action_args>
+
+<example>
+<action_name>spell</action_name>
+<action_id>2</action_id>
+<action_args>
+[[0],[0, 8000]]
+</action_args>
+</example>
+
+</action-spec>
+
+<current-policy>
+def act(self, observation):
+    import math
+
+    my_champ = next(unit for unit in observation["champ_units"] if unit["my_team"] == 1)
+    enemy_champ = next(unit for unit in observation["champ_units"] if unit["my_team"] == 0)
+
+    my_hp_pct = my_champ["current_hp"] / max(my_champ["max_hp"], 1)
+    enemy_hp_pct = enemy_champ["current_hp"] / max(enemy_champ["max_hp"], 1)
+    my_x = my_champ["position"]["X"]
+    my_y = my_champ["position"]["Y"]
+    enemy_dx = enemy_champ["dx_to_me"]
+    enemy_dy = enemy_champ["dy_to_me"]
+    enemy_dist = enemy_champ["distance_to_me"]
+    enemy_x = enemy_champ["position"]["X"]
+    enemy_y = enemy_champ["position"]["Y"]
+
+    nearby_projectiles = [p for p in observation["projectiles"]
+                         if p["my_team"] == 0 and p["distance_to_me"] < 600]
+
+    game_time = observation["game_time"]
+
+    # Priority 1: Dodge incoming enemy projectiles
+    if nearby_projectiles:
+        closest_proj = min(nearby_projectiles, key=lambda p: p["distance_to_me"])
+        proj_dx = closest_proj["dx_to_me"]
+        proj_dy = closest_proj["dy_to_me"]
+        proj_dist = closest_proj["distance_to_me"]
+        
+        # Calculate perpendicular dodge direction
+        # Alternate dodge direction based on time to be unpredictable
+        if int(game_time / 300) % 2 == 0:
+            dodge_dir_x = -proj_dy
+            dodge_dir_y = proj_dx
+        else:
+            dodge_dir_x = proj_dy
+            dodge_dir_y = -proj_dx
+        
+        mag = math.sqrt(dodge_dir_x**2 + dodge_dir_y**2)
+        if mag > 0 and proj_dist < 400:
+            # Use E (Arcane Shift) to blink perpendicular to dodge while dealing damage
+            # Blink toward enemy's flank
+            dodge_target_x = my_x + (dodge_dir_x / mag) * 300
+            dodge_target_y = my_y + (dodge_dir_y / mag) * 300
+            # Use E to blink-dodge
+            return (2, [[2], [dodge_target_y, dodge_target_x]])
+        elif proj_dist < 600:
+            # If projectile further, try to cast Q at enemy while sidestepping
+            dodge_target_x = my_x + (dodge_dir_x / mag) * 250 if mag > 0 else my_x + 200
+            dodge_target_y = my_y + (dodge_dir_y / mag) * 250 if mag > 0 else my_y + 200
+            return (1, [dodge_target_y, dodge_target_x])
+
+    # Priority 2: Spam abilities at enemy - no cooldowns means maximum DPS
+    # Use R (Trueshot Barrage) at long range for big damage
+    if enemy_dist > 1000:
+        # Cast R toward enemy for long-range poke while approaching
+        return (2, [[3], [enemy_y, enemy_x]])
+
+    # Use E (Arcane Shift) aggressively to blink toward enemy flank
+    # This does damage AND repositions us to dodge
+    if enemy_dist > 400:
+        # Blink to a position offset from the enemy (flanking angle)
+        angle_to_enemy = math.atan2(enemy_dy, enemy_dx)
+        # Offset to the side so we don't blink into their Q line
+        offset = math.pi / 4 if int(game_time / 200) % 2 == 0 else -math.pi / 4
+        blink_x = my_x + math.cos(angle_to_enemy + offset) * min(enemy_dist - 100, 475)
+        blink_y = my_y + math.sin(angle_to_enemy + offset) * min(enemy_dist - 100, 475)
+        return (2, [[2], [blink_y, blink_x]])
+
+    # In close range: cycle through abilities rapidly
+    # Rotation: Q -> W -> E -> Q -> W -> E (all no cooldown)
+    cycle = int(game_time / 150) % 4
+    
+    if cycle == 0:
+        # Cast Q at enemy
+        return (2, [[0], [enemy_y, enemy_x]])
+    elif cycle == 1:
+        # Cast W at enemy
+        return (2, [[1], [enemy_y, enemy_x]])
+    elif cycle == 2:
+        # Cast E to reposition (orbit around enemy)
+        angle_to_enemy = math.atan2(enemy_dy, enemy_dx)
+        orbit_x = enemy_x + math.cos(angle_to_enemy + math.pi / 3) * 350
+        orbit_y = enemy_y + math.sin(angle_to_enemy + math.pi / 3) * 350
+        return (2, [[2], [orbit_y, orbit_x]])
+    else:
+        # Cast R through enemy
+        return (2, [[3], [enemy_y, enemy_x]])
+</current-policy>
+
+<experience>
+T33|ME88,100,(26,280),L1,G35,K0D0|Q0W0E0R0|ENY88,100,(13901,13895),L1|PROJ|ACT[no_op,move,auto,spell_0,spell_1,spell_2,spell_3,spell_4,spell_5]
+T0|ME100,100,(6350,6350),L1,G35,K0D0|Q0W0E0R0|ENY100,100,(1300,1300),L1|PROJ|ACT[no_op,move,auto,spell_0,spell_1,spell_2,spell_3,spell_4,spell_5]
+T262|ME100,100,(6350,6350),L1,G35,K0D0|Q0W0E0R0|ENY100,100,(1300,1300),L1|PROJ|ACT[no_op,move,auto,spell_0,spell_1,spell_2,spell_3,spell_4,spell_5]
+T526|ME100,100,(6350,6350),L1,G35,K0D0|Q0W0E0R0|ENY100,100,(1300,1300),L1|PROJ|ACT[no_op,move,auto,spell_0,spell_1,spell_2,spell_3,spell_4,spell_5]
+T754|ME100,100,(6350,6350),L1,G35,K0D0|Q0W0E0R0|ENY100,100,(1300,1300),L1|PROJ|ACT[no_op,move,auto,spell_0,spell_1,spell_2,spell_3,spell_4,spell_5]
+T1016|ME100,100,(6350,6350),L1,G35,K0D0|Q0W0E0R0|ENY100,100,(1300,1300),L1|PROJ|ACT[no_op,move,auto,spell_0,spell_1,spell_2,spell_3,spell_4,spell_5]
+T1278|ME100,100,(6350,6350),L1,G35,K0D0|Q0W0E0R0|ENY100,100,(1300,1300),L1|PROJ[1073741854,1300,1300,2000,EzrealTrueshotBarrage][1073741853,0,0,2000,EzrealTrueshotBarrage]|ACT[no_op,move,auto,spell_0,spell_1,spell_2,spell_3,spell_4,spell_5]
+T1509|ME100,100,(6350,6350),L1,G35,K0D0|Q0W0E0R0|ENY100,100,(1300,1300),L1|PROJ[1073741854,973,973,2000,EzrealTrueshotBarrage][1073741853,326,326,2000,EzrealTrueshotBarrage]|ACT[no_op,move,auto,spell_0,spell_1,spell_2,spell_3,spell_4,spell_5]
+T1772|ME100,100,(6350,6350),L1,G35,K0D0|Q0W0E0R0|ENY100,100,(1300,1300),L1|PROJ[1073741854,602,602,2000,EzrealTrueshotBarrage][1073741853,697,697,2000,EzrealTrueshotBarrage]|ACT[no_op,move,auto,spell_0,spell_1,spell_2,spell_3,spell_4,spell_5]
+T2002|ME100,100,(6350,6350),L1,G35,K0D0|Q0W0E0R0|ENY100,100,(1300,1300),L1|PROJ[1073741854,276,276,2000,EzrealTrueshotBarrage][1073741853,1023,1023,2000,EzrealTrueshotBarrage]|ACT[no_op,move,auto,spell_0,spell_1,spell_2,spell_3,spell_4,spell_5]
+T2265|ME64,100,(6350,6350),L1,G35,K0D0|Q0W0E0R0|ENY64,100,(1300,1300),L1|PROJ[1073741854,-95,-95,2000,EzrealTrueshotBarrage][1073741853,1395,1395,2000,EzrealTrueshotBarrage]|ACT[no_op,move,auto,spell_0,spell_1,spell_2,spell_3,spell_4,spell_5]
+T2527|ME64,100,(6562,6137),L1,G35,K0D0|Q0W0E0R0|ENY64,100,(875,1725),L1|PROJ[1073741854,-678,-253,2000,EzrealTrueshotBarrage][1073741853,1554,1979,2000,EzrealTrueshotBarrage][1073741853,0,0,2000,EzrealTrueshotBarrage][1073741854,875,1725,2000,EzrealTrueshotBarrage]|ACT[no_op,move,auto,spell_0,spell_1,spell_2,spell_3,spell_4,spell_5]
+T2759|ME65,100,(6562,6137),L1,G35,K0D0|Q0W0E0R0|ENY65,100,(875,1725),L1|PROJ[1073741854,-1005,-580,2000,EzrealTrueshotBarrage][1073741853,1881,2306,2000,EzrealTrueshotBarrage][1073741853,270,375,2000,EzrealTrueshotBarrage][1073741854,605,1349,2000,EzrealTrueshotBarrage]|ACT[no_op,move,auto,spell_0,spell_1,spell_2,spell_3,spell_4,spell_5]
+T3022|ME65,100,(6562,6137),L1,G35,K0D0|Q0W0E0R0|ENY65,100,(875,1725),L1|PROJ[1073741854,-1377,-952,2000,EzrealTrueshotBarrage][1073741853,2253,2678,2000,EzrealTrueshotBarrage][1073741853,577,803,2000,EzrealTrueshotBarrage][1073741854,297,921,2000,EzrealTrueshotBarrage]|ACT[no_op,move,auto,spell_0,spell_1,spell_2,spell_3,spell_4,spell_5]
+T3253|ME65,100,(6562,6137),L1,G35,K0D0|Q0W0E0R0|ENY65,100,(875,1725),L1|PROJ[1073741854,-1703,-1278,2000,EzrealTrueshotBarrage][1073741853,2579,3004,2000,EzrealTrueshotBarrage][1073741853,846,1177,2000,EzrealTrueshotBarrage][1073741854,28,547,2000,EzrealTrueshotBarrage]|ACT[no_op,move,auto,spell_0,spell_1,spell_2,spell_3,spell_4,spell_5]
+T3519|ME65,100,(6562,6137),L1,G35,K0D0|Q0W0E0R0|ENY65,100,(875,1725),L1|PROJ[1073741854,-2079,-1654,2000,EzrealTrueshotBarrage][1073741853,2955,3380,2000,EzrealTrueshotBarrage][1073741853,1157,1609,2000,EzrealTrueshotBarrage][1073741854,-282,115,2000,EzrealTrueshotBarrage]|ACT[no_op,move,auto,spell_0,spell_1,spell_2,spell_3,spell_4,spell_5]
+T3781|ME65,100,(6436,6594),L1,G35,K0D0|Q0W0E0R0|ENY65,100,(1125,808),L1|PROJ[1073741854,-2326,-2485,2000,EzrealTrueshotBarrage][1073741853,3454,3295,2000,EzrealTrueshotBarrage][1073741853,0,0,2000,EzrealTrueshotBarrage][1073741853,1590,1578,2000,EzrealTrueshotBarrage][1073741854,-463,-769,2000,EzrealTrueshotBarrage][1073741854,1125,808,2000,EzrealTrueshotBarrage]|ACT[no_op,move,auto,spell_0,spell_1,spell_2,spell_3,spell_4,spell_5]
+T4011|ME65,100,(6436,6594),L1,G35,K0D0|Q0W0E0R0|ENY65,100,(1125,808),L1|PROJ[1073741854,-2650,-2809,2000,EzrealTrueshotBarrage][1073741853,3778,3619,2000,EzrealTrueshotBarrage][1073741853,395,233,2000,EzrealTrueshotBarrage][1073741853,1858,1951,2000,EzrealTrueshotBarrage][1073741854,-731,-1142,2000,EzrealTrueshotBarrage][1073741854,730,575,2000,EzrealTrueshotBarrage]|ACT[no_op,move,auto,spell_0,spell_1,spell_2,spell_3,spell_4,spell_5]
+T4273|ME65,100,(6436,6594),L1,G35,K0D0|Q0W0E0R0|ENY65,100,(1125,808),L1|PROJ[1073741854,-3021,-3180,2000,EzrealTrueshotBarrage][1073741853,4149,3990,2000,EzrealTrueshotBarrage][1073741853,847,500,2000,EzrealTrueshotBarrage][1073741853,2165,2377,2000,EzrealTrueshotBarrage][1073741854,-1037,-1568,2000,EzrealTrueshotBarrage][1073741854,278,308,2000,EzrealTrueshotBarrage]|ACT[no_op,move,auto,spell_0,spell_1,spell_2,spell_3,spell_4,spell_5]
+T4503|ME30,100,(6436,6594),L1,G35,K0D0|Q0W0E0R0|ENY30,100,(1125,808),L1|PROJ[1073741854,-3346,-3505,2000,EzrealTrueshotBarrage][1073741853,4474,4315,2000,EzrealTrueshotBarrage][1073741853,1242,733,2000,EzrealTrueshotBarrage][1073741853,2433,2750,2000,EzrealTrueshotBarrage][1073741854,-1305,-1941,2000,EzrealTrueshotBarrage][1073741854,-116,74,2000,EzrealTrueshotBarrage]|ACT[no_op,move,auto,spell_0,spell_1,spell_2,spell_3,spell_4,spell_5]
+T4766|ME30,100,(6496,6534),L1,G35,K0D0|Q0W0E0R0|ENY30,100,(1005,929),L1|PROJ[1073741854,-3778,-3816,2000,EzrealTrueshotBarrage][1073741853,4785,4747,2000,EzrealTrueshotBarrage][1073741853,1634,1061,2000,EzrealTrueshotBarrage][1073741853,2679,3237,2000,EzrealTrueshotBarrage][1073741854,-1672,-2307,2000,EzrealTrueshotBarrage][1073741854,-629,-132,2000,EzrealTrueshotBarrage]|ACT[no_op,move,auto,spell_0,spell_1,spell_2,spell_3,spell_4,spell_5]
+T5031|ME30,100,(6847,6597),L1,G35,K0D0|Q0W0E0R0|ENY30,100,(304,803),L1|PROJ[1073741854,-4504,-4254,2000,EzrealTrueshotBarrage][1073741853,4810,5060,2000,EzrealTrueshotBarrage][1073741853,1741,1268,2000,EzrealTrueshotBarrage][1073741853,2638,3605,2000,EzrealTrueshotBarrage][1073741853,0,0,2000,EzrealTrueshotBarrage][1073741854,-2333,-2801,2000,EzrealTrueshotBarrage][1073741854,-1436,-464,2000,EzrealTrueshotBarrage][1073741854,304,803,2000,EzrealTrueshotBarrage]|ACT[no_op,move,auto,spell_0,spell_1,spell_2,spell_3,spell_4,spell_5]
+T5262|ME30,100,(6847,6597),L1,G35,K0D0|Q0W0E0R0|ENY30,100,(304,803),L1|PROJ[1073741854,-4830,-4580,2000,EzrealTrueshotBarrage][1073741853,5136,5386,2000,EzrealTrueshotBarrage][1073741853,2138,1503,2000,EzrealTrueshotBarrage][1073741853,2908,3980,2000,EzrealTrueshotBarrage][1073741853,230,399,2000,EzrealTrueshotBarrage][1073741854,-2602,-3175,2000,EzrealTrueshotBarrage][1073741854,-1834,-699,2000,EzrealTrueshotBarrage][1073741854,73,403,2000,EzrealTrueshotBarrage]|ACT[no_op,move,auto,spell_0,spell_1,spell_2,spell_3,spell_4,spell_5]
+</experience>
+
+<history>
+Looking at the experience data, I can analyze what's happening:
+
+1. **We're playing Ezreal** (mirror match - both firing EzrealMysticShot projectiles)
+2. **Enemy starts at ~(1300,1300), we start at ~(6350,6350)** - we're far apart initially
+3. **The bot walks straight at the enemy** while alternating between move and Q cast (based on the time modulo pattern)
+4. **Both champions take equal damage** - HP drops symmetrically (100→88→72→59→32→19→5%), meaning we're trading evenly
+5. **Neither champion dies** - both end at ~5-6% HP
+6. **The problem**: We walk in a straight line toward the enemy, making us extremely easy to hit with skillshots. The enemy Ezreal Qs are all coming from the same diagonal direction and we never dodge.
+7. **Projectiles have dx,dy values** that show they're traveling along the diagonal toward us - we need to dodge perpendicular to this.
+8. **Position format note**: The action takes (y, x) but position dict has X and Y. Enemy is at lower coordinates than us.
+
+Key issues with current policy:
+- Walking straight at enemy = easy skillshot target
+- Simple time-modulo alternation between move and Q is terrible
+- No dodging at all
+- No use of W, E, R abilities (Ezreal E is a blink/dash - great for dodging and repositioning!)
+- Need to sidestep between Q casts
+
+Strategy improvements:
+1. **Dodge projectiles** by moving perpendicular to their travel direction
+2. **Use all abilities** - Q for poke, W for damage buff, E for blink/reposition, R for long range damage
+3. **Approach at an angle** instead of straight line
+4. **Weave between casting and dodging** - cast Q at enemy, then immediately sidestep
+5. **Use E aggressively** to close distance or dodge while dealing damage
+6. **Prioritize killing the enemy** - we need to land our skills while dodging theirs
+
+Since cooldowns are disabled, we should spam abilities as much as possible! E (Arcane Shift) is a blink that does damage, and with no cooldowns we can spam it toward the enemy for massive damage + repositioning.
+
+With no cooldowns, the optimal strategy is likely to spam E (Arcane Shift) directly on the enemy - it's a targeted blink that deals damage, and we can use it to constantly reposition making us hard to hit while dealing consistent damage.
+</history>
+
+<example>
+<thinking>
+During this episode, I constantly lost reward as I was hit by skillshots frequently due to being poor at dodging them.
+Therefore, I'm now going to try wiggling my character model rapidly moving back and forth before comitting to
+a skillshot, to make it harder for the enemy Ezreal to land a skillshot on me.
+<thinking>
+<policy>
+
+def act(self, obs):
+    import math # YOU MUST IMPORT THIS MODULE EVERY SINGLE TIME. DO NOT IMOPRT ANY OTHER MODULES
+    
+    # Get our champion and enemy champion info
+    my_champ = next(unit for unit in observation["champ_units"] if unit["my_team"] == 1)
+    enemy_champ = next(unit for unit in observation["champ_units"] if unit["my_team"] == 0)
+    nearby_projectiles = [p for p in observation["projectiles"] 
+                         if p["my_team"] == 0 and p["distance_to_me"] < 800]
+
+    # High priority: Dodge enemy skillshots (prevents HP loss which has high negative reward)
+    if nearby_projectiles:
+        proj = nearby_projectiles[0]
+        # Calculate perpendicular dodge direction
+        dodge_x = proj["dy_to_me"]
+        dodge_y = -proj["dx_to_me"]
+        magnitude = (dodge_x**2 + dodge_y**2)**0.5
+        if magnitude > 0:
+            dodge_x = (dodge_x/magnitude * 200) + my_champ["position"]["X"]
+            dodge_y = (dodge_y/magnitude * 200) + my_champ["position"]["Y"]
+            return (1, [dodge_y, dodge_x])
+
+    # Offensive opportunities (for kill rewards and HP damage)
+    if enemy_champ["distance_to_me"] < 600:
+        # Check if we have HP advantage
+        my_hp_percent = my_champ["current_hp"] / my_champ["max_hp"]
+        enemy_hp_percent = enemy_champ["current_hp"] / enemy_champ["max_hp"]
+        
+        if my_hp_percent > enemy_hp_percent + 0.2:  # We have significant HP advantage
+            # Cast Q if available and in range
+            if my_champ["q_cooldown"] == 0:
+                return (2, [[0], [enemy_champ["position"]["Y"], enemy_champ["position"]["X"]]])
+        else:
+            # Maintain safe distance if we don't have HP advantage
+            retreat_x = my_champ["position"]["X"] - enemy_champ["dx_to_me"]
+            retreat_y = my_champ["position"]["Y"] - enemy_champ["dy_to_me"]
+            return (1, [retreat_y, retreat_x])
+
+    # Resource management (MP has moderate reward weight)
+    if my_champ["current_mp"] / my_champ["max_mp"] < 0.3:
+        # Play conservatively when low on mana
+        safe_x = my_champ["position"]["X"] + (enemy_champ["dx_to_me"] * -1.5)
+        safe_y = my_champ["position"]["Y"] + (enemy_champ["dy_to_me"] * -1.5)
+        return (1, [safe_y, safe_x])
+
+    # Default behavior: Maintain optimal trading range
+    optimal_range = 500  # Adjust based on champion
+    if enemy_champ["distance_to_me"] > optimal_range:
+        # Move closer
+        approach_x = my_champ["position"]["X"] + enemy_champ["dx_to_me"] * 0.5
+        approach_y = my_champ["position"]["Y"] + enemy_champ["dy_to_me"] * 0.5
+        return (1, [approach_y, approach_x])
+    else:
+        # Orbit around enemy while in range
+        orbit_angle = math.atan2(enemy_champ["dy_to_me"], enemy_champ["dx_to_me"])
+        orbit_x = enemy_champ["position"]["X"] + math.cos(orbit_angle + math.pi/4) * optimal_range
+        orbit_y = enemy_champ["position"]["Y"] + math.sin(orbit_angle + math.pi/4) * optimal_range
+        return (1, [orbit_y, orbit_x])
+</policy>
+</example>
+
+<task>
+You must now return the new policy based on <example></example>.
+Simply infill and complete the tags below.
+DO NOT PROVIDE ANY PREAMBLE OR IRRELEVANT TEXT, FILL IN THE TEMPLATE AS REQUIRED.
+</task>
+
+<thinking>

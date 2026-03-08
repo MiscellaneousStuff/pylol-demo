@@ -1,0 +1,1074 @@
+
+You are T1 Faker, the best league of legends player in the world.
+
+You are observing the behaviour of an autonomous League of Legends scripting bot.
+The bot is currently acting on a hand-crafted python based policy.
+You will be provided the observations, actions and calculated reward for each timestep in game.
+
+You must improve the policy of the agent based on its gathered experience playing the game.
+You must determine instances where either its reward dropped immediately, or it performed
+an action later down the line which caused its reward to drop (getting hit by an enemy projectile,
+dying, etc.)
+
+You must also utilise the <history></history> section which contains the <thinking/> history during
+the entire optimisation process. This contains descriptions, corrections and other observations
+of agent behaviour during the training process. You *MUST* use this information to avoid cyclically
+updating your policy and forgetting parts of the policy which have already been learned.
+You must also use the most recent game data you have been given AS WELL AS the information contained
+in <history/>.
+
+<game_context priority="CRUCIAL">
+- Cooldowns are disabled (meaning there are no cooldowns) during this demo.
+</game_context>
+
+<priority value='LIFE AND DEATH' Crucially, limit your thinking to under 4000 words. We want fast iteration.</priority>
+
+
+
+<observation-spec>
+
+The observation data represents a League of Legends game state. Let me explain the key parts:
+
+1. Time Format (T{seconds}):
+   Shows game time in seconds
+   
+2. Champion State (ME/ENY):
+   - Health/Mana as percentages
+   - Position as (y, x) coordinates
+   - Level and gold
+   - Kills/Deaths
+   
+3. Ability Status (QWER):
+   - Cooldowns in seconds
+   - 0 means ability is ready
+   
+4. Projectiles (PROJ):
+   - Each [owner,dx,dy,speed,name]
+   - dx/dy shows direction relative to player
+   - Negative dx means projectile moving left
+   - Negative dy means projectile moving down
+   
+5. Available Actions (ACT):
+   - List of currently possible actions
+   - move: Can move
+   - auto: Can auto attack
+   - q/w/e/r: Can cast abilities
+
+For example:
+T12262|ME80,100,(9553,9271),L1,G35,K0D0|Q0W0E0R0|ENY50,80,(333,36),L1|PROJ[1234,-100,50,2000,EzQ]|ACT[move,q]
+
+This shows:
+- 12262 seconds into game
+- I'm at 80% HP, full mana, position (9553,9271)
+- Level 1, 35 gold, no kills/deaths
+- All abilities ready (0 cooldown)
+- Enemy at 50% HP, 80% mana, 333 units right and 36 units up
+- One enemy projectile moving left and slightly up
+
+This format preserves all tactical information while being much more compact than raw JSON.
+
+</observation-spec>
+
+<action-spec>
+
+<spell_options>
+SPELL_OPTIONS = (
+    ("Q", 0),
+    ("W", 1),
+    ("E", 2),
+    ("R", 3),
+    ("Sum1", 4),
+    ("Sum2", 5)
+)
+</spell_options>
+<action_ids>
+0 - no_op
+1 - move
+2 - spell
+</action_ids>
+<arg_type>
+Point - (y, x) (Range between 0 and 16000 inclusive)
+</arg_type>
+<action_args>
+no_op - None
+move  - Point (y, x)
+spell - Spell Option, Point
+</action_args>
+
+<example>
+<action_name>spell</action_name>
+<action_id>2</action_id>
+<action_args>
+[[0],[0, 8000]]
+</action_args>
+</example>
+
+</action-spec>
+
+<current-policy>
+def act(self, observation):
+    import math
+
+    my_champ = next(unit for unit in observation["champ_units"] if unit["my_team"] == 1)
+    enemy_champ = next(unit for unit in observation["champ_units"] if unit["my_team"] == 0)
+
+    my_hp_pct = my_champ["current_hp"] / max(my_champ["max_hp"], 1)
+    enemy_hp_pct = enemy_champ["current_hp"] / max(enemy_champ["max_hp"], 1)
+    my_x = my_champ["position"]["X"]
+    my_y = my_champ["position"]["Y"]
+    enemy_dx = enemy_champ["dx_to_me"]
+    enemy_dy = enemy_champ["dy_to_me"]
+    enemy_dist = enemy_champ["distance_to_me"]
+    enemy_x = enemy_champ["position"]["X"]
+    enemy_y = enemy_champ["position"]["Y"]
+
+    q_ready = my_champ["q_cooldown"] == 0
+    w_ready = my_champ["w_cooldown"] == 0
+    e_ready = my_champ["e_cooldown"] == 0
+    r_ready = my_champ["r_cooldown"] == 0
+
+    game_time = observation["game_time"]
+    angle_to_enemy = math.atan2(enemy_dy, enemy_dx)
+
+    # Only consider enemy projectiles that are CLOSE and likely heading toward us
+    # Check that the projectile is between us and enemy (same sign as enemy direction)
+    # and within a tight radius
+    threatening = []
+    for p in observation["projectiles"]:
+        if p["my_team"] == 0:
+            dist = p["distance_to_me"]
+            pdx = p["dx_to_me"]
+            pdy = p["dy_to_me"]
+            # Only threatening if close AND roughly in the direction of enemy
+            # (meaning it's between us and enemy, heading toward us)
+            if dist < 400:
+                # Check if projectile is on the same side as enemy (heading toward us)
+                dot = pdx * enemy_dx + pdy * enemy_dy
+                if dot > 0 or dist < 200:
+                    threatening.append(p)
+
+    # PRIORITY 0: Cast Q at enemy when in range - THIS IS THE HIGHEST DPS ACTION
+    # No cooldowns means we should Q every single tick possible
+    if q_ready and enemy_dist < 1100:
+        # Lead prediction: aim slightly ahead of enemy movement
+        lead_offset = math.sin(game_time * 0.019) * 150
+        aim_x = enemy_x + math.cos(angle_to_enemy + math.pi / 2) * lead_offset
+        aim_y = enemy_y + math.sin(angle_to_enemy + math.pi / 2) * lead_offset
+        return (2, [[0], [aim_y, aim_x]])
+
+    # PRIORITY 1: Dodge VERY close projectiles (only after Q is cast)
+    if threatening:
+        closest = min(threatening, key=lambda p: p["distance_to_me"])
+        pdx = closest["dx_to_me"]
+        pdy = closest["dy_to_me"]
+        perp_x = -pdy
+        perp_y = pdx
+        mag = math.sqrt(perp_x ** 2 + perp_y ** 2)
+        if mag > 0:
+            perp_x /= mag
+            perp_y /= mag
+
+        # Use E to dodge if very close
+        if closest["distance_to_me"] < 200 and e_ready:
+            e_x = my_x + perp_x * 475
+            e_y = my_y + perp_y * 475
+            return (2, [[2], [e_y, e_x]])
+
+        dodge_x = my_x + perp_x * 350
+        dodge_y = my_y + perp_y * 350
+        return (1, [dodge_y, dodge_x])
+
+    # PRIORITY 2: Cast W for mark damage when in range
+    if w_ready and enemy_dist < 1000:
+        return (2, [[1], [enemy_y, enemy_x]])
+
+    # PRIORITY 3: Use R occasionally (every ~8 ticks) for burst damage
+    tick = int(game_time / 250)
+    if r_ready and tick % 8 == 0:
+        return (2, [[3], [enemy_y, enemy_x]])
+
+    # PRIORITY 4: Use E to close gap when far
+    if e_ready and enemy_dist > 1300 and my_hp_pct > 0.25:
+        e_x = my_x + math.cos(angle_to_enemy) * 475
+        e_y = my_y + math.sin(angle_to_enemy) * 475
+        return (2, [[2], [e_y, e_x]])
+
+    # PRIORITY 5: Movement and positioning
+    # Far away: rush toward enemy with juke pattern
+    if enemy_dist > 1000:
+        juke = math.sin(game_time * 0.011) * math.pi / 4
+        move_angle = angle_to_enemy + juke
+        mx = my_x + math.cos(move_angle) * 400
+        my = my_y + math.sin(move_angle) * 400
+        return (1, [my, mx])
+
+    # Too close: kite back
+    if enemy_dist < 350:
+        angle_away = math.atan2(-enemy_dy, -enemy_dx)
+        mx = my_x + math.cos(angle_away) * 350
+        my = my_y + math.sin(angle_away) * 350
+        return (1, [my, mx])
+
+    # Optimal range (350-1000): unpredictable orbiting
+    t = game_time
+    juke1 = math.sin(t * 0.015) * 0.7
+    juke2 = math.sin(t * 0.0083 + 2.1) * 0.5
+    juke3 = math.sin(t * 0.027 + 0.7) * 0.4
+    combined = juke1 + juke2 + juke3
+    orbit_angle = angle_to_enemy + (math.pi / 2) * combined
+    mx = my_x + math.cos(orbit_angle) * 300
+    my = my_y + math.sin(orbit_angle) * 300
+    return (1, [my, mx])
+</current-policy>
+
+<experience>
+T33|ME88,100,(26,280),L1,G35,K0D0|Q0W0E0R0|ENY88,100,(13901,13895),L1|PROJ|ACT[no_op,move,auto,spell_0,spell_1,spell_2,spell_3,spell_4,spell_5]
+T0|ME100,100,(6350,6350),L1,G35,K0D0|Q0W0E0R0|ENY100,100,(1300,1300),L1|PROJ|ACT[no_op,move,auto,spell_0,spell_1,spell_2,spell_3,spell_4,spell_5]
+T262|ME100,100,(6350,6350),L1,G35,K0D0|Q0W0E0R0|ENY100,100,(1300,1300),L1|PROJ|ACT[no_op,move,auto,spell_0,spell_1,spell_2,spell_3,spell_4,spell_5]
+T526|ME100,100,(6685,6685),L1,G35,K0D0|Q0W0E0R0|ENY100,100,(629,629),L1|PROJ|ACT[no_op,move,auto,spell_0,spell_1,spell_2,spell_3,spell_4,spell_5]
+T754|ME100,100,(6685,6685),L1,G35,K0D0|Q0W0E0R0|ENY100,100,(629,629),L1|PROJ|ACT[no_op,move,auto,spell_0,spell_1,spell_2,spell_3,spell_4,spell_5]
+T1016|ME100,100,(6685,6685),L1,G35,K0D0|Q0W0E0R0|ENY100,100,(629,629),L1|PROJ[1073741854,629,629,2000,EzrealMysticShot][1073741853,0,0,2000,EzrealMysticShot]|ACT[no_op,move,auto,spell_0,spell_1,spell_2,spell_3,spell_4,spell_5]
+T1278|ME100,100,(6685,6685),L1,G35,K0D0|Q0W0E0R0|ENY100,100,(629,629),L1|PROJ[1073741854,629,629,2000,EzrealTrueshotBarrage][1073741853,0,0,2000,EzrealTrueshotBarrage][1073741854,294,226,2000,EzrealMysticShot][1073741853,334,402,2000,EzrealMysticShot]|ACT[no_op,move,auto,spell_0,spell_1,spell_2,spell_3,spell_4,spell_5]
+T1508|ME86,100,(6747,6643),L1,G35,K0D0|Q0W0E0R0|ENY86,100,(504,712),L1|PROJ[1073741854,241,345,2000,EzrealTrueshotBarrage][1073741853,263,366,2000,EzrealTrueshotBarrage]|ACT[no_op,move,auto,spell_0,spell_1,spell_2,spell_3,spell_4,spell_5]
+T1772|ME51,100,(6818,6595),L1,G35,K0D0|Q0W0E0R0|ENY51,100,(361,807),L1|PROJ[1073741854,-204,18,2000,EzrealTrueshotBarrage][1073741853,565,788,2000,EzrealTrueshotBarrage]|ACT[no_op,move,auto,spell_0,spell_1,spell_2,spell_3,spell_4,spell_5]
+T2002|ME51,100,(6818,6595),L1,G35,K0D0|Q0W0E0R0|ENY51,100,(299,848),L1|PROJ[1073741854,-529,-306,2000,EzrealTrueshotBarrage][1073741853,890,1113,2000,EzrealTrueshotBarrage]|ACT[no_op,move,auto,spell_0,spell_1,spell_2,spell_3,spell_4,spell_5]
+T2266|ME51,100,(6818,6595),L1,G35,K0D0|Q0W0E0R0|ENY51,100,(299,848),L1|PROJ[1073741854,-902,-679,2000,EzrealTrueshotBarrage][1073741853,1264,1487,2000,EzrealTrueshotBarrage][1073741853,268,375,2000,EzrealMysticShot][1073741854,299,848,2000,EzrealMysticShot]|ACT[no_op,move,auto,spell_0,spell_1,spell_2,spell_3,spell_4,spell_5]
+T2530|ME51,100,(6818,6595),L1,G35,K0D0|Q0W0E0R0|ENY51,100,(299,848),L1|PROJ[1073741854,-1274,-1051,2000,EzrealTrueshotBarrage][1073741853,1635,1858,2000,EzrealTrueshotBarrage][1073741853,575,802,2000,EzrealMysticShot][1073741854,31,396,2000,EzrealMysticShot]|ACT[no_op,move,auto,spell_0,spell_1,spell_2,spell_3,spell_4,spell_5]
+T2759|ME51,100,(6751,6562),L1,G35,K0D0|Q0W0E0R0|ENY51,100,(366,882),L1|PROJ[1073741854,-1532,-1343,2000,EzrealTrueshotBarrage][1073741853,2028,2217,2000,EzrealTrueshotBarrage][1073741853,757,997,2000,EzrealMysticShot][1073741854,-137,34,2000,EzrealMysticShot]|ACT[no_op,move,auto,spell_0,spell_1,spell_2,spell_3,spell_4,spell_5]
+T3021|ME51,100,(6675,6524),L1,G35,K0D0|Q0W0E0R0|ENY51,100,(442,920),L1|PROJ[1073741854,-1827,-1675,2000,EzrealTrueshotBarrage][1073741853,2474,2626,2000,EzrealTrueshotBarrage][1073741853,835,1037,2000,EzrealMysticShot][1073741854,-127,-38,2000,EzrealMysticShot][1073741854,207,638,1600,EzrealEssenceFlux][1073741854,191,536,2000,EzrealMysticShot][1073741853,353,262,1600,EzrealEssenceFlux]|ACT[no_op,move,auto,spell_0,spell_1,spell_2,spell_3,spell_4,spell_5]
+T3251|ME51,100,(6675,6524),L1,G35,K0D0|Q0W0E0R0|ENY51,100,(442,920),L1|PROJ[1073741854,-2151,-2000,2000,EzrealTrueshotBarrage][1073741853,2799,2950,2000,EzrealTrueshotBarrage][1073741853,797,984,2000,EzrealMysticShot][1073741854,-160,-94,2000,EzrealMysticShot][1073741854,-27,357,1600,EzrealEssenceFlux][1073741854,-59,152,2000,EzrealMysticShot][1073741853,640,491,1600,EzrealEssenceFlux]|ACT[no_op,move,auto,spell_0,spell_1,spell_2,spell_3,spell_4,spell_5]
+T3513|ME51,100,(6209,6614),L1,G35,K0D0|Q0W0E0R0|ENY51,100,(870,754),L1|PROJ[1073741854,-2056,-2461,2000,EzrealTrueshotBarrage][1073741853,3636,3231,2000,EzrealTrueshotBarrage][1073741853,1263,894,2000,EzrealMysticShot][1073741854,306,-184,2000,EzrealMysticShot][1073741854,263,-155,2000,EzrealMysticShot][1073741854,673,535,1600,EzrealEssenceFlux]|ACT[no_op,move,auto,spell_0,spell_1,spell_2,spell_3,spell_4,spell_5]
+T3773|ME51,100,(6351,6233),L1,G35,K0D0|Q0W0E0R0|ENY52,100,(767,1059),L1|PROJ[1073741854,-2566,-2448,2000,EzrealTrueshotBarrage][1073741853,3863,3981,2000,EzrealTrueshotBarrage][1073741853,1122,1276,2000,EzrealMysticShot][1073741854,164,197,2000,EzrealMysticShot][1073741854,122,225,2000,EzrealMysticShot][1073741854,270,591,1600,EzrealEssenceFlux]|ACT[no_op,move,auto,spell_0,spell_1,spell_2,spell_3,spell_4,spell_5]
+T4004|ME51,100,(6417,6199),L1,G35,K0D0|Q0W0E0R0|ENY52,100,(682,1020),L1|PROJ[1073741854,-2958,-2740,2000,EzrealTrueshotBarrage][1073741853,4122,4340,2000,EzrealTrueshotBarrage][1073741853,1092,1361,2000,EzrealMysticShot][1073741854,130,285,2000,EzrealMysticShot][1073741854,90,312,2000,EzrealMysticShot][1073741854,38,420,1600,EzrealEssenceFlux]|ACT[no_op,move,auto,spell_0,spell_1,spell_2,spell_3,spell_4,spell_5]
+T4267|ME51,100,(6417,6113),L1,G35,K0D0|Q0W0E0R0|ENY52,100,(489,725),L1|PROJ[1073741854,-3331,-3027,2000,EzrealTrueshotBarrage][1073741853,4494,4798,2000,EzrealTrueshotBarrage][1073741853,1091,1445,2000,EzrealMysticShot][1073741854,129,369,2000,EzrealMysticShot][1073741854,89,396,2000,EzrealMysticShot][1073741854,39,507,1600,EzrealEssenceFlux]|ACT[no_op,move,auto,spell_0,spell_1,spell_2,spell_3,spell_4,spell_5]
+T4528|ME51,100,(6357,6053),L1,G35,K0D0|Q0W0E0R0|ENY52,100,(549,785),L1|PROJ[1073741854,-3640,-3337,2000,EzrealTrueshotBarrage][1073741853,4924,5228,2000,EzrealTrueshotBarrage][1073741853,1150,1504,2000,EzrealMysticShot][1073741854,189,428,2000,EzrealMysticShot][1073741854,148,455,2000,EzrealMysticShot][1073741854,100,568,1600,EzrealEssenceFlux]|ACT[no_op,move,auto,spell_0,spell_1,spell_2,spell_3,spell_4,spell_5]
+T4758|ME51,100,(6282,6053),L1,G35,K0D0|Q0W0E0R0|ENY52,100,(561,826),L1|PROJ[1073741854,-3891,-3662,2000,EzrealTrueshotBarrage][1073741853,5324,5553,2000,EzrealTrueshotBarrage][1073741853,1188,1452,2000,EzrealMysticShot][1073741854,230,373,2000,EzrealMysticShot][1073741854,188,401,2000,EzrealMysticShot][1073741854,207,608,1600,EzrealEssenceFlux]|ACT[no_op,move,auto,spell_0,spell_1,spell_2,spell_3,spell_4,spell_5]
+T5022|ME51,100,(6244,6130),L1,G35,K0D0|Q0W0E0R0|ENY52,100,(539,689),L1|PROJ[1073741854,-4226,-4111,2000,EzrealTrueshotBarrage][1073741853,5735,5850,2000,EzrealTrueshotBarrage][1073741853,1224,1373,2000,EzrealMysticShot][1073741854,267,293,2000,EzrealMysticShot][1073741854,224,322,2000,EzrealMysticShot][1073741854,247,533,1600,EzrealEssenceFlux]|ACT[no_op,move,auto,spell_0,spell_1,spell_2,spell_3,spell_4,spell_5]
+T5252|ME52,100,(6278,6063),L1,G35,K0D0|Q0W0E0R0|ENY52,100,(506,681),L1|PROJ[1073741854,-4584,-4370,2000,EzrealTrueshotBarrage][1073741853,6027,6241,2000,EzrealTrueshotBarrage][1073741853,1230,1494,2000,EzrealMysticShot][1073741854,268,417,2000,EzrealMysticShot][1073741854,227,445,2000,EzrealMysticShot][1073741854,180,558,1600,EzrealEssenceFlux]|ACT[no_op,move,auto,spell_0,spell_1,spell_2,spell_3,spell_4,spell_5]
+T5516|ME52,100,(6316,5987),L1,G35,K0D0|Q0W0E0R0|ENY52,100,(467,672),L1|PROJ[1073741854,-4994,-4665,2000,EzrealTrueshotBarrage][1073741853,6361,6690,2000,EzrealTrueshotBarrage][1073741853,1192,1571,2000,EzrealMysticShot][1073741854,230,495,2000,EzrealMysticShot][1073741854,190,522,2000,EzrealMysticShot][1073741854,63,528,2000,EzrealTrueshotBarrage][1073741854,141,634,1600,EzrealEssenceFlux]|ACT[no_op,move,auto,spell_0,spell_1,spell_2,spell_3,spell_4,spell_5]
+T5779|ME52,100,(6316,6073),L1,G35,K0D0|Q0W0E0R0|ENY52,100,(396,538),L1|PROJ[1073741854,-5368,-5125,2000,EzrealTrueshotBarrage][1073741853,6735,6978,2000,EzrealTrueshotBarrage][1073741853,1191,1483,2000,EzrealMysticShot][1073741854,229,407,2000,EzrealMysticShot][1073741854,188,434,2000,EzrealMysticShot][1073741854,-400,190,2000,EzrealTrueshotBarrage][1073741854,142,550,1600,EzrealEssenceFlux]|ACT[no_op,move,auto,spell_0,spell_1,spell_2,spell_3,spell_4,spell_5]
+T6009|ME52,100,(6298,6145),L1,G35,K0D0|Q0W0E0R0|ENY52,100,(343,443),L1|PROJ[1073741854,-5675,-5522,2000,EzrealTrueshotBarrage][1073741853,7077,7230,2000,EzrealTrueshotBarrage][1073741853,1170,1356,2000,EzrealMysticShot][1073741854,213,277,2000,EzrealMysticShot][1073741854,170,305,2000,EzrealMysticShot][1073741854,-786,-101,2000,EzrealTrueshotBarrage][1073741854,194,519,1600,EzrealEssenceFlux]|ACT[no_op,move,auto,spell_0,spell_1,spell_2,spell_3,spell_4,spell_5]
+T6275|ME52,100,(6237,6206),L1,G35,K0D0|Q0W0E0R0|ENY52,100,(404,295),L1|PROJ[1073741854,-5989,-5959,2000,EzrealTrueshotBarrage][1073741853,7514,7545,2000,EzrealTrueshotBarrage][1073741853,1231,1296,2000,EzrealMysticShot][1073741854,274,216,2000,EzrealMysticShot][1073741854,231,245,2000,EzrealMysticShot][1073741854,-1192,-415,2000,EzrealTrueshotBarrage][1073741854,255,458,1600,EzrealEssenceFlux]|ACT[no_op,move,auto,spell_0,spell_1,spell_2,spell_3,spell_4,spell_5]
+T6504|ME52,100,(6289,6153),L1,G35,K0D0|Q0W0E0R0|ENY52,100,(299,401),L1|PROJ[1073741854,-6367,-6231,2000,EzrealTrueshotBarrage][1073741853,7787,7923,2000,EzrealTrueshotBarrage][1073741853,1217,1402,2000,EzrealMysticShot][1073741854,255,326,2000,EzrealMysticShot][1073741854,215,353,2000,EzrealMysticShot][1073741854,-1649,-582,2000,EzrealTrueshotBarrage][1073741854,169,469,1600,EzrealEssenceFlux]|ACT[no_op,move,auto,spell_0,spell_1,spell_2,spell_3,spell_4,spell_5]
+T6766|ME52,100,(6350,6093),L1,G35,K0D0|Q0W0E0R0|ENY52,100,(178,401),L1|PROJ[1073741854,-6797,-6541,2000,EzrealTrueshotBarrage][1073741853,8096,8353,2000,EzrealTrueshotBarrage][1073741853,1157,1463,2000,EzrealMysticShot][1073741854,195,386,2000,EzrealMysticShot][1073741854,155,414,2000,EzrealMysticShot][1073741854,-2168,-771,2000,EzrealTrueshotBarrage][1073741854,109,529,1600,EzrealEssenceFlux]|ACT[no_op,move,auto,spell_0,spell_1,spell_2,spell_3,spell_4,spell_5]
+T7028|ME52,100,(6350,6178),L1,G35,K0D0|Q0W0E0R0|ENY52,100,(118,255),L1|PROJ[1073741854,-7167,-6996,2000,EzrealTrueshotBarrage][1073741853,8467,8638,2000,EzrealTrueshotBarrage][1073741853,1156,1376,2000,EzrealMysticShot][1073741854,194,299,2000,EzrealMysticShot][1073741854,154,327,2000,EzrealMysticShot][1073741854,-2629,-1106,2000,EzrealTrueshotBarrage][1073741854,110,445,1600,EzrealEssenceFlux]|ACT[no_op,move,auto,spell_0,spell_1,spell_2,spell_3,spell_4,spell_5]
+T7257|ME52,100,(6275,6178),L1,G35,K0D0|Q0W0E0R0|ENY52,100,(193,330),L1|PROJ[1073741854,-7417,-7320,2000,EzrealTrueshotBarrage][1073741853,8864,8961,2000,EzrealTrueshotBarrage][1073741853,1192,1323,2000,EzrealMysticShot][1073741854,235,244,2000,EzrealMysticShot][1073741854,193,273,2000,EzrealMysticShot][1073741854,-2957,-1324,2000,EzrealTrueshotBarrage][1073741854,216,486,1600,EzrealEssenceFlux]|ACT[no_op,move,auto,spell_0,spell_1,spell_2,spell_3,spell_4,spell_5]
+T7519|ME52,100,(6275,6093),L1,G35,K0D0|Q0W0E0R0|ENY52,100,(263,462),L1|PROJ[1073741854,-7787,-7605,2000,EzrealTrueshotBarrage][1073741853,9235,9417,2000,EzrealTrueshotBarrage][1073741853,1193,1410,2000,EzrealMysticShot][1073741854,236,330,2000,EzrealMysticShot][1073741854,193,359,2000,EzrealMysticShot][1073741854,-3417,-1489,2000,EzrealTrueshotBarrage][1073741854,216,570,1600,EzrealEssenceFlux]|ACT[no_op,move,auto,spell_0,spell_1,spell_2,spell_3,spell_4,spell_5]
+T7782|ME52,100,(6313,6017),L1,G35,K0D0|Q0W0E0R0|ENY53,100,(149,577),L1|PROJ[1073741854,-8198,-7901,2000,EzrealTrueshotBarrage][1073741853,9569,9866,2000,EzrealTrueshotBarrage][1073741853,1156,1488,2000,EzrealMysticShot][1073741854,199,408,2000,EzrealMysticShot][1073741854,156,437,2000,EzrealMysticShot][1073741854,-3919,-1663,2000,EzrealTrueshotBarrage][1073741854,177,645,1600,EzrealEssenceFlux]|ACT[no_op,move,auto,spell_0,spell_1,spell_2,spell_3,spell_4,spell_5]
+T8012|ME52,100,(6366,6069),L1,G35,K0D0|Q0W0E0R0|ENY53,100,(21,524),L1|PROJ[1073741854,-8576,-8279,2000,EzrealTrueshotBarrage][1073741853,9841,10138,2000,EzrealTrueshotBarrage][1073741853,1140,1486,2000,EzrealMysticShot][1073741854,178,410,2000,EzrealMysticShot][1073741854,138,437,2000,EzrealMysticShot][1073741854,-4376,-1935,2000,EzrealTrueshotBarrage][1073741854,92,553,1600,EzrealEssenceFlux]|ACT[no_op,move,auto,spell_0,spell_1,spell_2,spell_3,spell_4,spell_5]
+T8275|ME52,100,(6315,6138),L1,G35,K0D0|Q0W0E0R0|ENY53,100,(93,373),L1|PROJ[1073741854,-8896,-8719,2000,EzrealTrueshotBarrage][1073741853,10264,10441,2000,EzrealTrueshotBarrage][1073741853,1191,1418,2000,EzrealMysticShot][1073741854,229,342,2000,EzrealMysticShot][1073741854,189,369,2000,EzrealMysticShot][1073741854,-4786,-2254,2000,EzrealTrueshotBarrage][1073741854,143,485,1600,EzrealEssenceFlux]|ACT[no_op,move,auto,spell_0,spell_1,spell_2,spell_3,spell_4,spell_5]
+T8505|ME52,100,(6315,6138),L1,G35,K0D0|Q0W0E0R0|ENY53,100,(40,320),L1|PROJ[1073741854,-9222,-9044,2000,EzrealTrueshotBarrage][1073741853,10590,10767,2000,EzrealTrueshotBarrage][1073741853,1152,1363,2000,EzrealMysticShot][1073741854,195,284,2000,EzrealMysticShot][1073741854,152,313,2000,EzrealMysticShot][1073741854,-5191,-2474,2000,EzrealTrueshotBarrage][1073741854,177,527,1600,EzrealEssenceFlux]|ACT[no_op,move,auto,spell_0,spell_1,spell_2,spell_3,spell_4,spell_5]
+T8768|ME52,100,(6315,6223),L1,G35,K0D0|Q0W0E0R0|ENY53,100,(40,149),L1|PROJ[1073741854,-9594,-9502,2000,EzrealTrueshotBarrage][1073741853,10962,11054,2000,EzrealTrueshotBarrage][1073741853,1152,1277,2000,EzrealMysticShot][1073741854,195,198,2000,EzrealMysticShot][1073741854,152,226,2000,EzrealMysticShot][1073741854,-5653,-2810,2000,EzrealTrueshotBarrage][1073741854,177,442,1600,EzrealEssenceFlux]|ACT[no_op,move,auto,spell_0,spell_1,spell_2,spell_3,spell_4,spell_5]
+T9030|ME52,100,(6315,6138),L1,G35,K0D0|Q0W0E0R0|ENY53,100,(123,214),L1|PROJ[1073741854,-9965,-9788,2000,EzrealTrueshotBarrage][1073741853,11333,11510,2000,EzrealTrueshotBarrage][1073741853,1150,1361,2000,EzrealMysticShot][1073741854,194,281,2000,EzrealMysticShot][1073741854,151,310,2000,EzrealMysticShot][1073741854,-6115,-2975,2000,EzrealTrueshotBarrage][1073741854,178,528,1600,EzrealEssenceFlux]|ACT[no_op,move,auto,spell_0,spell_1,spell_2,spell_3,spell_4,spell_5]
+T9260|ME52,100,(6349,6071),L1,G35,K0D0|Q0W0E0R0|ENY53,100,(162,299),L1|PROJ[1073741854,-10324,-10046,2000,EzrealTrueshotBarrage][1073741853,11625,11903,2000,EzrealTrueshotBarrage][1073741853,1156,1482,2000,EzrealMysticShot][1073741854,194,405,2000,EzrealMysticShot][1073741854,154,432,2000,EzrealMysticShot][1073741854,-6553,-3128,2000,EzrealTrueshotBarrage][1073741854,112,554,1600,EzrealEssenceFlux]|ACT[no_op,move,auto,spell_0,spell_1,spell_2,spell_3,spell_4,spell_5]
+T9523|ME52,100,(6349,5986),L1,G35,K0D0|Q0W0E0R0|ENY18,100,(209,455),L1|PROJ[1073741854,-10695,-10332,2000,EzrealTrueshotBarrage][1073741853,11996,12359,2000,EzrealTrueshotBarrage][1073741853,1157,1569,2000,EzrealMysticShot][1073741854,195,492,2000,EzrealMysticShot][1073741854,155,520,2000,EzrealMysticShot][1073741853,275,442,2000,EzrealTrueshotBarrage][1073741854,-7014,-3293,2000,EzrealTrueshotBarrage][1073741854,110,638,1600,EzrealEssenceFlux]|ACT[no_op,move,auto,spell_0,spell_1,spell_2,spell_3,spell_4,spell_5]
+T9754|ME53,100,(6276,6004),L1,G35,K0D0|Q0W0E0R0|ENY18,100,(323,499),L1|PROJ[1073741854,-10948,-10676,2000,EzrealTrueshotBarrage][1073741853,12395,12667,2000,EzrealTrueshotBarrage][1073741853,1192,1497,2000,EzrealMysticShot][1073741854,235,418,2000,EzrealMysticShot][1073741854,192,447,2000,EzrealMysticShot][1073741853,624,793,2000,EzrealTrueshotBarrage][1073741854,-7346,-3531,2000,EzrealTrueshotBarrage][1073741854,216,660,1600,EzrealEssenceFlux]|ACT[no_op,move,auto,spell_0,spell_1,spell_2,spell_3,spell_4,spell_5]
+T10015|ME53,100,(6216,6064),L1,G35,K0D0|Q0W0E0R0|ENY18,100,(444,499),L1|PROJ[1073741854,-11258,-11107,2000,EzrealTrueshotBarrage][1073741853,12825,12977,2000,EzrealTrueshotBarrage][1073741853,1252,1438,2000,EzrealMysticShot][1073741854,295,359,2000,EzrealMysticShot][1073741854,253,388,2000,EzrealMysticShot][1073741853,998,1152,2000,EzrealTrueshotBarrage][1073741854,-7747,-3841,2000,EzrealTrueshotBarrage][1073741854,275,599,1600,EzrealEssenceFlux]|ACT[no_op,move,auto,spell_0,spell_1,spell_2,spell_3,spell_4,spell_5]
+T10281|ME53,100,(6130,6064),L1,G35,K0D0|Q0W0E0R0|ENY18,100,(491,576),L1|PROJ[1073741854,-11547,-11482,2000,EzrealTrueshotBarrage][1073741853,13286,13352,2000,EzrealTrueshotBarrage][1073741853,1339,1438,2000,EzrealMysticShot][1073741854,382,359,2000,EzrealMysticShot][1073741854,339,387,2000,EzrealMysticShot][1073741853,1402,1576,2000,EzrealTrueshotBarrage][1073741854,-8126,-4093,2000,EzrealTrueshotBarrage][1073741854,362,599,1600,EzrealEssenceFlux]|ACT[no_op,move,auto,spell_0,spell_1,spell_2,spell_3,spell_4,spell_5]
+T10512|ME53,100,(6130,6140),L1,G35,K0D0|Q0W0E0R0|ENY18,100,(438,447),L1|PROJ[1073741854,-11876,-11886,2000,EzrealTrueshotBarrage][1073741853,13615,13605,2000,EzrealTrueshotBarrage][1073741853,1377,1416,2000,EzrealMysticShot][1073741854,415,340,2000,EzrealMysticShot][1073741854,375,367,2000,EzrealMysticShot][1073741853,1680,1873,2000,EzrealTrueshotBarrage][1073741854,-8535,-4391,2000,EzrealTrueshotBarrage][1073741854,329,483,1600,EzrealEssenceFlux]|ACT[no_op,move,auto,spell_0,spell_1,spell_2,spell_3,spell_4,spell_5]
+T10777|ME53,100,(6157,6221),L1,G35,K0D0|Q0W0E0R0|ENY18,100,(350,306),L1|PROJ[1073741854,-12276,-12340,2000,EzrealTrueshotBarrage][1073741853,13960,13896,2000,EzrealTrueshotBarrage][1073741853,1350,1334,2000,EzrealMysticShot][1073741854,388,258,2000,EzrealMysticShot][1073741854,347,285,2000,EzrealMysticShot][1073741853,1969,2213,2000,EzrealTrueshotBarrage][1073741854,-9025,-4723,2000,EzrealTrueshotBarrage][1073741854,302,402,1600,EzrealEssenceFlux]|ACT[no_op,move,auto,spell_0,spell_1,spell_2,spell_3,spell_4,spell_5]
+T11005|ME53,100,(6180,6150),L1,G35,K0D0|Q0W0E0R0|ENY18,100,(303,447),L1|PROJ[1073741854,-12623,-12593,2000,EzrealTrueshotBarrage][1073741853,14261,14291,2000,EzrealTrueshotBarrage][1073741853,1287,1350,2000,EzrealMysticShot][1073741854,330,271,2000,EzrealMysticShot][1073741854,287,300,2000,EzrealMysticShot][1073741853,2220,2651,2000,EzrealTrueshotBarrage][1073741854,-9452,-4871,2000,EzrealTrueshotBarrage][1073741854,312,514,1600,EzrealEssenceFlux]|ACT[no_op,move,auto,spell_0,spell_1,spell_2,spell_3,spell_4,spell_5]
+T11267|ME53,100,(6142,6226),L1,G35,K0D0|Q0W0E0R0|ENY18,100,(368,290),L1|PROJ[1073741854,-12955,-13040,2000,EzrealTrueshotBarrage][1073741853,14669,14585,2000,EzrealTrueshotBarrage][1073741853,1325,1274,2000,EzrealMysticShot][1073741854,368,195,2000,EzrealMysticShot][1073741854,325,224,2000,EzrealMysticShot][1073741853,2572,2994,2000,EzrealTrueshotBarrage][1073741854,-9874,-5197,2000,EzrealTrueshotBarrage][1073741854,350,438,1600,EzrealEssenceFlux]|ACT[no_op,move,auto,spell_0,spell_1,spell_2,spell_3,spell_4,spell_5]
+T11529|ME53,100,(6223,6199),L1,G35,K0D0|Q0W0E0R0|ENY18,100,(202,317),L1|PROJ[1073741854,-13036,-13013,2000,EzrealTrueshotBarrage][1073741853,14589,14612,2000,EzrealTrueshotBarrage][1073741853,1244,1302,2000,EzrealMysticShot][1073741854,287,222,2000,EzrealMysticShot][1073741854,245,251,2000,EzrealMysticShot][1073741853,2805,3440,2000,EzrealTrueshotBarrage][1073741854,-10415,-5420,2000,EzrealTrueshotBarrage][1073741854,269,465,1600,EzrealEssenceFlux]|ACT[no_op,move,auto,spell_0,spell_1,spell_2,spell_3,spell_4,spell_5]
+T11758|ME53,100,(6282,6155),L1,G35,K0D0|Q0W0E0R0|ENY18,100,(90,309),L1|PROJ[1073741854,-13143,-13015,2000,EzrealTrueshotBarrage][1073741853,14576,14704,2000,EzrealTrueshotBarrage][1073741853,1223,1400,2000,EzrealMysticShot][1073741854,262,324,2000,EzrealMysticShot][1073741854,221,351,2000,EzrealMysticShot][1073741853,3020,3851,2000,EzrealTrueshotBarrage][1073741854,-10877,-5593,2000,EzrealTrueshotBarrage][1073741854,176,468,1600,EzrealEssenceFlux]|ACT[no_op,move,auto,spell_0,spell_1,spell_2,spell_3,spell_4,spell_5]
+T12020|ME53,100,(6343,6095),L1,G35,K0D0|Q0W0E0R0|ENY18,100,(51,286),L1|PROJ[1073741854,-13201,-12953,2000,EzrealTrueshotBarrage][1073741853,14514,14762,2000,EzrealTrueshotBarrage][1073741853,1162,1458,2000,EzrealMysticShot][1073741854,200,382,2000,EzrealMysticShot][1073741854,160,409,2000,EzrealMysticShot][1073741853,3274,4332,2000,EzrealTrueshotBarrage][1073741854,-11399,-5783,2000,EzrealTrueshotBarrage][1073741854,117,530,1600,EzrealEssenceFlux]|ACT[no_op,move,auto,spell_0,spell_1,spell_2,spell_3,spell_4,spell_5]
+T12250|ME53,100,(6268,6095),L1,G35,K0D0|Q0W0E0R0|ENY18,100,(199,286),L1|PROJ[1073741854,-13081,-12907,2000,EzrealTrueshotBarrage][1073741853,14543,14716,2000,EzrealTrueshotBarrage][1073741853,1198,1406,2000,EzrealMysticShot][1073741854,241,326,2000,EzrealMysticShot][1073741854,199,355,2000,EzrealMysticShot][1073741853,3623,4698,2000,EzrealTrueshotBarrage][1073741854,-11727,-6002,2000,EzrealTrueshotBarrage][1073741854,224,571,1600,EzrealEssenceFlux]|ACT[no_op,move,auto,spell_0,spell_1,spell_2,spell_3,spell_4,spell_5]
+T12513|ME53,100,(6192,6133),L1,G35,K0D0|Q0W0E0R0|ENY18,100,(357,275),L1|PROJ[1073741854,-13006,-12947,2000,EzrealTrueshotBarrage][1073741853,14621,14680,2000,EzrealTrueshotBarrage][1073741853,1276,1369,2000,EzrealMysticShot][1073741854,319,290,2000,EzrealMysticShot][1073741854,276,318,2000,EzrealMysticShot][1073741853,4015,5081,2000,EzrealTrueshotBarrage][1073741854,-12113,-6291,2000,EzrealTrueshotBarrage][1073741854,300,531,1600,EzrealEssenceFlux]|ACT[no_op,move,auto,spell_0,spell_1,spell_2,spell_3,spell_4,spell_5]
+T12776|ME53,100,(6106,6133),L1,G35,K0D0|Q0W0E0R0|ENY19,100,(490,346),L1|PROJ[1073741854,-12920,-12947,2000,EzrealTrueshotBarrage][1073741853,14706,14679,2000,EzrealTrueshotBarrage][1073741853,1362,1369,2000,EzrealMysticShot][1073741854,405,289,2000,EzrealMysticShot][1073741854,362,318,2000,EzrealMysticShot][1073741853,4417,5504,2000,EzrealTrueshotBarrage][1073741854,-12491,-6543,2000,EzrealTrueshotBarrage][1073741854,386,531,1600,EzrealEssenceFlux]|ACT[no_op,move,auto,spell_0,spell_1,spell_2,spell_3,spell_4,spell_5]
+T13008|ME53,100,(6043,6174),L1,G35,K0D0|Q0W0E0R0|ENY19,100,(628,305),L1|PROJ[1073741854,-12903,-13034,2000,EzrealTrueshotBarrage][1073741853,14814,14683,2000,EzrealTrueshotBarrage][1073741853,1462,1379,2000,EzrealMysticShot][1073741854,500,303,2000,EzrealMysticShot][1073741854,460,330,2000,EzrealMysticShot][1073741853,4757,5832,2000,EzrealTrueshotBarrage][1073741854,-12835,-6805,2000,EzrealTrueshotBarrage][1073741854,416,449,1600,EzrealEssenceFlux]|ACT[no_op,move,auto,spell_0,spell_1,spell_2,spell_3,spell_4,spell_5]
+T13274|ME53,100,(6130,6174),L1,G35,K0D0|Q0W0E0R0|ENY19,100,(458,326),L1|PROJ[1073741854,-12989,-13034,2000,EzrealTrueshotBarrage][1073741853,14728,14683,2000,EzrealTrueshotBarrage][1073741853,1375,1379,2000,EzrealMysticShot][1073741854,414,303,2000,EzrealMysticShot][1073741854,373,330,2000,EzrealMysticShot][1073741853,4989,6257,2000,EzrealTrueshotBarrage][1073741854,-13388,-7058,2000,EzrealTrueshotBarrage][1073741854,330,449,1600,EzrealEssenceFlux]|ACT[no_op,move,auto,spell_0,spell_1,spell_2,spell_3,spell_4,spell_5]
+T13502|ME53,100,(6200,6198),L1,G35,K0D0|Q0W0E0R0|ENY19,100,(313,302),L1|PROJ[1073741854,-13013,-13011,2000,EzrealTrueshotBarrage][1073741853,14611,14613,2000,EzrealTrueshotBarrage][1073741853,1266,1302,2000,EzrealMysticShot][1073741854,310,223,2000,EzrealMysticShot][1073741854,267,252,2000,EzrealMysticShot][1073741853,5193,6601,2000,EzrealTrueshotBarrage][1073741854,-13861,-7300,2000,EzrealTrueshotBarrage][1073741854,292,467,1600,EzrealEssenceFlux]|ACT[no_op,move,auto,spell_0,spell_1,spell_2,spell_3,spell_4,spell_5]
+T13765|ME53,100,(6162,6274),L1,G35,K0D0|Q0W0E0R0|ENY19,100,(351,141),L1|PROJ[1073741854,-12975,-13087,2000,EzrealTrueshotBarrage][1073741853,14649,14537,2000,EzrealTrueshotBarrage][1073741853,1304,1226,2000,EzrealMysticShot][1073741854,348,147,2000,EzrealMysticShot][1073741854,305,175,2000,EzrealMysticShot][1073741853,5545,6944,2000,EzrealTrueshotBarrage][1073741854,-14284,-7627,2000,EzrealTrueshotBarrage][1073741854,330,391,1600,EzrealEssenceFlux]|ACT[no_op,move,auto,spell_0,spell_1,spell_2,spell_3,spell_4,spell_5]
+T14026|ME53,100,(6233,6227),L1,G35,K0D0|Q0W0E0R0|ENY19,100,(280,273),L1|PROJ[1073741854,-13047,-13041,2000,EzrealTrueshotBarrage][1073741853,14579,14585,2000,EzrealTrueshotBarrage][1073741853,1234,1274,2000,EzrealMysticShot][1073741854,277,195,2000,EzrealMysticShot][1073741854,234,223,2000,EzrealMysticShot][1073741853,5788,7411,2000,EzrealTrueshotBarrage][1073741854,-14816,-7829,2000,EzrealTrueshotBarrage][1073741854,259,437,1600,EzrealEssenceFlux]|ACT[no_op,move,auto,spell_0,spell_1,spell_2,spell_3,spell_4,spell_5]
+T14255|ME54,100,(6293,6182),L1,G35,K0D0|Q0W0E0R0|ENY19,100,(188,251),L1|PROJ[1073741854,-13151,-13041,2000,EzrealTrueshotBarrage][1073741853,14564,14674,2000,EzrealTrueshotBarrage][1073741853,1212,1370,2000,EzrealMysticShot][1073741854,250,294,2000,EzrealMysticShot][1073741854,210,321,2000,EzrealMysticShot][1073741853,6003,7822,2000,EzrealTrueshotBarrage][1073741854,-15277,-8003,2000,EzrealTrueshotBarrage][1073741854,167,442,1600,EzrealEssenceFlux]|ACT[no_op,move,auto,spell_0,spell_1,spell_2,spell_3,spell_4,spell_5]
+T14516|ME54,100,(6353,6122),L1,G35,K0D0|Q0W0E0R0|ENY19,100,(67,251),L1|PROJ[1073741854,-13210,-12980,2000,EzrealTrueshotBarrage][1073741853,14503,14733,2000,EzrealTrueshotBarrage][1073741853,1151,1429,2000,EzrealMysticShot][1073741854,189,353,2000,EzrealMysticShot][1073741854,149,380,2000,EzrealMysticShot][1073741853,6257,8300,2000,EzrealTrueshotBarrage][1073741854,-15797,-8192,2000,EzrealTrueshotBarrage][1073741854,108,503,1600,EzrealEssenceFlux]|ACT[no_op,move,auto,spell_0,spell_1,spell_2,spell_3,spell_4,spell_5]
+T14779|ME54,100,(6391,6046),L1,G35,K0D0|Q0W0E0R0|ENY19,100,(77,398),L1|PROJ[1073741854,-13250,-12905,2000,EzrealTrueshotBarrage][1073741853,14466,14811,2000,EzrealTrueshotBarrage][1073741853,1114,1507,2000,EzrealMysticShot][1073741854,152,431,2000,EzrealMysticShot][1073741854,112,458,2000,EzrealMysticShot][1073741853,6533,8797,2000,EzrealTrueshotBarrage][1073741854,-16296,-8366,2000,EzrealTrueshotBarrage][1073741854,69,578,1600,EzrealEssenceFlux]|ACT[no_op,move,auto,spell_0,spell_1,spell_2,spell_3,spell_4,spell_5]
+T15009|ME54,100,(6318,6064),L1,G35,K0D0|Q0W0E0R0|ENY19,100,(220,404),L1|PROJ[1073741854,-13133,-12879,2000,EzrealTrueshotBarrage][1073741853,14494,14748,2000,EzrealTrueshotBarrage][1073741853,1150,1438,2000,EzrealMysticShot][1073741854,193,358,2000,EzrealMysticShot][1073741854,150,387,2000,EzrealMysticShot][1073741853,6882,9147,2000,EzrealTrueshotBarrage][1073741854,-16629,-8604,2000,EzrealTrueshotBarrage][1073741854,173,599,1600,EzrealEssenceFlux]|ACT[no_op,move,auto,spell_0,spell_1,spell_2,spell_3,spell_4,spell_5]
+T15273|ME54,100,(6318,6150),L1,G35,K0D0|Q0W0E0R0|ENY19,100,(134,318),L1|PROJ[1073741854,-13132,-12964,2000,EzrealTrueshotBarrage][1073741853,14494,14662,2000,EzrealTrueshotBarrage][1073741853,1149,1351,2000,EzrealMysticShot][1073741854,192,272,2000,EzrealMysticShot][1073741854,149,300,2000,EzrealMysticShot][1073741853,7198,9484,2000,EzrealTrueshotBarrage][1073741854,-17093,-8941,2000,EzrealTrueshotBarrage][1073741854,174,514,1600,EzrealEssenceFlux]|ACT[no_op,move,auto,spell_0,spell_1,spell_2,spell_3,spell_4,spell_5]
+T15503|ME54,100,(6300,6222),L1,G35,K0D0|Q0W0E0R0|ENY19,100,(100,193),L1|PROJ[1073741854,-13160,-13082,2000,EzrealTrueshotBarrage][1073741853,14558,14636,2000,EzrealTrueshotBarrage][1073741853,1205,1332,2000,EzrealMysticShot][1073741854,244,256,2000,EzrealMysticShot][1073741854,203,283,2000,EzrealMysticShot][1073741853,7491,9779,2000,EzrealTrueshotBarrage][1073741854,-17132,-9045,2000,EzrealTrueshotBarrage][1073741854,159,401,1600,EzrealEssenceFlux]|ACT[no_op,move,auto,spell_0,spell_1,spell_2,spell_3,spell_4,spell_5]
+T15765|ME54,100,(6300,6137),L1,G35,K0D0|Q0W0E0R0|ENY19,100,(181,305),L1|PROJ[1073741854,-13161,-12998,2000,EzrealTrueshotBarrage][1073741853,14559,14722,2000,EzrealTrueshotBarrage][1073741853,1206,1418,2000,EzrealMysticShot][1073741854,244,342,2000,EzrealMysticShot][1073741854,204,369,2000,EzrealMysticShot][1073741853,7805,10284,2000,EzrealTrueshotBarrage][1073741854,-17133,-8960,2000,EzrealTrueshotBarrage][1073741854,158,485,1600,EzrealEssenceFlux]|ACT[no_op,move,auto,spell_0,spell_1,spell_2,spell_3,spell_4,spell_5]
+T16028|ME54,100,(6338,6061),L1,G35,K0D0|Q0W0E0R0|ENY19,100,(224,409),L1|PROJ[1073741854,-13199,-12921,2000,EzrealTrueshotBarrage][1073741853,14520,14798,2000,EzrealTrueshotBarrage][1073741853,1167,1494,2000,EzrealMysticShot][1073741854,206,418,2000,EzrealMysticShot][1073741854,165,445,2000,EzrealMysticShot][1073741853,8083,10782,2000,EzrealTrueshotBarrage][1073741854,-17171,-8883,2000,EzrealTrueshotBarrage][1073741854,120,563,1600,EzrealEssenceFlux]|ACT[no_op,move,auto,spell_0,spell_1,spell_2,spell_3,spell_4,spell_5]
+T16258|ME54,100,(6320,6133),L1,G35,K0D0|Q0W0E0R0|ENY19,100,(208,270),L1|PROJ[1073741854,-13134,-12947,2000,EzrealTrueshotBarrage][1073741853,14492,14679,2000,EzrealTrueshotBarrage][1073741853,1147,1369,2000,EzrealMysticShot][1073741854,190,289,2000,EzrealMysticShot][1073741854,148,318,2000,EzrealMysticShot][1073741853,8376,11078,2000,EzrealTrueshotBarrage][1073741854,-17095,-8925,2000,EzrealTrueshotBarrage][1073741854,171,531,1600,EzrealEssenceFlux]|ACT[no_op,move,auto,spell_0,spell_1,spell_2,spell_3,spell_4,spell_5]
+T16520|ME54,100,(6320,6218),L1,G35,K0D0|Q0W0E0R0|ENY19,100,(132,223),L1|PROJ[1073741854,-13135,-13033,2000,EzrealTrueshotBarrage][1073741853,14492,14594,2000,EzrealTrueshotBarrage][1073741853,1148,1284,2000,EzrealMysticShot][1073741854,190,204,2000,EzrealMysticShot][1073741854,148,233,2000,EzrealMysticShot][1073741853,8691,11413,2000,EzrealTrueshotBarrage][1073741854,-17096,-9010,2000,EzrealTrueshotBarrage][1073741854,171,445,1600,EzrealEssenceFlux]|ACT[no_op,move,auto,spell_0,spell_1,spell_2,spell_3,spell_4,spell_5]
+T16750|ME54,100,(6320,6144),L1,G35,K0D0|Q0W0E0R0|ENY20,100,(173,359),L1|PROJ[1073741854,-13181,-13004,2000,EzrealTrueshotBarrage][1073741853,14539,14715,2000,EzrealTrueshotBarrage][1073741853,1186,1412,2000,EzrealMysticShot][1073741854,224,336,2000,EzrealMysticShot][1073741854,184,363,2000,EzrealMysticShot][1073741853,8966,11855,2000,EzrealTrueshotBarrage][1073741854,-17154,-8967,2000,EzrealTrueshotBarrage][1073741854,138,479,1600,EzrealEssenceFlux]|ACT[no_op,move,auto,spell_0,spell_1,spell_2,spell_3,spell_4,spell_5]
+T17014|ME54,100,(6359,6067),L1,G35,K0D0|Q0W0E0R0|ENY20,100,(206,483),L1|PROJ[1073741854,-13222,-12930,2000,EzrealTrueshotBarrage][1073741853,14503,14794,2000,EzrealTrueshotBarrage][1073741853,1150,1491,2000,EzrealMysticShot][1073741854,188,415,2000,EzrealMysticShot][1073741854,147,442,2000,EzrealMysticShot][1073741853,9244,12353,2000,EzrealTrueshotBarrage][1073741854,-17195,-8892,2000,EzrealTrueshotBarrage][1073741854,98,553,1600,EzrealEssenceFlux]|ACT[no_op,move,auto,spell_0,spell_1,spell_2,spell_3,spell_4,spell_5]
+T17275|ME54,100,(6397,6143),L1,G35,K0D0|Q0W0E0R0|ENY20,100,(83,407),L1|PROJ[1073741854,-13260,-13006,2000,EzrealTrueshotBarrage][1073741853,14464,14718,2000,EzrealTrueshotBarrage][1073741853,1111,1415,2000,EzrealMysticShot][1073741854,149,338,2000,EzrealMysticShot][1073741854,109,366,2000,EzrealMysticShot][1073741853,9520,12697,2000,EzrealTrueshotBarrage][1073741854,-17232,-8968,2000,EzrealTrueshotBarrage][1073741854,60,478,1600,EzrealEssenceFlux]|ACT[no_op,move,auto,spell_0,spell_1,spell_2,spell_3,spell_4,spell_5]
+T17506|ME54,100,(6363,6210),L1,G35,K0D0|Q0W0E0R0|ENY20,100,(93,269),L1|PROJ[1073741854,-13178,-13025,2000,EzrealTrueshotBarrage][1073741853,14450,14603,2000,EzrealTrueshotBarrage][1073741853,1105,1292,2000,EzrealMysticShot][1073741854,148,213,2000,EzrealMysticShot][1073741854,105,242,2000,EzrealMysticShot][1073741853,9830,12999,2000,EzrealTrueshotBarrage][1073741854,-17139,-9002,2000,EzrealTrueshotBarrage][1073741854,128,453,1600,EzrealEssenceFlux]|ACT[no_op,move,auto,spell_0,spell_1,spell_2,spell_3,spell_4,spell_5]
+T17769|ME54,100,(6303,6150),L1,G35,K0D0|Q0W0E0R0|ENY20,100,(214,390),L1|PROJ[1073741854,-13117,-12964,2000,EzrealTrueshotBarrage][1073741853,14510,14663,2000,EzrealTrueshotBarrage][1073741853,1165,1352,2000,EzrealMysticShot][1073741854,208,273,2000,EzrealMysticShot][1073741854,165,301,2000,EzrealMysticShot][1073741853,10206,13481,2000,EzrealTrueshotBarrage][1073741854,-17078,-8941,2000,EzrealTrueshotBarrage][1073741854,189,514,1600,EzrealEssenceFlux]|ACT[no_op,move,auto,spell_0,spell_1,spell_2,spell_3,spell_4,spell_5]
+T18031|ME54,100,(6303,6065),L1,G35,K0D0|Q0W0E0R0|ENY20,100,(296,496),L1|PROJ[1073741854,-13117,-12880,2000,EzrealTrueshotBarrage][1073741853,14510,14748,2000,EzrealTrueshotBarrage][1073741853,1166,1438,2000,EzrealMysticShot][1073741854,209,358,2000,EzrealMysticShot][1073741854,166,387,2000,EzrealMysticShot][1073741853,10519,13984,2000,EzrealTrueshotBarrage][1073741854,-17079,-8857,2000,EzrealTrueshotBarrage][1073741854,188,598,1600,EzrealEssenceFlux]|ACT[no_op,move,auto,spell_0,spell_1,spell_2,spell_3,spell_4,spell_5]
+T18260|ME54,100,(6355,6012),L1,G35,K0D0|Q0W0E0R0|ENY20,100,(191,496),L1|PROJ[1073741854,-13217,-12874,2000,EzrealTrueshotBarrage][1073741853,14505,14848,2000,EzrealTrueshotBarrage][1073741853,1152,1545,2000,EzrealMysticShot][1073741854,190,469,2000,EzrealMysticShot][1073741854,150,496,2000,EzrealMysticShot][1073741853,10741,14405,2000,EzrealTrueshotBarrage][1073741854,-17190,-8836,2000,EzrealTrueshotBarrage][1073741854,102,609,1600,EzrealEssenceFlux]|ACT[no_op,move,auto,spell_0,spell_1,spell_2,spell_3,spell_4,spell_5]
+T18522|ME54,100,(6393,6088),L1,G35,K0D0|Q0W0E0R0|ENY20,100,(72,446),L1|PROJ[1073741854,-13255,-12950,2000,EzrealTrueshotBarrage][1073741853,14467,14772,2000,EzrealTrueshotBarrage][1073741853,1114,1469,2000,EzrealMysticShot][1073741854,152,392,2000,EzrealMysticShot][1073741854,112,419,2000,EzrealMysticShot][1073741853,11017,14748,2000,EzrealTrueshotBarrage][1073741854,-17228,-8912,2000,EzrealTrueshotBarrage][1073741854,64,533,1600,EzrealEssenceFlux]|ACT[no_op,move,auto,spell_0,spell_1,spell_2,spell_3,spell_4,spell_5]
+T18752|ME55,100,(6360,6155),L1,G35,K0D0|Q0W0E0R0|ENY20,100,(53,327),L1|PROJ[1073741854,-13176,-12971,2000,EzrealTrueshotBarrage][1073741853,14454,14659,2000,EzrealTrueshotBarrage][1073741853,1110,1349,2000,EzrealMysticShot][1073741854,152,270,2000,EzrealMysticShot][1073741854,110,299,2000,EzrealMysticShot][1073741853,11326,15049,2000,EzrealTrueshotBarrage][1073741854,-17138,-8948,2000,EzrealTrueshotBarrage][1073741854,130,507,1600,EzrealEssenceFlux]|ACT[no_op,move,auto,spell_0,spell_1,spell_2,spell_3,spell_4,spell_5]
+T19016|ME55,100,(6360,6241),L1,G35,K0D0|Q0W0E0R0|ENY20,100,(-7,180),L1|PROJ[1073741854,-13176,-13057,2000,EzrealTrueshotBarrage][1073741853,14454,14573,2000,EzrealTrueshotBarrage][1073741853,1109,1263,2000,EzrealMysticShot][1073741854,152,184,2000,EzrealMysticShot][1073741854,109,212,2000,EzrealMysticShot][1073741853,11643,15386,2000,EzrealTrueshotBarrage][1073741854,-17138,-9034,2000,EzrealTrueshotBarrage][1073741854,130,421,1600,EzrealEssenceFlux]|ACT[no_op,move,auto,spell_0,spell_1,spell_2,spell_3,spell_4,spell_5]
+T19278|ME55,100,(6360,6156),L1,G35,K0D0|Q0W0E0R0|ENY20,100,(77,265),L1|PROJ[1073741854,-13176,-12972,2000,EzrealTrueshotBarrage][1073741853,14454,14659,2000,EzrealTrueshotBarrage][1073741853,1110,1348,2000,EzrealMysticShot][1073741854,152,269,2000,EzrealMysticShot][1073741854,110,298,2000,EzrealMysticShot][1073741853,11957,15890,2000,EzrealTrueshotBarrage][1073741854,-17138,-8949,2000,EzrealTrueshotBarrage][1073741854,130,506,1600,EzrealEssenceFlux]|ACT[no_op,move,auto,spell_0,spell_1,spell_2,spell_3,spell_4,spell_5]
+T19508|ME55,100,(6393,6089),L1,G35,K0D0|Q0W0E0R0|ENY20,100,(116,314),L1|PROJ[1073741854,-13255,-12951,2000,EzrealTrueshotBarrage][1073741853,14467,14771,2000,EzrealTrueshotBarrage][1073741853,1114,1468,2000,EzrealMysticShot][1073741854,152,391,2000,EzrealMysticShot][1073741854,112,418,2000,EzrealMysticShot][1073741853,11962,16009,2000,EzrealTrueshotBarrage][1073741854,-17228,-8913,2000,EzrealTrueshotBarrage][1073741854,64,532,1600,EzrealEssenceFlux]|ACT[no_op,move,auto,spell_0,spell_1,spell_2,spell_3,spell_4,spell_5]
+T19770|ME55,100,(6393,6004),L1,G35,K0D0|Q0W0E0R0|ENY20,100,(197,426),L1|PROJ[1073741854,-13255,-12865,2000,EzrealTrueshotBarrage][1073741853,14466,14856,2000,EzrealTrueshotBarrage][1073741853,1113,1552,2000,EzrealMysticShot][1073741854,151,476,2000,EzrealMysticShot][1073741854,111,503,2000,EzrealMysticShot][1073741853,11962,16093,2000,EzrealTrueshotBarrage][1073741854,-17227,-8827,2000,EzrealTrueshotBarrage][1073741854,65,618,1600,EzrealEssenceFlux]|ACT[no_op,move,auto,spell_0,spell_1,spell_2,spell_3,spell_4,spell_5]
+T20001|ME55,100,(6326,6038),L1,G35,K0D0|Q0W0E0R0|ENY20,100,(317,445),L1|PROJ[1073741854,-13141,-12852,2000,EzrealTrueshotBarrage][1073741853,14486,14775,2000,EzrealTrueshotBarrage][1073741853,1142,1465,2000,EzrealMysticShot][1073741854,185,385,2000,EzrealMysticShot][1073741854,142,414,2000,EzrealMysticShot][1073741853,11989,16006,2000,EzrealTrueshotBarrage][1073741854,-17102,-8829,2000,EzrealTrueshotBarrage][1073741854,165,626,1600,EzrealEssenceFlux]|ACT[no_op,move,auto,spell_0,spell_1,spell_2,spell_3,spell_4,spell_5]
+T20265|ME55,100,(6245,6065),L1,G35,K0D0|Q0W0E0R0|ENY20,100,(347,487),L1|PROJ[1073741854,-13060,-12880,2000,EzrealTrueshotBarrage][1073741853,14568,14749,2000,EzrealTrueshotBarrage][1073741853,1224,1438,2000,EzrealMysticShot][1073741854,267,359,2000,EzrealMysticShot][1073741854,224,387,2000,EzrealMysticShot][1073741853,12071,15980,2000,EzrealTrueshotBarrage][1073741854,-17021,-8857,2000,EzrealTrueshotBarrage][1073741854,246,598,1600,EzrealEssenceFlux]|ACT[no_op,move,auto,spell_0,spell_1,spell_2,spell_3,spell_4,spell_5]
+T20529|ME55,100,(6184,6125),L1,G35,K0D0|Q0W0E0R0|ENY20,100,(407,341),L1|PROJ[1073741854,-13001,-12943,2000,EzrealTrueshotBarrage][1073741853,14631,14690,2000,EzrealTrueshotBarrage][1073741853,1286,1380,2000,EzrealMysticShot][1073741854,329,301,2000,EzrealMysticShot][1073741854,286,329,2000,EzrealMysticShot][1073741853,12133,15922,2000,EzrealTrueshotBarrage][1073741854,-16963,-8919,2000,EzrealTrueshotBarrage][1073741854,305,536,1600,EzrealEssenceFlux]|ACT[no_op,move,auto,spell_0,spell_1,spell_2,spell_3,spell_4,spell_5]
+T20757|ME55,100,(6132,6073),L1,G35,K0D0|Q0W0E0R0|ENY20,100,(437,464),L1|PROJ[1073741854,-12996,-12937,2000,EzrealTrueshotBarrage][1073741853,14731,14790,2000,EzrealTrueshotBarrage][1073741853,1378,1487,2000,EzrealMysticShot][1073741854,416,411,2000,EzrealMysticShot][1073741854,376,438,2000,EzrealMysticShot][1073741853,12226,16028,2000,EzrealTrueshotBarrage][1073741854,-16970,-8898,2000,EzrealTrueshotBarrage][1073741854,324,546,1600,EzrealEssenceFlux]|ACT[no_op,move,auto,spell_0,spell_1,spell_2,spell_3,spell_4,spell_5]
+T21021|ME55,100,(6208,6111),L1,G35,K0D0|Q0W0E0R0|ENY20,100,(277,446),L1|PROJ[1073741854,-13073,-12975,2000,EzrealTrueshotBarrage][1073741853,14654,14752,2000,EzrealTrueshotBarrage][1073741853,1301,1449,2000,EzrealMysticShot][1073741854,339,373,2000,EzrealMysticShot][1073741854,299,400,2000,EzrealMysticShot][1073741853,12149,15990,2000,EzrealTrueshotBarrage][1073741854,-17046,-8937,2000,EzrealTrueshotBarrage][1073741854,248,509,1600,EzrealEssenceFlux]|ACT[no_op,move,auto,spell_0,spell_1,spell_2,spell_3,spell_4,spell_5]
+T21250|ME55,100,(6208,6185),L1,G35,K0D0|Q0W0E0R0|ENY21,100,(253,301),L1|PROJ[1073741854,-13025,-13002,2000,EzrealTrueshotBarrage][1073741853,14607,14630,2000,EzrealTrueshotBarrage][1073741853,1262,1319,2000,EzrealMysticShot][1073741854,304,240,2000,EzrealMysticShot][1073741854,262,269,2000,EzrealMysticShot][1073741853,12109,15861,2000,EzrealTrueshotBarrage][1073741854,-16987,-8979,2000,EzrealTrueshotBarrage][1073741854,281,476,1600,EzrealEssenceFlux]|ACT[no_op,move,auto,spell_0,spell_1,spell_2,spell_3,spell_4,spell_5]
+T21513|ME55,100,(6208,6100),L1,G35,K0D0|Q0W0E0R0|ENY21,100,(215,463),L1|PROJ[1073741854,-13025,-12917,2000,EzrealTrueshotBarrage][1073741853,14607,14715,2000,EzrealTrueshotBarrage][1073741853,1262,1405,2000,EzrealMysticShot][1073741854,305,326,2000,EzrealMysticShot][1073741854,262,354,2000,EzrealMysticShot][1073741853,12109,15947,2000,EzrealTrueshotBarrage][1073741854,-16987,-8894,2000,EzrealTrueshotBarrage][1073741854,281,561,1600,EzrealEssenceFlux]|ACT[no_op,move,auto,spell_0,spell_1,spell_2,spell_3,spell_4,spell_5]
+T21776|ME55,100,(6269,6040),L1,G35,K0D0|Q0W0E0R0|ENY21,100,(128,442),L1|PROJ[1073741854,-13085,-12856,2000,EzrealTrueshotBarrage][1073741853,14546,14775,2000,EzrealTrueshotBarrage][1073741853,1201,1464,2000,EzrealMysticShot][1073741854,244,385,2000,EzrealMysticShot][1073741854,201,414,2000,EzrealMysticShot][1073741853,12048,16006,2000,EzrealTrueshotBarrage][1073741854,-17046,-8833,2000,EzrealTrueshotBarrage][1073741854,221,622,1600,EzrealEssenceFlux]|ACT[no_op,move,auto,spell_0,spell_1,spell_2,spell_3,spell_4,spell_5]
+T22006|ME55,100,(6292,6111),L1,G35,K0D0|Q0W0E0R0|ENY21,100,(80,300),L1|PROJ[1073741854,-13155,-12973,2000,EzrealTrueshotBarrage][1073741853,14569,14750,2000,EzrealTrueshotBarrage][1073741853,1216,1447,2000,EzrealMysticShot][1073741854,254,371,2000,EzrealMysticShot][1073741854,213,398,2000,EzrealMysticShot][1073741853,12064,15988,2000,EzrealTrueshotBarrage][1073741854,-17128,-8935,2000,EzrealTrueshotBarrage][1073741854,165,510,1600,EzrealEssenceFlux]|ACT[no_op,move,auto,spell_0,spell_1,spell_2,spell_3,spell_4,spell_5]
+T22268|ME55,100,(6292,6196),L1,G35,K0D0|Q0W0E0R0|ENY21,100,(20,155),L1|PROJ[1073741854,-13156,-13060,2000,EzrealTrueshotBarrage][1073741853,14570,14666,2000,EzrealTrueshotBarrage][1073741853,1217,1363,2000,EzrealMysticShot][1073741854,254,287,2000,EzrealMysticShot][1073741854,214,314,2000,EzrealMysticShot][1073741853,12065,15904,2000,EzrealTrueshotBarrage][1073741854,-17129,-9021,2000,EzrealTrueshotBarrage][1073741854,164,424,1600,EzrealEssenceFlux]|ACT[no_op,move,auto,spell_0,spell_1,spell_2,spell_3,spell_4,spell_5]
+T22530|ME55,100,(6210,6217),L1,G35,K0D0|Q0W0E0R0|ENY21,100,(185,155),L1|PROJ[1073741854,-13075,-13082,2000,EzrealTrueshotBarrage][1073741853,14654,14647,2000,EzrealTrueshotBarrage][1073741853,1300,1344,2000,EzrealMysticShot][1073741854,338,268,2000,EzrealMysticShot][1073741854,298,295,2000,EzrealMysticShot][1073741853,12149,15885,2000,EzrealTrueshotBarrage][1073741854,-17048,-9043,2000,EzrealTrueshotBarrage][1073741854,246,402,1600,EzrealEssenceFlux]|ACT[no_op,move,auto,spell_0,spell_1,spell_2,spell_3,spell_4,spell_5]
+T22761|ME56,100,(6243,6150),L1,G35,K0D0|Q0W0E0R0|ENY21,100,(227,222),L1|PROJ[1073741854,-13061,-12967,2000,EzrealTrueshotBarrage][1073741853,14573,14666,2000,EzrealTrueshotBarrage][1073741853,1227,1356,2000,EzrealMysticShot][1073741854,270,277,2000,EzrealMysticShot][1073741854,227,306,2000,EzrealMysticShot][1073741853,12075,15898,2000,EzrealTrueshotBarrage][1073741854,-17023,-8944,2000,EzrealTrueshotBarrage]|ACT[no_op,move,auto,spell_0,spell_1,spell_2,spell_3,spell_4,spell_5]
+T23022|ME56,100,(6196,6079),L1,G35,K0D0|Q0W0E0R0|ENY21,100,(321,363),L1|PROJ[1073741854,-13014,-12897,2000,EzrealTrueshotBarrage][1073741853,14620,14737,2000,EzrealTrueshotBarrage][1073741853,1275,1427,2000,EzrealMysticShot][1073741854,317,348,2000,EzrealMysticShot][1073741854,275,376,2000,EzrealMysticShot][1073741853,12122,15969,2000,EzrealTrueshotBarrage][1073741854,-16976,-8873,2000,EzrealTrueshotBarrage]|ACT[no_op,move,auto,spell_0,spell_1,spell_2,spell_3,spell_4,spell_5]
+T23251|ME56,100,(6229,6012),L1,G35,K0D0|Q0W0E0R0|ENY21,100,(311,500),L1|PROJ[1073741854,-13092,-12875,2000,EzrealTrueshotBarrage][1073741853,14631,14848,2000,EzrealTrueshotBarrage][1073741853,1278,1545,2000,EzrealMysticShot][1073741854,316,469,2000,EzrealMysticShot][1073741854,276,496,2000,EzrealMysticShot][1073741853,12126,16086,2000,EzrealTrueshotBarrage][1073741854,-17064,-8837,2000,EzrealTrueshotBarrage]|ACT[no_op,move,auto,spell_0,spell_1,spell_2,spell_3,spell_4,spell_5]
+T23515|ME56,100,(6209,6095),L1,G35,K0D0|Q0W0E0R0|ENY21,100,(294,341),L1|PROJ[1073741854,-13073,-12959,2000,EzrealTrueshotBarrage][1073741853,14654,14767,2000,EzrealTrueshotBarrage][1073741853,1300,1464,2000,EzrealMysticShot][1073741854,338,388,2000,EzrealMysticShot][1073741854,298,415,2000,EzrealMysticShot][1073741853,12149,16005,2000,EzrealTrueshotBarrage][1073741854,-17046,-8921,2000,EzrealTrueshotBarrage]|ACT[no_op,move,auto,spell_0,spell_1,spell_2,spell_3,spell_4,spell_5]
+T23777|ME56,100,(6236,6176),L1,G35,K0D0|Q0W0E0R0|ENY21,100,(186,233),L1|PROJ[1073741854,-13100,-13040,2000,EzrealTrueshotBarrage][1073741853,14626,14686,2000,EzrealTrueshotBarrage][1073741853,1273,1383,2000,EzrealMysticShot][1073741854,311,307,2000,EzrealMysticShot][1073741854,271,334,2000,EzrealMysticShot][1073741853,12121,15924,2000,EzrealTrueshotBarrage][1073741854,-17073,-9001,2000,EzrealTrueshotBarrage]|ACT[no_op,move,auto,spell_0,spell_1,spell_2,spell_3,spell_4,spell_5]
+T24006|ME56,100,(6236,6102),L1,G35,K0D0|Q0W0E0R0|ENY21,100,(145,369),L1|PROJ[1073741854,-13053,-12919,2000,EzrealTrueshotBarrage][1073741853,14580,14714,2000,EzrealTrueshotBarrage][1073741853,1235,1404,2000,EzrealMysticShot][1073741854,277,325,2000,EzrealMysticShot][1073741854,235,353,2000,EzrealMysticShot][1073741853,12082,15946,2000,EzrealTrueshotBarrage][1073741854,-17015,-8895,2000,EzrealTrueshotBarrage]|ACT[no_op,move,auto,spell_0,spell_1,spell_2,spell_3,spell_4,spell_5]
+T24268|ME56,100,(6165,6054),L1,G35,K0D0|Q0W0E0R0|ENY21,100,(286,464),L1|PROJ[1073741854,-12983,-12873,2000,EzrealTrueshotBarrage][1073741853,14652,14762,2000,EzrealTrueshotBarrage][1073741853,1306,1452,2000,EzrealMysticShot][1073741854,349,373,2000,EzrealMysticShot][1073741854,306,401,2000,EzrealMysticShot][1073741853,12154,15994,2000,EzrealTrueshotBarrage][1073741854,-16945,-8849,2000,EzrealTrueshotBarrage]|ACT[no_op,move,auto,spell_0,spell_1,spell_2,spell_3,spell_4,spell_5]
+T24531|ME56,100,(6127,5978),L1,G35,K0D0|Q0W0E0R0|ENY21,100,(363,617),L1|PROJ[1073741854,-12944,-12795,2000,EzrealTrueshotBarrage][1073741853,14689,14837,2000,EzrealTrueshotBarrage][1073741853,1344,1527,2000,EzrealMysticShot][1073741854,386,448,2000,EzrealMysticShot][1073741854,344,477,2000,EzrealMysticShot][1073741853,12191,16069,2000,EzrealTrueshotBarrage][1073741854,-16905,-8771,2000,EzrealTrueshotBarrage]|ACT[no_op,move,auto,spell_0,spell_1,spell_2,spell_3,spell_4,spell_5]
+</experience>
+
+<history>
+Looking at the experience data, I can see several critical issues:
+
+1. **Both champions are Ezreal** (mirror match) - I can see EzrealMysticShot projectiles.
+
+2. **The bot is walking straight at the enemy** - My position goes from (6350,6350) toward the enemy at ~(1300,1300), steadily approaching. The enemy position relative to me starts at ~(1300,1300) dx/dy and shrinks to (30,30).
+
+3. **HP drops from 100% to 6%** - The bot is getting hit by every single Q (EzrealMysticShot) because it walks in a straight line directly toward the enemy. Both champions trade evenly since they walk at each other.
+
+4. **The current policy is bizarre** - It alternates between moving toward enemy and casting Q based on game_time modulo. The position format is also wrong - it passes `[enemy_champ_x, enemy_champ_y]` but the action spec says Point is `(y, x)`.
+
+5. **No dodging at all** - Multiple projectiles are visible in observations but the bot never tries to dodge them. The projectiles have positive dx/dy values (coming toward me) and the bot walks right into them.
+
+6. **The bot never uses W, E, R** - Only Q is cast occasionally via the modulo logic.
+
+Key improvements needed:
+- **Dodge projectiles** - Move perpendicular to incoming projectiles
+- **Use all abilities** - W (Essence Flux), E (Arcane Shift for mobility/dodge), R (Trueshot Barrage)
+- **Don't walk in a straight line** - Juke/wiggle to avoid skillshots
+- **Maintain proper range** - Don't walk directly on top of the enemy
+- **Fix coordinate ordering** - Actions use (y, x) format
+- **Spam abilities since cooldowns are disabled** - This is huge! No cooldowns means we should be casting Q constantly while dodging
+
+Since cooldowns are disabled, the optimal strategy is to spam Q while dodging enemy Q's. E can be used for repositioning/dodging. We should maintain a range where we can hit Q but also have time to react to enemy Q.
+---
+<thinking>
+Let me analyze the experience data carefully:
+
+1. **The bot starts at (6350,6350), enemy at (1300,1300)** - they're far apart (~7000 units)
+2. **The bot slowly approaches** - position changes gradually toward enemy
+3. **At T2528, first projectiles appear** - both Q's fired, and at T2761 both drop to 86% HP (both got hit)
+4. **After that initial exchange, HP barely changes** - goes from 86% to ~91% over time (natural regen), meaning the bot IS dodging projectiles somewhat
+5. **But the bot NEVER CASTS ANY ABILITIES after the initial exchange** - This is the critical problem!
+
+Looking at the projectile data more carefully: After T3518, there are always 4 projectiles (2 pairs of Q's from each side). The bot's Q and W projectiles AND enemy projectiles are all visible. The dx/dy values on many enemy projectiles are large negative numbers (already past the bot), meaning they already missed.
+
+**Key Issues:**
+1. **The bot stopped casting abilities entirely after the first exchange** - It's only dodging/moving. Enemy dist stays around 500-800 range but the bot never casts Q, W, or R.
+2. Looking at the policy: when `nearby_projectiles` exist (which is ALWAYS since there are always projectiles flying around from both sides), it enters the dodge block and NEVER gets to the attack code. The dodge check at distance < 900 catches everything.
+3. The bot E-shifts away when projectiles are < 400, which teleports it far away, then it has to re-approach.
+4. The enemy is slowly regenerating HP while we don't deal damage.
+
+**Root Cause Analysis:**
+- The projectile filter `distance_to_me < 900` is too generous - it catches projectiles that have already passed or aren't threatening
+- The bot needs to distinguish between projectiles heading TOWARD it vs already past it
+- The bot should be able to attack AND dodge - not just dodge exclusively
+- With NO COOLDOWNS, the bot should be spamming Q/W constantly while dodging
+
+**What the ideal Ezreal play looks like:**
+1. Maintain ~700-900 range (Q range is ~1150)
+2. Spam Q constantly (no cooldowns!)
+3. Use W to mark, then Q to proc it for bonus damage
+4. Sidestep enemy Q's by moving perpendicular
+5. Use E to dodge only critical skillshots, or to reposition aggressively
+6. Use R when enemy is low
+
+**Key fixes needed:**
+1. Filter projectiles better - only dodge ones actually heading toward us and close
+2. Cast Q/W EVERY frame if possible, not just when no projectiles exist
+3. Interleave attacking and dodging - cast spells TOWARD enemy while moving to dodge
+4. The bot should prioritize casting Q even while dodging
+5. Maintain proper range - not too close, not too far
+
+Let me check the projectile data: `p["dx_to_me"]` and `p["dy_to_me"]` represent direction from me to projectile. If a projectile is at dx=500, it's 500 units to my right. But the projectile is MOVING - we need to know if it's coming toward us.
+
+Actually, looking at the observation spec: "dx/dy shows direction relative to player" and "Negative dx means projectile moving left". Wait, looking again at the spec more carefully:
+
+For projectiles: `[owner,dx,dy,speed,name]` where dx/dy is direction relative to player. But in the observation dict, we have `dx_to_me` and `dy_to_me` which likely means the vector FROM the projectile TO me (or from me to projectile).
+
+Looking at the data: At T2528, projectile has dx=398, dy=255 - the projectile is 398 right and 255 above me. Over time these values decrease as the projectile approaches. When they go negative, the projectile has passed.
+
+So to determine if a projectile is threatening, I should check:
+- Is it getting closer? (distance decreasing)
+- Is it within a cone heading toward me?
+
+Actually, a simpler approach: check if the projectile's position vector (dx, dy) dotted with its velocity gives a negative number (meaning it's moving toward us). But we don't have explicit velocity... 
+
+Let me think differently. The projectile dx_to_me/dy_to_me gives the vector from my position to the projectile. If the projectile is moving toward me, the magnitude of this vector should be decreasing. But we only have one snapshot.
+
+Better approach: A projectile is threatening if it's within some distance AND we can estimate if it's heading our way. Since we know the projectile's name and its position relative to us, and enemy Ezreal Q travels in a line from enemy to a target location...
+
+Actually, let me simplify. The key insight is: **the bot should prioritize attacking over dodging**. Since cooldowns are disabled, every tick we don't cast Q is wasted DPS. The bot should:
+1. Always try to cast Q at the enemy
+2. Between Q casts, move to dodge
+3. Only use E to dodge truly threatening projectiles
+
+Let me also check: are there projectiles from MY team (my_team==1)? The filter already handles this with `my_team == 0`.
+
+Looking at T3750: `PROJ[1073741854,-108,51,2000,EzrealMysticShot]` - this projectile is at dx=-108, meaning it's slightly to my left and past me. The `1073741854` could be team 0 (enemy). But the filter checks `my_team == 0`.
+
+The main issue is clear: **the bot gets stuck in the dodge loop and never attacks**. With 4 projectiles always flying around, `nearby_projectiles` is never empty.
+
+New strategy:
+1. **ALWAYS cast Q toward enemy as first priority** (since no cooldowns, maximum DPS)
+2. If Q was just cast, move to dodge
+3. Only dodge projectiles that are actually close AND heading toward us
+4. Use tighter projectile threat detection (< 400 distance AND approaching)
+5. Maintain range of ~700-900
+
+Let me write the improved policy:
+
+```python
+def act(self, observation):
+    import math
+    
+    my_champ = next(unit for unit in observation["champ_units"] if unit["my_team"] == 1)
+    enemy_champ = next(unit for unit in observation["champ_units"] if unit["my_team"] == 0)
+    
+    my_hp_pct = my_champ["current_hp"] / max(my_champ["max_hp"], 1)
+    enemy_hp_pct = enemy_champ["current_hp"] / max(enemy_champ["max_hp"], 1)
+    my_x = my_champ["position"]["X"]
+    my_y = my_champ["position"]["Y"]
+    enemy_dx = enemy_champ["dx_to_me"]
+    enemy_dy = enemy_champ["dy_to_me"]
+    enemy_dist = enemy_champ["distance_to_me"]
+    enemy_x = enemy_champ["position"]["X"]
+    enemy_y = enemy_champ["position"]["Y"]
+    
+    q_ready = my_champ["q_cooldown"] == 0
+    w_ready = my_champ["w_cooldown"] == 0
+    e_ready = my_champ["e_cooldown"] == 0
+    r_ready = my_champ["r_cooldown"] == 0
+    
+    # Filter for ACTUALLY threatening projectiles
+    # Only consider enemy projectiles that are close and likely heading toward us
+    threatening_projectiles = []
+    for p in observation["projectiles"]:
+        if p["my_team"] == 0:
+            dist = p["distance_to_me"]
+            dx = p["dx_to_me"]
+            dy = p["dy_to_me"]
+            # A projectile is threatening if it's close and the vector from us to it
+            # is small (meaning it's near us and could hit us)
+            # Only worry about very close projectiles
+            if dist < 350:
+                threatening_projectiles.append(p)
+    
+    # PRIORITY 1: ALWAYS CAST Q when in range (no cooldowns = spam!)
+    # Ezreal Q range is ~1150. Cast it aggressively.
+    if enemy_dist < 1100 and q_ready:
+        # Lead the target slightly - aim at where they might be
+        # For now, just aim directly at them
+        return (2, [[0], [enemy_y, enemy_x]])
+    
+    # PRIORITY 2: Cast W for extra damage when in range
+    if enemy_dist < 1000 and w_ready:
+        return (2, [[1], [enemy_y, enemy_x]])
+    
+    # PRIORITY 3: Use R if enemy is low
+    if r_ready and enemy_hp_pct < 0.3:
+        return (2, [[3], [enemy_y, enemy_x]])
+    
+    # PRIORITY 4: Dodge very close projectiles
+    if threatening_projectiles:
+        closest_proj = min(threatening_projectiles, key=lambda p: p["distance_to_me"])
+        proj_dx = closest_proj["dx_to_me"]
+        proj_dy = closest_proj["dy_to_me"]
+        
+        # Move perpendicular to the projectile direction
+        perp_dx = -proj_dy
+        perp_dy = proj_dx
+        mag = math.sqrt(perp_dx**2 + perp_dy**2)
+        if mag > 0:
+            perp_dx /= mag
+            perp_dy /= mag
+        
+        dodge_dist = 300
+        dodge_x = my_x + perp_dx * dodge_dist
+        dodge_y = my_y + perp_dy * dodge_dist
+        
+        # Use E to dodge only if projectile is EXTREMELY close
+        if closest_proj["distance_to_me"] < 200 and e_ready:
+            # E away perpendicular
+            e_x = my_x + perp_dx * 475
+            e_y = my_y + perp_dy * 475
+            return (2, [[2], [e_y, e_x]])
+        
+        return (1, [dodge_y, dodge_x])
+    
+    # PRIORITY 5: Positioning
+    # Maintain optimal range of ~800 for consistent Q hits while having dodge room
+    optimal_range = 800
+    
+    if enemy_dist < 400:
+        # Too close, back off
+        angle_away = math.atan2(-enemy_dy, -enemy_dx)
+        move_x = my_x + math.cos(angle_away) * 350
+        move_y = my_y + math.sin(angle_away) * 350
+        return (1, [move_y, move_x])
+    
+    if enemy_dist > 1000:
+        # Too far, approach at an angle to be harder to hit
+        angle_to = math.atan2(enemy_dy, enemy_dx)
+        # Add perpendicular component for juking
+        juke = math.sin(observation["game_time"] * 0.005) * math.pi / 4
+        move_angle = angle_to + juke
+        move_x = my_x + math.cos(move_angle) * 300
+        move_y = my_y + math.sin(move_angle) * 300
+        return (1, [move_y, move_x])
+    
+    # At good range - orbit/juke to dodge skillshots
+    angle_to = math.atan2(enemy_dy, enemy_dx)
+    # Rapid direction changes to make us hard to predict
+    t = observation["game_time"]
+    # Fast oscillation for juking
+    juke_dir = 1 if int(t / 300) % 2 == 0 else -1
+    orbit_angle = angle_to + (math.pi / 2) * juke_dir
+    move_x = my_x + math.cos(orbit_angle) * 250
+    move_y = my_y + math.sin(orbit_angle) * 250
+    return (1, [move_y, move_x])
+```
+
+Wait, I need to reconsider. Looking at the experience data more carefully:
+
+The issue is that after the initial Q exchange at T2528, the bot's HP stays at 86-91% and slowly recovers. The ENEMY is also at 86-91%. So neither side is dealing damage after the initial exchange. The bot is stuck in a loop of dodging without ever casting.
+
+The fix is clear: **PRIORITIZE CASTING Q OVER EVERYTHING ELSE** (except maybe dodging a projectile that's about to hit you in the next 0.1 seconds).
+
+Since cooldowns are disabled, we should be casting Q literally every single game tick. The action system probably has some animation lock, but we should try to cast Q as often as possible.
+
+Also I notice the bot drifts further and further from the enemy - positions go from ~6350 to ~7300 over time, while enemy seems to stay near their starting area. The bot is orbiting away instead of staying in range.
+
+Let me also reconsider: Maybe the threshold for threatening should be even tighter, or I should just not dodge at all and focus purely on DPS. In a mirror match with no cooldowns, the one who lands more Qs wins. If we spam Q every frame, we'll deal way more damage than we take.
+
+Actually wait - the experience shows both at nearly equal HP throughout, meaning NEITHER is landing abilities. The bot fired Q once, got hit once, and then stopped fighting entirely. The priority should absolutely be:
+
+1. Spam Q (and W) at enemy every single tick
+2. Juke/move between casts
+3. Only dodge if something is literally on top of us
+---
+Looking at the experience data carefully:
+
+1. **T0-T2268**: Bot walks toward enemy, both at 100% HP. Distance ~5000+ units. No abilities cast during approach.
+2. **T2268**: First Q cast (both fire simultaneously). Both projectiles visible.
+3. **T2762**: Both drop to 86% HP - both got hit by Q.
+4. **T3027**: W+Q cast again. At T3524, both drop to ~72% HP.
+5. **T3754-T4513**: Another Q exchange, both drop to ~55% HP.
+6. **T4778-T5769**: Bot STOPS CASTING and just orbits. HP slowly recovers to 56-57%.
+7. **T5769 onwards**: Bot just orbits endlessly, never casting Q again. Both HP slowly regenerate.
+
+**Critical Problem**: After the initial exchanges, the bot enters the "orbit at optimal range" code and NEVER goes back to casting Q. Looking at why:
+
+- Enemy distance stays around 500-900 range (based on dx/dy values of ~500-800)
+- The policy checks `enemy_dist < 1100` for Q - this should be true!
+- BUT there are always projectiles flying around. The policy checks projectiles BEFORE Q... wait, in the current policy Q is Priority 1 before dodge. So why isn't it casting?
+
+Looking more carefully at the enemy distance: `enemy_dx` and `enemy_dy` values are around 500-800 each, so `enemy_dist` = sqrt(500² + 700²) ≈ 860. This IS within 1100 range. So Q should fire.
+
+Wait - the issue might be that Q IS being fired but the bot is also dodging. But looking at T6000+, the bot positions oscillate back and forth rapidly with NO HP changes. The bot is casting Q but missing because both are juking, OR the Q cast isn't actually happening.
+
+Actually, looking at projectiles: after T5769 there are always 4+ projectiles from team 1073741854 (enemy) AND 1073741853 (us). So BOTH sides ARE casting! But neither is hitting because both are dodging.
+
+**The real issue**: The bot fires Q at the enemy's CURRENT position, but the enemy is also juking. The Q misses. Meanwhile the bot orbits predictably. Since enemy projectiles always exist at various distances, the dodge code rarely triggers (threshold 300), and the bot just orbits.
+
+**What needs to change**:
+1. **Lead Q shots** - Predict enemy movement, don't aim at current position
+2. **Use W+Q combo** - W marks, Q procs for bonus damage
+3. **Use R** - Ultimate is a wide beam, harder to dodge
+4. **Better movement** - More unpredictable juking, not a simple orbit pattern
+5. **E aggressively** - Use E to reposition for guaranteed Q hits at close range
+6. **Cast more spells per frame** - We should be casting Q AND W constantly since no cooldowns
+
+The orbit period is `int(game_time / 250)` which flips every 250ms - that's very predictable. Enemy can easily predict this.
+
+**Strategy**: Since both keep dodging Qs, use R (wide beam, harder to dodge) and W (marks enemy for bonus damage on next hit). Use E aggressively to close distance and land point-blank Q. Vary movement unpredictably.
+---
+Looking at the experience data carefully:
+
+1. **T0-T1016**: Bot stays COMPLETELY STILL at (6350,6350). Enemy at (1300,1300). Distance ~7100 units. **NO ACTIONS TAKEN** - the bot is doing nothing for over 1 second of game time!
+
+2. **T1277**: Enemy fires R (EzrealTrueshotBarrage) - two projectiles appear at distance ~1300 each heading toward us.
+
+3. **T1770-T2001**: Bot barely moves (6350→6350,6435→6510). The R projectile is getting closer (distance shrinking from 1300 to ~300).
+
+4. **T2263**: HP drops from 100% to 64%! Got hit by R. Enemy also at 64% (mirror?).
+
+5. **T2526-T3280**: More R projectiles fired. HP drops further to 30%.
+
+6. **T3512**: Both at 30% HP. Bot still barely moving.
+
+**Critical Issues**:
+- The bot is NOT MOVING toward the enemy. Distance is ~7000+ units, way beyond any ability range (1100 for Q).
+- Enemy dist is huge, so `enemy_dist < 1200` for E fails, `enemy_dist < 1100` for Q fails, `enemy_dist < 1000` for W fails.
+- The only thing that triggers is `enemy_dist > 1050` approach code, but the juke pattern moves very slowly.
+- Meanwhile enemy R (global range) hits us because we barely dodge.
+- The bot doesn't use R back (which is also global) because `enemy_dist < 2000` fails (dist ~7000).
+
+**Key fixes needed**:
+1. **Use R at any range** - it's global! Fire R at enemy immediately while closing distance
+2. **Move DIRECTLY toward enemy faster** - stop juking at extreme range, just rush in
+3. **Dodge R projectiles** - they're huge and do massive damage
+4. **Increase R range check** to be very large or unlimited
+5. **Better projectile dodge threshold** - R projectiles were at 300 distance but our threshold is also 300, may have been too late
+
+From history: the bot was previously not casting abilities. Now it casts but misses at close range. But THIS game shows a completely different problem - the bot never gets in range because it approaches too slowly, and gets killed by enemy R (global) while approaching.
+
+**New strategy**:
+1. If far away (>2000), fire R immediately (global range) and rush toward enemy
+2. Cast R liberally - no cooldowns means spam it
+3. Dodge projectiles at larger range (500+) since R is wide
+4. Use E to close gaps when far
+5. Once in range, spam Q/W/R constantly
+6. Keep the perpendicular dodge logic but trigger it earlier
+---
+<thinking>
+Let me analyze the latest experience data carefully:
+
+1. **T0-T1020**: Bot stays completely still at (6350,6350). Enemy at (1300,1300). Distance ~7100 units. The bot does NOTHING for over 1 second. This is because the policy fires R first (Priority 0), but looking at the code... R IS ready, enemy dist IS > 0. So it should cast R. But the bot doesn't move at all.
+
+Wait, looking at the positions: ME at (26,280) at T33 but then ME at (6350,6350) at T0? The timestamps are out of order. Let me re-read...
+
+Actually T33 shows position (26,280) but T0 shows (6350,6350). This seems like the T33 entry might be from a different game or the ordering is off. Let me focus on the main sequence starting from T0.
+
+T0-T1020: Bot at (6350,6350), enemy at (1300,1300). Bot doesn't move. But the policy should trigger R (global range, ready). So why isn't anything happening? Maybe the game hasn't started yet? Or maybe the policy IS casting R but it doesn't show position change because R is a cast-in-place ability.
+
+T1282: Projectiles appear - EzrealTrueshotBarrage from both sides! So R WAS being cast by both sides. The projectiles have dx=1300 (enemy position relative to us) - these are R projectiles heading from enemy toward us.
+
+T1511-T2006: R projectiles approaching. dx decreasing from 1300 to 276. Bot still at (6350,6350) - NOT DODGING!
+
+T2268: HP drops from 100% to 64%! Got hit by enemy R. Position shifts to (6685,6685). Enemy at (629,629), also at 64%.
+
+T2532: More R projectiles. Both at 64%.
+
+T3022: HP drops to 30%! Got hit by another R. Both at 30%.
+
+T3251-T4531: HP at 16%. More R projectiles fired. Bot barely moves.
+
+T4531-T4761: HP at 16-17%. Both alive, spamming R at each other.
+
+**Key Problems with Current Policy:**
+
+1. **Bot spams R and nothing else** - R is Priority 1 (before Q, W, E, movement). Since cooldowns are disabled and R is always ready, the bot ONLY casts R every single tick. It never moves, never dodges, never casts Q/W.
+
+2. **Bot gets hit by enemy R because it never moves** - R cast doesn't move the character, so it stands still and eats every enemy R.
+
+3. **The R-only spam is a death loop** - Both sides spam R, both get hit, both die equally. No advantage gained.
+
+4. **Dodging never triggers** - The dodge code (Priority 0) checks for projectiles < 500 distance. But R is being cast every tick before the dodge check. Actually wait - dodge IS Priority 0 in the current policy. Let me re-read...
+
+Looking at the current policy:
+- Priority 0: Dodge close projectiles (< 500 dist)
+- Priority 1: Cast R (always, any range)
+- Priority 2: Cast Q (< 1150 range)
+- Priority 3: Cast W (< 1000 range)
+- Priority 4: E to close gap (> 1200)
+- Priority 5: Movement
+
+So the dodge SHOULD trigger when projectiles are within 500. But looking at T1774, projectile dist ~850 (sqrt(603²+603²)). At T2006, dist ~390 (sqrt(276²+276²)). So at T2006 the projectile IS within 500.
+
+But wait - the bot's position doesn't change at T2006 (still at 6350,6350). That means the dodge didn't trigger OR the dodge command was issued but didn't execute because the bot was already casting R.
+
+Actually, I think the problem is: **the bot casts R every tick, and R has a cast animation that locks the character in place**. So even though dodge is Priority 0, by the time a projectile gets within 500 range, the bot is mid-R-cast and can't move.
+
+Actually no, looking more carefully: the dodge IS priority 0 (before R). So when projectiles are within 500, it should dodge instead of casting R. But at T2006, projectiles are at dist 390 (within 500). At T2268, the bot moved to (6685,6685) - so it DID try to dodge, but too late (already got hit).
+
+The issue is the 500 threshold is too small for R projectiles which travel at 2000 speed. By the time they're within 500, you only have 250ms to dodge - not enough if you were casting R.
+
+**Solutions:**
+
+1. **Don't spam R as first priority** - R should be used strategically, not every tick
+2. **Increase dodge detection range** - For fast projectiles like R, need to dodge at 800+ distance
+3. **Prioritize Q over R** - Q is faster, more reliable at range
+4. **Move between casts** - Don't just stand and cast
+5. **Alternate between casting and moving** - Cast Q, then move to dodge, cast Q, move to dodge
+
+**New Strategy:**
+
+Since cooldowns are disabled, the optimal play is:
+1. Approach enemy while dodging
+2. At ~800-1000 range, alternate between casting Q and dodging
+3. Use W occasionally for mark damage
+4. Use R sparingly (when enemy can't dodge, or to finish)
+5. Use E for emergency dodges or gap closing
+6. ALWAYS be moving between ability casts
+
+The key insight: we need to INTERLEAVE actions. We can't just cast spells every tick - we need to move between casts to dodge. A simple alternation: cast Q one tick, move/dodge next tick.
+
+Let me also think about the movement issue. The bot starts at (6350,6350) and enemy at (1300,1300). Distance is sqrt((6350-1300)² + (6350-1300)²) ≈ 7141. The bot needs to close this gap. But in the current policy, R is always cast first, preventing any movement.
+
+Looking at the game_time: T0 to T4761. That's about 4.7 seconds of real game time. The bot needs to approach during this time.
+
+**New Policy Design:**
+
+I need a state machine approach:
+1. Far range (>1200): Move toward enemy, use R occasionally, dodge incoming R
+2. Mid range (800-1200): Spam Q, dodge, use W
+3. Close range (<800): Q spam, kite back if low HP, E if needed
+
+Key mechanic: **Alternate between casting and moving.** Use game_time modulo to alternate:
+- Even ticks: Cast an ability
+- Odd ticks: Move to dodge/reposition
+
+Actually, since we get observations every ~250ms, we can check: if there's a threatening projectile, dodge. Otherwise, cast an ability. This is better than blind alternation.
+
+But the problem is projectiles are ALWAYS present once they start firing. So we need smarter projectile filtering.
+
+Let me design the projectile threat assessment:
+- A projectile is threatening if:
+  1. It's from the enemy team (my_team == 0)
+  2. It's within a certain distance (say 600)
+  3. It's heading TOWARD us (distance is decreasing)
+
+We can estimate if it's heading toward us by checking: if the projectile position vector dot product with some inferred velocity is negative. But we don't track frame-to-frame.
+
+Alternative: use the projectile name and position. EzrealTrueshotBarrage (R) and EzrealMysticShot (Q) both travel in straight lines from enemy toward a target. If the projectile is between us and the enemy, it's likely heading toward us.
+
+Actually, simpler heuristic: if the projectile's dx_to_me has the same sign as enemy_dx_to_me AND the magnitude is smaller, the projectile is between us and the enemy, heading toward us. 
+
+Even simpler: just dodge any close enemy projectile. But raise/lower the threshold smartly.
+
+Let me write the new policy:
+
+```python
+def act(self, observation):
+    import math
+    
+    my_champ = next(unit for unit in observation["champ_units"] if unit["my_team"] == 1)
+    enemy_champ = next(unit for unit in observation["champ_units"] if unit["my_team"] == 0)
+    
+    my_hp_pct = my_champ["current_hp"] / max(my_champ["max_hp"], 1)
+    enemy_hp_pct = enemy_champ["current_hp"] / max(enemy_champ["max_hp"], 1)
+    my_x = my_champ["position"]["X"]
+    my_y = my_champ["position"]["Y"]
+    enemy_dx = enemy_champ["dx_to_me"]
+    enemy_dy = enemy_champ["dy_to_me"]
+    enemy_dist = enemy_champ["distance_to_me"]
+    enemy_x = enemy_champ["position"]["X"]
+    enemy_y = enemy_champ["position"]["Y"]
+    
+    q_ready = my_champ["q_cooldown"] == 0
+    w_ready = my_champ["w_cooldown"] == 0
+    e_ready = my_champ["e_cooldown"] == 0
+    r_ready = my_champ["r_cooldown"] == 0
+    
+    game_time = observation["game_time"]
+    
+    # Identify truly threatening enemy projectiles
+    threatening = []
+    for p in observation["projectiles"]:
+        if p["my_team"] == 0:
+            dist = p["distance_to_me"]
+            if dist < 500:
+                threatening.append(p)
+    
+    # PRIORITY 0: Dodge close projectiles ALWAYS
+    if threatening:
+        closest = min(threatening, key=lambda p: p["distance_to_me"])
+        pdx = closest["dx_to_me"]
+        pdy = closest["dy_to_me"]
+        perp_x = -pdy
+        perp_y = pdx
+        mag = math.sqrt(perp_x**2 + perp_y**2)
+        if mag > 0:
+            perp_x /= mag
+            perp_y /= mag
+        
+        if closest["distance_to_me"] < 250 and e_ready:
+            e_x = my_x + perp_x * 475
+            e_y = my_y + perp_y * 475
+            return (2, [[2], [e_y, e_x]])
+        
+        dodge_x = my_x + perp_x * 350
+        dodge_y = my_y + perp_y * 350
+        return (1, [dodge_y, dodge_x])
+    
+    # PRIORITY 1: R when far (global) - but alternate with movement
+    if r_ready:
+        ...
+```
+
+Wait, the core problem is still: R is always ready (no cooldowns), so Priority 1 fires R every tick when there are no close projectiles. This means we never move toward enemy.
+
+I need to use game_time to pace abilities. For example, only cast R every N milliseconds to allow movement in between.
+
+Let me think about what game_time values look like: T0, T265, T526, T757, T1020... so intervals are ~250ms.
+
+I'll use a pacing mechanism:
+- Cast R once every ~1000ms (every 4th tick)
+- Cast Q every other tick when in range
+- Move/dodge on other ticks
+
+```python
+# Determine action phase based on time
+tick_phase = int(game_time / 250) % 4  # 0,1,2,3 cycling
+```
+
+Actually, let me think about this differently. The key issues from history:
+
+1. Bot stands still because it spams R every tick → Need to interleave movement
+2. Bot gets hit by R because it doesn't dodge in time → Need larger dodge radius
+3. Bot never uses Q/W because R takes priority → Need smarter ability usage
+4. Bot never approaches enemy → Need approach movement
+
+Here's my refined strategy:
+
+**Phase 1: Far away (>1200 distance)**
+- Use game_time % to alternate: R cast → move toward → R cast → move toward
+- Dodge any incoming projectiles with high priority
+
+**Phase 2: Mid range (600-1200)**
+- Alternate: Q cast → dodge/move → W cast → dodge/move
+- Use R occasionally for big damage
+- Juke unpredictably
+
+**Phase 3: Close range (<600)**
+- Spam Q, kite back
+- E if needed for safety
+
+The alternation is key. Let me use `game_time % 500` or similar to switch between cast/move modes.
+
+Actually, I think a cleaner approach: every tick, check if there's a projectile to dodge. If yes, dodge. If no, check what ability to cast based on range and a cycling counter. If no ability is appropriate, move toward/orbit enemy.
+
+The problem with my R-spam was that NO COOLDOWNS means R is always available. So I need to explicitly limit R usage.
+
+Let me write the final policy:
+
+```python
+def act(self, observation):
+    import math
+    
+    my_champ = next(unit for unit in observation["champ_units"] if unit["my_team"] == 1)
+    enemy_champ = next(unit for unit in observation["champ_units"] if unit["my_team"] == 0)
+    
+    my_hp_pct = my_champ["current_hp"] / max(my_champ["max_hp"], 1)
+    enemy_hp_pct = enemy_champ["current_hp"] / max(enemy_champ["max_hp"], 1)
+    my_x = my_champ["position"]["X"]
+    my_y = my_champ["position"]["Y"]
+    enemy_dx = enemy_champ["dx_to_me"]
+    enemy_dy = enemy_champ["dy_to_me"]
+    enemy_dist = enemy_champ["distance_to_me"]
+    enemy_x = enemy_champ["position"]["X"]
+    enemy_y = enemy_champ["position"]["Y"]
+    
+    q_ready = my_champ["q_cooldown"] == 0
+    w_ready = my_champ["w_cooldown"] == 0
+    e_ready = my_champ["e_cooldown"] == 0
+    r_ready = my_champ["r_cooldown"] == 0
+    
+    game_time = observation["game_time"]
+    
+    # Threatening projectiles - wider detection radius
+    threatening = []
+    for p in observation["projectiles"]:
+        if p["my_team"] == 0:
+            dist = p["distance_to_me"]
+            if dist < 600:
+                threatening.append(p)
+    
+    # PRIORITY 0: ALWAYS dodge close threatening projectiles
+    if threatening:
+        closest = min(threatening, key=lambda p: p["distance_to_me"])
+        pdx = closest["dx_to_me"]
+        pdy = closest["dy_to_me"]
+        perp_x = -pdy
+        perp_y = pdx
+        mag = math.sqrt(perp_x**2 + perp_y**2)
+        if mag > 0:
+            perp_x /= mag
+            perp_y /= mag
+        
+        # E dodge for very close projectiles
+        if closest["distance_to_me"] < 300 and e_ready:
+            e_x = my_x + perp_x * 475
+            e_y = my_y + perp_y * 475
+            return (2, [[2], [e_y, e_x]])
+        
+        dodge_x = my_x + perp_x * 400
+        dodge_y = my_y + perp_y * 400
+        return (1, [dodge_y, dodge_x])
+    
+    # Use a tick counter to alternate between casting and moving
+    tick = int(game_time / 250)
+    
+    # Aim with lead prediction
+    angle_to = math.atan2(enemy_dy, enemy_dx)
+    lead = math.sin(game_time * 0.017) * 200
+    aim_x = enemy_x + math.cos(angle_to + math.pi/2) * lead
+    aim_y = enemy_y + math.sin(angle_to + math.pi/2) * lead
+    
+    # Every other tick: cast an ability
+    if tick % 2 == 0:
+        # R spam when far away (but not every tick - every 6th tick)
+        if r_ready and enemy_dist > 1200 and tick % 6 == 0:
+            return (2, [[3], [aim_y, aim_x]])
+        
+        # Q is highest DPS when in range
+        if q_ready and enemy_dist < 1150:
+            return (2, [[0], [aim_y, aim_x]])
+        
+        # W for mark
+        if w_ready and enemy_dist < 1000:
+            return (2, [[1], [aim_y, aim_x]])
+        
+        # R at any range every 6th tick
+        if r_ready and tick % 6 == 0:
+            return (2, [[3], [aim_y, aim_x]])
+    
+    # Odd ticks or no ability to cast: MOVE
+    # E to close gap when far
+    if e_ready and enemy_dist > 1500 and my_hp_pct > 0.3:
+        e_x = my_x + math.cos(angle_to) * 475
+        e_y = my_y + math.sin(angle_to) * 475
+        return (2, [[2], [e_y, e_x]])
+    
+    # Movement based on range
+    if enemy_dist > 1000:
+        # Approach with juke
+        juke = math.sin(game_time * 0.009) * math.pi / 5
+        move_angle = angle_to + juke
+        mx = my_x + math.cos(move_angle) * 400
+        my = my_y + math.sin(move_angle) * 400
+        return (1, [my, mx])
+    
+    if enemy_dist < 350:
+        # Kite back
+        angle_away = math.atan2(-enemy_dy, -enemy_dx)
+        mx = my_x + math.cos(angle_away) * 350
+        my = my_y + math.sin(angle_away) * 350
+        return (1, [my, mx])
+    
+    # Optimal range: juke unpredictably
+    t = game_time
+    juke1 = math.sin(t * 0.013) * 0.8
+    juke2 = math.sin(t * 0.0071 + 1.9) * 0.5
+    juke3 = math.sin(t * 0.023 + 0.5) * 0.3
+    combined = juke1 + juke2 + juke3
+    orbit_angle = angle_to + (math.pi / 2) * combined
+    mx = my_x + math.cos(orbit_angle) * 280
+    my = my_y + math.sin(orbit_angle) * 280
+    return (1, [my, mx])
+```
+
+This should fix the core issues:
+1. Bot no longer stands still spamming R (alternates between cast and move)
+2. Dodge radius increased to 600 (catches R projectiles sooner)
+3. Q prioritized over R at close range
+4. Movement interleaved with casting
+5. R only used every 6th tick to prevent R-lock
+6. E used for gap closing when far
+7. Unpredictable juking when in range
+---
+Looking at the experience data carefully:
+
+1. **T0-T526**: Bot at (6350,6350), enemy at (1300,1300). Distance ~7100. Bot starts moving toward enemy.
+2. **T1018-1281**: Projectiles appear - both fire Q and R simultaneously. Bot still at (6685,6685).
+3. **T1769**: HP drops from 100% to 51%! Got hit by R AND Q. Enemy at 65%. We took WAY more damage.
+4. **T1769-T8778**: HP stays at 51-52%, enemy at 65-66%. Bot orbits around 6500-6800 range but NEVER DEALS DAMAGE. Enemy slowly regens.
+5. **T8778**: HP drops to 17%! Got hit by another R. Enemy still at 66%.
+6. **T8778-T24520**: HP stays at 17-21% (regen), enemy at 67-70%. Bot just orbits, never attacking.
+
+**Critical Problems:**
+
+1. **The bot NEVER CASTS ABILITIES after initial exchange** - Looking at tick logic: `tick = int(game_time / 250)`, and `tick % 2 == 0` for casting. But game_time values are like 1769, 2032... so tick = 7, 8, etc. Even ticks should cast. But enemy_dist based on dx/dy ~(300-600) means dist ~400-700, well within Q range (1150). So WHY isn't Q being cast?
+
+2. **The dodge block catches everything** - There are ALWAYS projectiles within 600 distance (the `threatening` filter). Looking at data: every observation has projectiles with dx/dy of 200-500, meaning distances of 300-700. Many are within 600. So the bot ALWAYS enters the dodge block and NEVER reaches the cast phase.
+
+3. **Many "threatening" projectiles are already PAST us** - Projectiles with large negative dx/dy values (like -10000) are far past. But some projectiles at dx=253, dy=257 (dist ~360) trigger the dodge. These might be our OWN projectiles being misidentified, or enemy projectiles that already passed.
+
+4. **The dodge is ineffective** - HP dropped from 51% to 17% at T8778 despite constant dodging. The perpendicular dodge doesn't work well against R (wide beam).
+
+**Key Fixes:**
+
+1. **Filter projectiles MUCH more aggressively** - Only dodge projectiles heading TOWARD us (positive dot product with enemy direction) AND very close (<400)
+2. **NEVER let dodge completely block ability casting** - Cast Q FIRST, then dodge. DPS > dodging.
+3. **Use E offensively** - E into range, cast Q point-blank
+4. **Spam Q as TOP priority** when in range - Q every tick, no alternation needed
+5. **Move/dodge ONLY when Q is on animation cooldown** (even though cooldowns are "disabled", there's likely a cast time)
+
+The fundamental insight: with no cooldowns, the winner is whoever lands more Qs. Standing still dodging = 0 DPS = losing. We must prioritize Q spam.
+
+New approach: Cast Q EVERY TICK at enemy when in range. Only dodge if a projectile is < 300 distance. Use the tick alternation ONLY for R (not Q). Approach aggressively with E when far.
+</history>
+
+<example>
+<thinking>
+During this episode, I constantly lost reward as I was hit by skillshots frequently due to being poor at dodging them.
+Therefore, I'm now going to try wiggling my character model rapidly moving back and forth before comitting to
+a skillshot, to make it harder for the enemy Ezreal to land a skillshot on me.
+<thinking>
+<policy>
+
+def act(self, obs):
+    import math # YOU MUST IMPORT THIS MODULE EVERY SINGLE TIME. DO NOT IMOPRT ANY OTHER MODULES
+    
+    # Get our champion and enemy champion info
+    my_champ = next(unit for unit in observation["champ_units"] if unit["my_team"] == 1)
+    enemy_champ = next(unit for unit in observation["champ_units"] if unit["my_team"] == 0)
+    nearby_projectiles = [p for p in observation["projectiles"] 
+                         if p["my_team"] == 0 and p["distance_to_me"] < 800]
+
+    # High priority: Dodge enemy skillshots (prevents HP loss which has high negative reward)
+    if nearby_projectiles:
+        proj = nearby_projectiles[0]
+        # Calculate perpendicular dodge direction
+        dodge_x = proj["dy_to_me"]
+        dodge_y = -proj["dx_to_me"]
+        magnitude = (dodge_x**2 + dodge_y**2)**0.5
+        if magnitude > 0:
+            dodge_x = (dodge_x/magnitude * 200) + my_champ["position"]["X"]
+            dodge_y = (dodge_y/magnitude * 200) + my_champ["position"]["Y"]
+            return (1, [dodge_y, dodge_x])
+
+    # Offensive opportunities (for kill rewards and HP damage)
+    if enemy_champ["distance_to_me"] < 600:
+        # Check if we have HP advantage
+        my_hp_percent = my_champ["current_hp"] / my_champ["max_hp"]
+        enemy_hp_percent = enemy_champ["current_hp"] / enemy_champ["max_hp"]
+        
+        if my_hp_percent > enemy_hp_percent + 0.2:  # We have significant HP advantage
+            # Cast Q if available and in range
+            if my_champ["q_cooldown"] == 0:
+                return (2, [[0], [enemy_champ["position"]["Y"], enemy_champ["position"]["X"]]])
+        else:
+            # Maintain safe distance if we don't have HP advantage
+            retreat_x = my_champ["position"]["X"] - enemy_champ["dx_to_me"]
+            retreat_y = my_champ["position"]["Y"] - enemy_champ["dy_to_me"]
+            return (1, [retreat_y, retreat_x])
+
+    # Resource management (MP has moderate reward weight)
+    if my_champ["current_mp"] / my_champ["max_mp"] < 0.3:
+        # Play conservatively when low on mana
+        safe_x = my_champ["position"]["X"] + (enemy_champ["dx_to_me"] * -1.5)
+        safe_y = my_champ["position"]["Y"] + (enemy_champ["dy_to_me"] * -1.5)
+        return (1, [safe_y, safe_x])
+
+    # Default behavior: Maintain optimal trading range
+    optimal_range = 500  # Adjust based on champion
+    if enemy_champ["distance_to_me"] > optimal_range:
+        # Move closer
+        approach_x = my_champ["position"]["X"] + enemy_champ["dx_to_me"] * 0.5
+        approach_y = my_champ["position"]["Y"] + enemy_champ["dy_to_me"] * 0.5
+        return (1, [approach_y, approach_x])
+    else:
+        # Orbit around enemy while in range
+        orbit_angle = math.atan2(enemy_champ["dy_to_me"], enemy_champ["dx_to_me"])
+        orbit_x = enemy_champ["position"]["X"] + math.cos(orbit_angle + math.pi/4) * optimal_range
+        orbit_y = enemy_champ["position"]["Y"] + math.sin(orbit_angle + math.pi/4) * optimal_range
+        return (1, [orbit_y, orbit_x])
+</policy>
+</example>
+
+<task>
+You must now return the new policy based on <example></example>.
+Simply infill and complete the tags below.
+DO NOT PROVIDE ANY PREAMBLE OR IRRELEVANT TEXT, FILL IN THE TEMPLATE AS REQUIRED.
+</task>
+
+<thinking>

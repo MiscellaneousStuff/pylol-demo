@@ -1,0 +1,338 @@
+<thinking>
+Let me analyze the latest experience data carefully:
+
+1. **T0-T754**: Bot at (6350,6350), enemy at (1300,1300). Distance ~7100. Bot moves to (6685,6685) by T525.
+2. **T1018**: Projectiles appear - EzrealMysticShot from both sides. Bot still at (6685,6685).
+3. **T1510**: HP drops to 86% for both. Bot barely moved to (6737,6632).
+4. **T1773**: Bot at 86%, enemy at 86%. Slow movement.
+5. **T2263**: More projectiles (Q and W from both sides). Bot at (6737,6632).
+6. **T2528**: HP drops to 72% for us, 73% for enemy. Getting hit.
+7. **T2758-T3516**: HP at 73% for both. Bot orbits around (6400-6700, 6300-6700).
+8. **T3516 onwards**: Enemy fires more Qs. HP stays at 73-77% for both (natural regen). Distance to enemy ~700-1300.
+9. **For the ENTIRE rest of the game (T3516-T24521)**: Both HP slowly regenerate (73→77%). Neither side deals meaningful damage. Bot just orbits endlessly.
+
+**Key observations from this episode:**
+
+1. **Bot barely deals damage after initial exchange** - HP stays at 73-77% for both sides for 20+ seconds.
+2. **Bot IS moving (orbiting)** but never in a way that leads to kills.
+3. **Looking at projectiles**: There are always 2 EzrealMysticShot projectiles visible (one from each team). The enemy projectiles have dx/dy values of 100-800, meaning distances of 150-1100.
+4. **The bot seems to be casting Q** (our projectiles exist) but they're all missing because the enemy dodges too.
+5. **The tick-based phase system (tick % 3)** means Q only fires every 3rd tick (~750ms). This is LOW DPS for no-cooldown mode.
+
+**Root cause analysis from history:**
+
+The history shows a recurring problem cycle:
+- If Q is highest priority → bot never moves → gets hit by everything
+- If dodge is highest priority → bot never casts → deals no damage
+- If tick-based alternation → Q fires too infrequently to kill
+- Lead prediction on Q → causes more misses than hits
+
+**What's happening in this specific episode:**
+
+The current policy uses tick % 3 phases:
+- Phase 0: Q cast
+- Phase 1: W/R cast  
+- Phase 2: move
+
+Looking at enemy distances: dx/dy values like (500-800, 600-1300) → distances of ~800-1500. Many observations show enemy_dist > 1000, which means Q cast condition (`enemy_dist < 1100`) barely passes.
+
+The threatening projectile filter uses:
+- `dist < 400`
+- `dot > 0 or dist < 200`
+
+Looking at projectile data: Most enemy projectiles have distances of 200-500+. Some are within 400. When they're within 400 AND dot > 0, the dodge override triggers.
+
+**The fundamental problem**: The bot is stuck in a stalemate. Both Ezreals orbit each other, fire Q, and both dodge. Neither can kill the other.
+
+**What needs to change to WIN:**
+
+1. **E→Q burst combo**: Use E to blink toward enemy, then immediately Q at point-blank range. Point-blank Q is nearly impossible to dodge. With no cooldowns, we can E→Q repeatedly.
+
+2. **R more aggressively**: R is a wide beam. Fire it frequently (every 2-3 ticks). At 600-800 range, R is hard to dodge.
+
+3. **Better movement pattern**: The current orbit is predictable (sinusoidal). Use sharper direction changes.
+
+4. **Aggressive when HP advantage**: When we're ahead, E into enemy face and burst.
+
+5. **DODGE OVERRIDE should remain highest priority** for truly close projectiles, but the threshold should be tight (< 350).
+
+6. **Cast Q MORE FREQUENTLY**: Instead of every 3rd tick, cast Q every 2nd tick. Alternate Q → move → Q → move.
+
+Let me design the new policy:
+
+```python
+def act(self, observation):
+    import math
+    
+    my_champ = next(unit for unit in observation["champ_units"] if unit["my_team"] == 1)
+    enemy_champ = next(unit for unit in observation["champ_units"] if unit["my_team"] == 0)
+    
+    my_hp_pct = my_champ["current_hp"] / max(my_champ["max_hp"], 1)
+    enemy_hp_pct = enemy_champ["current_hp"] / max(enemy_champ["max_hp"], 1)
+    my_x = my_champ["position"]["X"]
+    my_y = my_champ["position"]["Y"]
+    enemy_dx = enemy_champ["dx_to_me"]
+    enemy_dy = enemy_champ["dy_to_me"]
+    enemy_dist = enemy_champ["distance_to_me"]
+    enemy_x = enemy_champ["position"]["X"]
+    enemy_y = enemy_champ["position"]["Y"]
+    
+    q_ready = my_champ["q_cooldown"] == 0
+    w_ready = my_champ["w_cooldown"] == 0
+    e_ready = my_champ["e_cooldown"] == 0
+    r_ready = my_champ["r_cooldown"] == 0
+    
+    game_time = observation["game_time"]
+    angle_to_enemy = math.atan2(enemy_dy, enemy_dx)
+    hp_advantage = my_hp_pct - enemy_hp_pct
+    
+    # Filter for truly threatening enemy projectiles
+    threatening = []
+    for p in observation["projectiles"]:
+        if p["my_team"] == 0:
+            dist = p["distance_to_me"]
+            pdx = p["dx_to_me"]
+            pdy = p["dy_to_me"]
+            if dist < 400:
+                # Check if heading toward us (same general direction as enemy)
+                dot = pdx * enemy_dx + pdy * enemy_dy
+                if dot > 0 or dist < 200:
+                    threatening.append(p)
+    
+    # OVERRIDE: Dodge very close projectiles ALWAYS
+    if threatening:
+        closest = min(threatening, key=lambda p: p["distance_to_me"])
+        pdx = closest["dx_to_me"]
+        pdy = closest["dy_to_me"]
+        perp_x = -pdy
+        perp_y = pdx
+        mag = math.sqrt(perp_x**2 + perp_y**2)
+        if mag > 0:
+            perp_x /= mag
+            perp_y /= mag
+        
+        # E dodge for extremely close
+        if closest["distance_to_me"] < 200 and e_ready:
+            e_x = my_x + perp_x * 475
+            e_y = my_y + perp_y * 475
+            return (2, [[2], [e_y, e_x]])
+        
+        dodge_x = my_x + perp_x * 350
+        dodge_y = my_y + perp_y * 350
+        return (1, [dodge_y, dodge_x])
+    
+    tick = int(game_time / 250)
+    
+    # AGGRESSIVE E→Q COMBO when we have HP advantage
+    if hp_advantage > 0.15 and e_ready and enemy_dist > 400 and enemy_dist < 1500:
+        # E toward enemy to close gap for point-blank Q
+        e_target_dist = min(475, enemy_dist - 200)
+        e_x = my_x + math.cos(angle_to_enemy) * e_target_dist
+        e_y = my_y + math.sin(angle_to_enemy) * e_target_dist
+        return (2, [[2], [e_y, e_x]])
+    
+    # Alternate: cast on even ticks, move on odd ticks
+    if tick % 2 == 0:
+        # Cast R every 4th tick for burst (wide beam, hard to dodge)
+        if r_ready and tick % 4 == 0 and enemy_dist < 3000:
+            return (2, [[3], [enemy_y, enemy_x]])
+        
+        # Q - primary damage, aim directly at enemy
+        if q_ready and enemy_dist < 1100:
+            return (2, [[0], [enemy_y, enemy_x]])
+        
+        # W for mark damage
+        if w_ready and enemy_dist < 1000:
+            return (2, [[1], [enemy_y, enemy_x]])
+        
+        # R at any range if nothing else available
+        if r_ready:
+            return (2, [[3], [enemy_y, enemy_x]])
+    
+    # ODD TICKS: Movement/positioning
+    
+    # E to close gap when very far
+    if e_ready and enemy_dist > 1300 and my_hp_pct > 0.25:
+        e_x = my_x + math.cos(angle_to_enemy) * 475
+        e_y = my_y + math.sin(angle_to_enemy) * 475
+        return (2, [[2], [e_y, e_x]])
+    
+    # Far: rush toward enemy with juke
+    if enemy_dist > 1000:
+        juke = math.sin(game_time * 0.011) * math.pi / 4
+        move_angle = angle_to_enemy + juke
+        mx = my_x + math.cos(move_angle) * 400
+        my_ = my_y + math.sin(move_angle) * 400
+        return (1, [my_, mx])
+    
+    # Too close: kite back
+    if enemy_dist < 350:
+        angle_away = math.atan2(-enemy_dy, -enemy_dx)
+        mx = my_x + math.cos(angle_away) * 350
+        my_ = my_y + math.sin(angle_away) * 350
+        return (1, [my_, mx])
+    
+    # Optimal range (350-1000): rapid unpredictable orbiting
+    t = game_time
+    # Multiple sine waves with different frequencies for unpredictability
+    juke1 = math.sin(t * 0.015) * 0.7
+    juke2 = math.sin(t * 0.0083 + 2.1) * 0.5
+    juke3 = math.sin(t * 0.027 + 0.7) * 0.4
+    combined = juke1 + juke2 + juke3
+    orbit_angle = angle_to_enemy + (math.pi / 2) * combined
+    mx = my_x + math.cos(orbit_angle) * 300
+    my_ = my_y + math.sin(orbit_angle) * 300
+    return (1, [my_, mx])
+```
+
+Wait, this is essentially the current policy! Let me look at what's ACTUALLY different/wrong.
+
+The current policy has these exact issues:
+1. tick % 3 means only casting 2/3 of the time (phases 0 and 1 cast, phase 2 moves)
+2. R only fires when `tick % 4 == 0` AND it's phase 1 → very rare
+3. The orbit juke pattern is smooth/predictable
+
+Looking at the data: the bot orbits between (6300-6700) on both axes for 20+ seconds. Enemy dist stays around 600-1300. Bot casts Q on phase 0 and W/R on phase 1, moves on phase 2. But Q keeps missing because the enemy dodges.
+
+**What I need to change:**
+
+1. **Increase R frequency dramatically** - R is a wide beam that's much harder to dodge than Q. With no cooldowns, spam R. Make R fire every other cast tick.
+
+2. **Use E→Q combo** - Blink to point-blank range and fire Q. Nearly unmissable.
+
+3. **Change orbit to be more erratic** - Instead of smooth sinusoidal, use sharp directional changes.
+
+4. **When casting Q, add slight lead based on orbit direction** - If enemy is orbiting, lead slightly in their movement direction.
+
+Actually, the biggest insight: **R does massive AoE damage and is a wide beam**. With no cooldowns, we should be spamming R much more than Q. R is harder to dodge. Let me make R the primary damage source and Q the filler.
+
+Also, I notice the hp_advantage check for E engage is `> 0.2` in current policy but both start even and stay roughly even. So the E engage never triggers. Lower this to `> 0.05` or just make E engage a regular part of the rotation.
+
+Let me also consider: the E→Q combo. E blinks 475 units. If we're at 800 range, E puts us at ~325 from enemy. At 325 range, Q travel time is ~163ms. Enemy move speed is ~340 units/sec, so they move ~56 units in that time. Q hitbox is ~60 wide, so they'd need to move perpendicular AND react in time. This is very likely to hit.
+
+After E→Q, we're at 325 range. Then we need to kite back. So the rotation is: E forward → Q → move back → R → move back → E forward → Q → etc.
+
+New policy with E→Q focus:
+
+```python
+def act(self, observation):
+    import math
+    
+    my_champ = next(unit for unit in observation["champ_units"] if unit["my_team"] == 1)
+    enemy_champ = next(unit for unit in observation["champ_units"] if unit["my_team"] == 0)
+    
+    my_hp_pct = my_champ["current_hp"] / max(my_champ["max_hp"], 1)
+    enemy_hp_pct = enemy_champ["current_hp"] / max(enemy_champ["max_hp"], 1)
+    my_x = my_champ["position"]["X"]
+    my_y = my_champ["position"]["Y"]
+    enemy_dx = enemy_champ["dx_to_me"]
+    enemy_dy = enemy_champ["dy_to_me"]
+    enemy_dist = enemy_champ["distance_to_me"]
+    enemy_x = enemy_champ["position"]["X"]
+    enemy_y = enemy_champ["position"]["Y"]
+    
+    q_ready = my_champ["q_cooldown"] == 0
+    w_ready = my_champ["w_cooldown"] == 0
+    e_ready = my_champ["e_cooldown"] == 0
+    r_ready = my_champ["r_cooldown"] == 0
+    
+    game_time = observation["game_time"]
+    angle_to_enemy = math.atan2(enemy_dy, enemy_dx)
+    hp_advantage = my_hp_pct - enemy_hp_pct
+    
+    # Threatening projectiles - tight filter
+    threatening = []
+    for p in observation["projectiles"]:
+        if p["my_team"] == 0:
+            dist = p["distance_to_me"]
+            pdx = p["dx_to_me"]
+            pdy = p["dy_to_me"]
+            if dist < 400:
+                dot = pdx * enemy_dx + pdy * enemy_dy
+                if dot > 0 or dist < 200:
+                    threatening.append(p)
+    
+    # OVERRIDE: Dodge very close projectiles
+    if threatening:
+        closest = min(threatening, key=lambda p: p["distance_to_me"])
+        pdx = closest["dx_to_me"]
+        pdy = closest["dy_to_me"]
+        perp_x = -pdy
+        perp_y = pdx
+        mag = math.sqrt(perp_x**2 + perp_y**2)
+        if mag > 0:
+            perp_x /= mag
+            perp_y /= mag
+        
+        if closest["distance_to_me"] < 200 and e_ready:
+            e_x = my_x + perp_x * 475
+            e_y = my_y + perp_y * 475
+            return (2, [[2], [e_y, e_x]])
+        
+        dodge_x = my_x + perp_x * 350
+        dodge_y = my_y + perp_y * 350
+        return (1, [dodge_y, dodge_x])
+    
+    tick = int(game_time / 250)
+    phase = tick % 3  # 0=attack, 1=attack2, 2=move
+    
+    # AGGRESSIVE E→Q when HP advantage OR to engage
+    if hp_advantage > 0.1 and e_ready and enemy_dist > 400 and enemy_dist < 1500:
+        e_target = min(475, enemy_dist - 150)
+        e_x = my_x + math.cos(angle_to_enemy) * e_target
+        e_y = my_y + math.sin(angle_to_enemy) * e_target
+        return (2, [[2], [e_y, e_x]])
+    
+    # Phase 0: R (wide beam, high damage, hard to dodge)
+    if phase == 0:
+        if r_ready:
+            return (2, [[3], [enemy_y, enemy_x]])
+        if q_ready and enemy_dist < 1100:
+            return (2, [[0], [enemy_y, enemy_x]])
+    
+    # Phase 1: Q + W
+    if phase == 1:
+        if q_ready and enemy_dist < 1100:
+            return (2, [[0], [enemy_y, enemy_x]])
+        if w_ready and enemy_dist < 1000:
+            return (2, [[1], [enemy_y, enemy_x]])
+    
+    # Phase 2: Move
+    # E to close gap when far
+    if e_ready and enemy_dist > 1300 and my_hp_pct > 0.25:
+        e_x = my_x + math.cos(angle_to_enemy) * 475
+        e_y = my_y + math.sin(angle_to_enemy) * 475
+        return (2, [[2], [e_y, e_x]])
+    
+    if enemy_dist > 1000:
+        juke = math.sin(game_time * 0.011) * math.pi / 4
+        move_angle = angle_to_enemy + juke
+        mx = my_x + math.cos(move_angle) * 400
+        my_ = my_y + math.sin(move_angle) * 400
+        return (1, [my_, mx])
+    
+    if enemy_dist < 350:
+        angle_away = math.atan2(-enemy_dy, -enemy_dx)
+        mx = my_x + math.cos(angle_away) * 350
+        my_ = my_y + math.sin(angle_away) * 350
+        return (1, [my_, mx])
+    
+    # Orbit unpredictably
+    t = game_time
+    # Sharp direction changes instead of smooth sine
+    rapid = 1.0 if int(t / 300) % 2 == 0 else -1.0
+    jitter = math.sin(t * 0.031) * 0.3
+    orbit_angle = angle_to_enemy + (math.pi / 2) * (rapid + jitter)
+    mx = my_x + math.cos(orbit_angle) * 300
+    my_ = my_y + math.sin(orbit_angle) * 300
+    return (1, [my_, mx])
+```
+
+The key changes from the current policy:
+1. **R fires every 3rd tick (phase 0)** instead of every 12th tick (tick%4==0 AND phase 1). Much more R damage.
+2. **E aggressive engage at hp_advantage > 0.1** (was 0.2). More frequent E→Q combos.
+3. **Sharper orbiting** - binary direction switch every 300ms instead of smooth sine. Harder to predict.
+4. **R is primary damage in phase 0**, Q is filler in phase 1.
+5. **W used as filler** when Q has been cast.
+
+This should significantly increase DPS while maintaining dodging capability.

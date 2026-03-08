@@ -261,22 +261,7 @@ spell - Spell Option, Point
 </example>
 """
 
-SPEED = "<priority value='LIFE AND DEATH' Crucially, limit your thinking to under 1000 words. We want fast iteration.</priority>"
-TRAINING_PROMPT = lambda current_policy, data: f"""
-You are T1 Faker, the best league of legends player in the world.
-
-You are observing the behaviour of an autonomous League of Legends scripting bot.
-The bot is currently acting on a hand-crafted python based policy.
-You will be provided the observations, actions and calculated reward for each timestep in game.
-
-You must improve the policy of the agent based on its gathered experience playing the game.
-You must determine instances where either its reward dropped immediately, or it performed
-an action later down the line which caused its reward to drop (getting hit by an enemy projectile,
-dying, etc.)
-
-{SPEED}
-
-<reward-shaping>
+REWARD_SHAPING = """<reward-shaping>
 def calc_reward(self, last_obs, obs):
   # Returns the cumulative reward for an observation.
 
@@ -383,7 +368,36 @@ def calc_reward(self, last_obs, obs):
   
   # print("Reward:", reward, end = "\n\n")
   return reward
-</reward-shaping>
+</reward-shaping>"""
+REWARD_SHAPING = ""
+SPEED = "<priority value='LIFE AND DEATH' Crucially, limit your thinking to under 4000 words. We want fast iteration.</priority>"
+TRAINING_PROMPT = lambda current_policy, data, history: f"""
+You are T1 Faker, the best league of legends player in the world.
+
+You are observing the behaviour of an autonomous League of Legends scripting bot.
+The bot is currently acting on a hand-crafted python based policy.
+You will be provided the observations, actions and calculated reward for each timestep in game.
+
+You must improve the policy of the agent based on its gathered experience playing the game.
+You must determine instances where either its reward dropped immediately, or it performed
+an action later down the line which caused its reward to drop (getting hit by an enemy projectile,
+dying, etc.). The objective of the task is to gain the most reward possible AND to kill the enemy
+champion WITHOUT being killed ourselves. PRIORITISE ATTEMPTING TO KILL THE ENEMY CHAMPION FIRST.
+
+You must also utilise the <history></history> section which contains the <thinking/> history during
+the entire optimisation process. This contains descriptions, corrections and other observations
+of agent behaviour during the training process. You *MUST* use this information to avoid cyclically
+updating your policy and forgetting parts of the policy which have already been learned.
+You must also use the most recent game data you have been given AS WELL AS the information contained
+in <history/>.
+
+<game_context priority="CRUCIAL">
+- Cooldowns are disabled (meaning there are no cooldowns) during this demo.
+</game_context>
+
+{SPEED}
+
+{REWARD_SHAPING}
 
 <observation-spec>
 {OBSERVATION_SCHEMA}
@@ -400,6 +414,10 @@ def calc_reward(self, last_obs, obs):
 <experience>
 {data}
 </experience>
+
+<history>
+{history}
+</history>
 
 <example>
 <thinking>
@@ -566,7 +584,8 @@ class Policy():
     print("\n=== SENDING TO MODEL ===")
     print("Compressed Data Sample:", compressed_data.split('\n')[:2])  # First 2 observations
     
-    prompt = TRAINING_PROMPT(self._policy, compressed_data)
+    history = "\n---\n".join(open(f).read() for f in sorted(__import__("glob").glob("./checkpoints/*_thinking.txt")))
+    prompt = TRAINING_PROMPT(self._policy, compressed_data, history)
     print("\nPrompt Length:", len(prompt))
     print("Prompt Preview:", prompt[:500], "...\n")  # First 500 chars
     
@@ -639,12 +658,12 @@ feature_map_size = 16000
 feature_move_range = 8
 player_list = "Ezreal.BLUE,Ezreal.PURPLE" # Comma-separated list of `Player.Team`
 map = "Old Summoners Rift" # ["New Summoners Rift", "Howling Abyss"]
-max_steps = 1000 # 100 steps / 4 obs_per_sec := 25 seconds
 max_episodes = 3 # When set to 0, ignores this variable
 host = "127.0.1.1"
 config_path = "./config_dirs.txt"
 obs_sec = 4
 max_steps_per_episode = 100 # 100 steps := 25 secs
+max_steps = max_episodes * max_steps_per_episode  # 100 steps / 4 obs_per_sec := 25 seconds
 # run_client = False
 # TRAIN = True
 

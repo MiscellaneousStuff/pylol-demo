@@ -1,0 +1,204 @@
+<thinking>
+Let me analyze the experience data carefully:
+
+1. **The bot starts at (6350,6350), enemy at (1300,1300)** - they're far apart (~7000 units)
+2. **The bot slowly approaches** - position changes gradually toward enemy
+3. **At T2528, first projectiles appear** - both Q's fired, and at T2761 both drop to 86% HP (both got hit)
+4. **After that initial exchange, HP barely changes** - goes from 86% to ~91% over time (natural regen), meaning the bot IS dodging projectiles somewhat
+5. **But the bot NEVER CASTS ANY ABILITIES after the initial exchange** - This is the critical problem!
+
+Looking at the projectile data more carefully: After T3518, there are always 4 projectiles (2 pairs of Q's from each side). The bot's Q and W projectiles AND enemy projectiles are all visible. The dx/dy values on many enemy projectiles are large negative numbers (already past the bot), meaning they already missed.
+
+**Key Issues:**
+1. **The bot stopped casting abilities entirely after the first exchange** - It's only dodging/moving. Enemy dist stays around 500-800 range but the bot never casts Q, W, or R.
+2. Looking at the policy: when `nearby_projectiles` exist (which is ALWAYS since there are always projectiles flying around from both sides), it enters the dodge block and NEVER gets to the attack code. The dodge check at distance < 900 catches everything.
+3. The bot E-shifts away when projectiles are < 400, which teleports it far away, then it has to re-approach.
+4. The enemy is slowly regenerating HP while we don't deal damage.
+
+**Root Cause Analysis:**
+- The projectile filter `distance_to_me < 900` is too generous - it catches projectiles that have already passed or aren't threatening
+- The bot needs to distinguish between projectiles heading TOWARD it vs already past it
+- The bot should be able to attack AND dodge - not just dodge exclusively
+- With NO COOLDOWNS, the bot should be spamming Q/W constantly while dodging
+
+**What the ideal Ezreal play looks like:**
+1. Maintain ~700-900 range (Q range is ~1150)
+2. Spam Q constantly (no cooldowns!)
+3. Use W to mark, then Q to proc it for bonus damage
+4. Sidestep enemy Q's by moving perpendicular
+5. Use E to dodge only critical skillshots, or to reposition aggressively
+6. Use R when enemy is low
+
+**Key fixes needed:**
+1. Filter projectiles better - only dodge ones actually heading toward us and close
+2. Cast Q/W EVERY frame if possible, not just when no projectiles exist
+3. Interleave attacking and dodging - cast spells TOWARD enemy while moving to dodge
+4. The bot should prioritize casting Q even while dodging
+5. Maintain proper range - not too close, not too far
+
+Let me check the projectile data: `p["dx_to_me"]` and `p["dy_to_me"]` represent direction from me to projectile. If a projectile is at dx=500, it's 500 units to my right. But the projectile is MOVING - we need to know if it's coming toward us.
+
+Actually, looking at the observation spec: "dx/dy shows direction relative to player" and "Negative dx means projectile moving left". Wait, looking again at the spec more carefully:
+
+For projectiles: `[owner,dx,dy,speed,name]` where dx/dy is direction relative to player. But in the observation dict, we have `dx_to_me` and `dy_to_me` which likely means the vector FROM the projectile TO me (or from me to projectile).
+
+Looking at the data: At T2528, projectile has dx=398, dy=255 - the projectile is 398 right and 255 above me. Over time these values decrease as the projectile approaches. When they go negative, the projectile has passed.
+
+So to determine if a projectile is threatening, I should check:
+- Is it getting closer? (distance decreasing)
+- Is it within a cone heading toward me?
+
+Actually, a simpler approach: check if the projectile's position vector (dx, dy) dotted with its velocity gives a negative number (meaning it's moving toward us). But we don't have explicit velocity... 
+
+Let me think differently. The projectile dx_to_me/dy_to_me gives the vector from my position to the projectile. If the projectile is moving toward me, the magnitude of this vector should be decreasing. But we only have one snapshot.
+
+Better approach: A projectile is threatening if it's within some distance AND we can estimate if it's heading our way. Since we know the projectile's name and its position relative to us, and enemy Ezreal Q travels in a line from enemy to a target location...
+
+Actually, let me simplify. The key insight is: **the bot should prioritize attacking over dodging**. Since cooldowns are disabled, every tick we don't cast Q is wasted DPS. The bot should:
+1. Always try to cast Q at the enemy
+2. Between Q casts, move to dodge
+3. Only use E to dodge truly threatening projectiles
+
+Let me also check: are there projectiles from MY team (my_team==1)? The filter already handles this with `my_team == 0`.
+
+Looking at T3750: `PROJ[1073741854,-108,51,2000,EzrealMysticShot]` - this projectile is at dx=-108, meaning it's slightly to my left and past me. The `1073741854` could be team 0 (enemy). But the filter checks `my_team == 0`.
+
+The main issue is clear: **the bot gets stuck in the dodge loop and never attacks**. With 4 projectiles always flying around, `nearby_projectiles` is never empty.
+
+New strategy:
+1. **ALWAYS cast Q toward enemy as first priority** (since no cooldowns, maximum DPS)
+2. If Q was just cast, move to dodge
+3. Only dodge projectiles that are actually close AND heading toward us
+4. Use tighter projectile threat detection (< 400 distance AND approaching)
+5. Maintain range of ~700-900
+
+Let me write the improved policy:
+
+```python
+def act(self, observation):
+    import math
+    
+    my_champ = next(unit for unit in observation["champ_units"] if unit["my_team"] == 1)
+    enemy_champ = next(unit for unit in observation["champ_units"] if unit["my_team"] == 0)
+    
+    my_hp_pct = my_champ["current_hp"] / max(my_champ["max_hp"], 1)
+    enemy_hp_pct = enemy_champ["current_hp"] / max(enemy_champ["max_hp"], 1)
+    my_x = my_champ["position"]["X"]
+    my_y = my_champ["position"]["Y"]
+    enemy_dx = enemy_champ["dx_to_me"]
+    enemy_dy = enemy_champ["dy_to_me"]
+    enemy_dist = enemy_champ["distance_to_me"]
+    enemy_x = enemy_champ["position"]["X"]
+    enemy_y = enemy_champ["position"]["Y"]
+    
+    q_ready = my_champ["q_cooldown"] == 0
+    w_ready = my_champ["w_cooldown"] == 0
+    e_ready = my_champ["e_cooldown"] == 0
+    r_ready = my_champ["r_cooldown"] == 0
+    
+    # Filter for ACTUALLY threatening projectiles
+    # Only consider enemy projectiles that are close and likely heading toward us
+    threatening_projectiles = []
+    for p in observation["projectiles"]:
+        if p["my_team"] == 0:
+            dist = p["distance_to_me"]
+            dx = p["dx_to_me"]
+            dy = p["dy_to_me"]
+            # A projectile is threatening if it's close and the vector from us to it
+            # is small (meaning it's near us and could hit us)
+            # Only worry about very close projectiles
+            if dist < 350:
+                threatening_projectiles.append(p)
+    
+    # PRIORITY 1: ALWAYS CAST Q when in range (no cooldowns = spam!)
+    # Ezreal Q range is ~1150. Cast it aggressively.
+    if enemy_dist < 1100 and q_ready:
+        # Lead the target slightly - aim at where they might be
+        # For now, just aim directly at them
+        return (2, [[0], [enemy_y, enemy_x]])
+    
+    # PRIORITY 2: Cast W for extra damage when in range
+    if enemy_dist < 1000 and w_ready:
+        return (2, [[1], [enemy_y, enemy_x]])
+    
+    # PRIORITY 3: Use R if enemy is low
+    if r_ready and enemy_hp_pct < 0.3:
+        return (2, [[3], [enemy_y, enemy_x]])
+    
+    # PRIORITY 4: Dodge very close projectiles
+    if threatening_projectiles:
+        closest_proj = min(threatening_projectiles, key=lambda p: p["distance_to_me"])
+        proj_dx = closest_proj["dx_to_me"]
+        proj_dy = closest_proj["dy_to_me"]
+        
+        # Move perpendicular to the projectile direction
+        perp_dx = -proj_dy
+        perp_dy = proj_dx
+        mag = math.sqrt(perp_dx**2 + perp_dy**2)
+        if mag > 0:
+            perp_dx /= mag
+            perp_dy /= mag
+        
+        dodge_dist = 300
+        dodge_x = my_x + perp_dx * dodge_dist
+        dodge_y = my_y + perp_dy * dodge_dist
+        
+        # Use E to dodge only if projectile is EXTREMELY close
+        if closest_proj["distance_to_me"] < 200 and e_ready:
+            # E away perpendicular
+            e_x = my_x + perp_dx * 475
+            e_y = my_y + perp_dy * 475
+            return (2, [[2], [e_y, e_x]])
+        
+        return (1, [dodge_y, dodge_x])
+    
+    # PRIORITY 5: Positioning
+    # Maintain optimal range of ~800 for consistent Q hits while having dodge room
+    optimal_range = 800
+    
+    if enemy_dist < 400:
+        # Too close, back off
+        angle_away = math.atan2(-enemy_dy, -enemy_dx)
+        move_x = my_x + math.cos(angle_away) * 350
+        move_y = my_y + math.sin(angle_away) * 350
+        return (1, [move_y, move_x])
+    
+    if enemy_dist > 1000:
+        # Too far, approach at an angle to be harder to hit
+        angle_to = math.atan2(enemy_dy, enemy_dx)
+        # Add perpendicular component for juking
+        juke = math.sin(observation["game_time"] * 0.005) * math.pi / 4
+        move_angle = angle_to + juke
+        move_x = my_x + math.cos(move_angle) * 300
+        move_y = my_y + math.sin(move_angle) * 300
+        return (1, [move_y, move_x])
+    
+    # At good range - orbit/juke to dodge skillshots
+    angle_to = math.atan2(enemy_dy, enemy_dx)
+    # Rapid direction changes to make us hard to predict
+    t = observation["game_time"]
+    # Fast oscillation for juking
+    juke_dir = 1 if int(t / 300) % 2 == 0 else -1
+    orbit_angle = angle_to + (math.pi / 2) * juke_dir
+    move_x = my_x + math.cos(orbit_angle) * 250
+    move_y = my_y + math.sin(orbit_angle) * 250
+    return (1, [move_y, move_x])
+```
+
+Wait, I need to reconsider. Looking at the experience data more carefully:
+
+The issue is that after the initial Q exchange at T2528, the bot's HP stays at 86-91% and slowly recovers. The ENEMY is also at 86-91%. So neither side is dealing damage after the initial exchange. The bot is stuck in a loop of dodging without ever casting.
+
+The fix is clear: **PRIORITIZE CASTING Q OVER EVERYTHING ELSE** (except maybe dodging a projectile that's about to hit you in the next 0.1 seconds).
+
+Since cooldowns are disabled, we should be casting Q literally every single game tick. The action system probably has some animation lock, but we should try to cast Q as often as possible.
+
+Also I notice the bot drifts further and further from the enemy - positions go from ~6350 to ~7300 over time, while enemy seems to stay near their starting area. The bot is orbiting away instead of staying in range.
+
+Let me also reconsider: Maybe the threshold for threatening should be even tighter, or I should just not dodge at all and focus purely on DPS. In a mirror match with no cooldowns, the one who lands more Qs wins. If we spam Q every frame, we'll deal way more damage than we take.
+
+Actually wait - the experience shows both at nearly equal HP throughout, meaning NEITHER is landing abilities. The bot fired Q once, got hit once, and then stopped fighting entirely. The priority should absolutely be:
+
+1. Spam Q (and W) at enemy every single tick
+2. Juke/move between casts
+3. Only dodge if something is literally on top of us

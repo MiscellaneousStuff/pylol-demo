@@ -1,0 +1,23 @@
+Looking at the experience data, I can see several critical issues:
+
+1. **Both champions are Ezreal** (mirror match) - I can see EzrealMysticShot projectiles.
+
+2. **The bot is walking straight at the enemy** - My position goes from (6350,6350) toward the enemy at ~(1300,1300), steadily approaching. The enemy position relative to me starts at ~(1300,1300) dx/dy and shrinks to (30,30).
+
+3. **HP drops from 100% to 6%** - The bot is getting hit by every single Q (EzrealMysticShot) because it walks in a straight line directly toward the enemy. Both champions trade evenly since they walk at each other.
+
+4. **The current policy is bizarre** - It alternates between moving toward enemy and casting Q based on game_time modulo. The position format is also wrong - it passes `[enemy_champ_x, enemy_champ_y]` but the action spec says Point is `(y, x)`.
+
+5. **No dodging at all** - Multiple projectiles are visible in observations but the bot never tries to dodge them. The projectiles have positive dx/dy values (coming toward me) and the bot walks right into them.
+
+6. **The bot never uses W, E, R** - Only Q is cast occasionally via the modulo logic.
+
+Key improvements needed:
+- **Dodge projectiles** - Move perpendicular to incoming projectiles
+- **Use all abilities** - W (Essence Flux), E (Arcane Shift for mobility/dodge), R (Trueshot Barrage)
+- **Don't walk in a straight line** - Juke/wiggle to avoid skillshots
+- **Maintain proper range** - Don't walk directly on top of the enemy
+- **Fix coordinate ordering** - Actions use (y, x) format
+- **Spam abilities since cooldowns are disabled** - This is huge! No cooldowns means we should be casting Q constantly while dodging
+
+Since cooldowns are disabled, the optimal strategy is to spam Q while dodging enemy Q's. E can be used for repositioning/dodging. We should maintain a range where we can hit Q but also have time to react to enemy Q.

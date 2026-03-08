@@ -1,0 +1,22 @@
+Looking at the experience data, I see critical problems:
+
+1. **The bot NEVER casts any abilities or attacks** - HP stays at 100% for both sides until around T3000 when both start taking damage. The bot has 0 kills, 0 deaths, and 35 gold throughout the entire 22+ second episode.
+
+2. **The bot is stuck in an orbit/dodge loop** - There are always 4 projectiles visible (likely from both sides' Q/W casts), and the bot keeps dodging instead of fighting. The projectiles with owner `1073741854` appear to be enemy, `1073741853` appear to be ours. But the bot never seems to actually cast - the projectiles appear and both sides trade symmetrically.
+
+3. **Enemy distance is huge** - The enemy dx/dy values show distances of 500-900+ in each axis, meaning total distance ~700-1200. Yet the bot keeps orbiting instead of casting Q (range 1150).
+
+4. **Key issue from history**: The bot's projectile filtering was preventing it from approaching. The projectiles always exist within the dodge radius, causing perpetual dodge behavior that prevents attacking.
+
+5. **The bot's Q casts do land sometimes** (HP drops for enemy too), but it's symmetric - both lose HP equally, meaning no dodging advantage.
+
+**Fixes needed:**
+- **Filter projectiles better** - only dodge ones actually moving TOWARD us (dot product check)
+- **PRIORITIZE casting Q** - Ezreal Q is the primary damage tool, cast it whenever available at enemy
+- **Use W for extra damage**
+- **Actually approach the enemy** - current distance management keeps the bot too far
+- **Use E offensively or defensively** - Arcane Shift for repositioning
+- **Kite properly** - cast Q then move, don't just orbit
+- **Low HP retreat** needs to be more aggressive (use E to escape)
+
+The fundamental problem: The bot keeps dodging projectiles that are far away or already past, instead of attacking. I need to make attacking the TOP priority when abilities are available, and only dodge projectiles that are genuinely close AND moving toward us.

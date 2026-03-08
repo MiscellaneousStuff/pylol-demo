@@ -1,0 +1,35 @@
+Looking at the experience data carefully:
+
+1. **T0-T2268**: Bot walks toward enemy, both at 100% HP. Distance ~5000+ units. No abilities cast during approach.
+2. **T2268**: First Q cast (both fire simultaneously). Both projectiles visible.
+3. **T2762**: Both drop to 86% HP - both got hit by Q.
+4. **T3027**: W+Q cast again. At T3524, both drop to ~72% HP.
+5. **T3754-T4513**: Another Q exchange, both drop to ~55% HP.
+6. **T4778-T5769**: Bot STOPS CASTING and just orbits. HP slowly recovers to 56-57%.
+7. **T5769 onwards**: Bot just orbits endlessly, never casting Q again. Both HP slowly regenerate.
+
+**Critical Problem**: After the initial exchanges, the bot enters the "orbit at optimal range" code and NEVER goes back to casting Q. Looking at why:
+
+- Enemy distance stays around 500-900 range (based on dx/dy values of ~500-800)
+- The policy checks `enemy_dist < 1100` for Q - this should be true!
+- BUT there are always projectiles flying around. The policy checks projectiles BEFORE Q... wait, in the current policy Q is Priority 1 before dodge. So why isn't it casting?
+
+Looking more carefully at the enemy distance: `enemy_dx` and `enemy_dy` values are around 500-800 each, so `enemy_dist` = sqrt(500² + 700²) ≈ 860. This IS within 1100 range. So Q should fire.
+
+Wait - the issue might be that Q IS being fired but the bot is also dodging. But looking at T6000+, the bot positions oscillate back and forth rapidly with NO HP changes. The bot is casting Q but missing because both are juking, OR the Q cast isn't actually happening.
+
+Actually, looking at projectiles: after T5769 there are always 4+ projectiles from team 1073741854 (enemy) AND 1073741853 (us). So BOTH sides ARE casting! But neither is hitting because both are dodging.
+
+**The real issue**: The bot fires Q at the enemy's CURRENT position, but the enemy is also juking. The Q misses. Meanwhile the bot orbits predictably. Since enemy projectiles always exist at various distances, the dodge code rarely triggers (threshold 300), and the bot just orbits.
+
+**What needs to change**:
+1. **Lead Q shots** - Predict enemy movement, don't aim at current position
+2. **Use W+Q combo** - W marks, Q procs for bonus damage
+3. **Use R** - Ultimate is a wide beam, harder to dodge
+4. **Better movement** - More unpredictable juking, not a simple orbit pattern
+5. **E aggressively** - Use E to reposition for guaranteed Q hits at close range
+6. **Cast more spells per frame** - We should be casting Q AND W constantly since no cooldowns
+
+The orbit period is `int(game_time / 250)` which flips every 250ms - that's very predictable. Enemy can easily predict this.
+
+**Strategy**: Since both keep dodging Qs, use R (wide beam, harder to dodge) and W (marks enemy for bonus damage on next hit). Use E aggressively to close distance and land point-blank Q. Vary movement unpredictably.

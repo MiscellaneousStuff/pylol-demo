@@ -1,0 +1,13 @@
+Looking at the experience data, the critical issue is clear:
+
+1. **The bot NEVER casts any spells** - Q0W0E0R0 throughout the entire 24+ second episode. Both champions stay at ~83-87% HP with 0 kills, 0 deaths, 35 gold. The bot is completely passive.
+
+2. **The bot just orbits at ~500-800 range** without ever attacking. Enemy distance (computed from dx/dy) is consistently 400-900 units, well within Q range (1050) and often within auto range (550).
+
+3. **Why no spells?** Looking at the policy flow: the `threatening_proj` check with `pdist < 350` is catching projectiles every frame. There are ALWAYS 4+ projectiles visible (both teams' Q and W projectiles persist in observations). Many have distances 200-400, triggering the dodge every single tick and preventing spell casts.
+
+4. **The dodge is the ONLY thing executing** - the bot perpetually dodges and never reaches the spell casting code because projectile dodge is Priority 0.
+
+5. **From history**: This exact problem has been identified repeatedly - dodge blocking spell casts. The fix must: (a) only dodge truly threatening projectiles, (b) ensure spells get cast by alternating cast/move, (c) check projectile approach direction.
+
+**Key fix**: Restructure priorities so spell casting happens BEFORE dodge (or interleaved). Only dodge projectiles that are genuinely close (<250) and approaching. Cast Q every other tick, move on alternate ticks. The `should_attack` toggle (tick_count % 2) was the right idea but the threatening_proj check at line ~100 runs first and returns before reaching it.

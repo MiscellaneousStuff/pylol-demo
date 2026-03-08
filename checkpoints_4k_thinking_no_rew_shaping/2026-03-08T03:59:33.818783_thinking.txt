@@ -1,0 +1,30 @@
+Looking at the latest experience data:
+
+1. **T0-T754**: Bot at (6350,6350), enemy at (1300,1300). Distance ~7100. Bot moves to (6685,6685) by T523.
+2. **T1018**: First projectiles appear. Bot still at (6685,6685).
+3. **T1511**: Enemy drops to 86% - our Q/R hit! We're still at 100%.
+4. **T1772**: MASSIVE HP DROP - we go from 100% to 51%! Enemy also at 51%. Got hit by R.
+5. **T2264**: Enemy drops to 33%! We stay at 51%. Our damage is landing.
+6. **T2756**: We drop to 37%, enemy at 34%. Getting hit by more projectiles.
+7. **T3281**: Enemy at 20%, we at 38%. We're winning!
+8. **T3509**: We drop to 20%, enemy at 21%. Now even again.
+9. **T4005-T7778**: Both at ~20-22%. Bot orbits but neither finishes the other. HP slowly regens.
+
+**Key problems:**
+
+1. **Bot doesn't move at all during T0-T1772** - stands still at (6685,6685) getting hit by everything. The Q-first priority means it casts Q every tick and NEVER moves/dodges.
+2. **After getting low HP, bot orbits but never finishes enemy** - enemy at 20% but we can't kill them.
+3. **The aggressive E engage (hp_advantage > 0.2)** triggered early but then both ended up equally low.
+4. **Projectile dodge never triggers** because Q is always Priority 0 and always ready (no cooldowns). The bot casts Q EVERY tick and never reaches the dodge code.
+
+**ROOT CAUSE**: With no cooldowns, Q is ALWAYS ready. Since Q is Priority 0, the bot ALWAYS returns Q cast and NEVER dodges. It's a stationary turret getting hit by everything.
+
+**Fix**: We MUST interleave Q casting with movement/dodging. Use tick-based alternation: cast Q on some ticks, move/dodge on others. Also, dodge should take priority over Q when projectiles are very close.
+
+**Strategy:**
+- Tick % 3 == 0: Cast Q (every 3rd tick ≈ 750ms)
+- Tick % 3 == 1: Cast W or R
+- Tick % 3 == 2: Move/dodge
+- BUT override to dodge if projectile is < 400 distance regardless of tick
+- When HP advantage > 20%, use E aggressively then Q
+- R every ~4 ticks for burst damage (wider beam = easier to hit)

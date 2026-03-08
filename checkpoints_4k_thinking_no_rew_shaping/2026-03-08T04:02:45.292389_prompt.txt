@@ -1,0 +1,1718 @@
+
+You are T1 Faker, the best league of legends player in the world.
+
+You are observing the behaviour of an autonomous League of Legends scripting bot.
+The bot is currently acting on a hand-crafted python based policy.
+You will be provided the observations, actions and calculated reward for each timestep in game.
+
+You must improve the policy of the agent based on its gathered experience playing the game.
+You must determine instances where either its reward dropped immediately, or it performed
+an action later down the line which caused its reward to drop (getting hit by an enemy projectile,
+dying, etc.)
+
+You must also utilise the <history></history> section which contains the <thinking/> history during
+the entire optimisation process. This contains descriptions, corrections and other observations
+of agent behaviour during the training process. You *MUST* use this information to avoid cyclically
+updating your policy and forgetting parts of the policy which have already been learned.
+You must also use the most recent game data you have been given AS WELL AS the information contained
+in <history/>.
+
+<game_context priority="CRUCIAL">
+- Cooldowns are disabled (meaning there are no cooldowns) during this demo.
+</game_context>
+
+<priority value='LIFE AND DEATH' Crucially, limit your thinking to under 4000 words. We want fast iteration.</priority>
+
+
+
+<observation-spec>
+
+The observation data represents a League of Legends game state. Let me explain the key parts:
+
+1. Time Format (T{seconds}):
+   Shows game time in seconds
+   
+2. Champion State (ME/ENY):
+   - Health/Mana as percentages
+   - Position as (y, x) coordinates
+   - Level and gold
+   - Kills/Deaths
+   
+3. Ability Status (QWER):
+   - Cooldowns in seconds
+   - 0 means ability is ready
+   
+4. Projectiles (PROJ):
+   - Each [owner,dx,dy,speed,name]
+   - dx/dy shows direction relative to player
+   - Negative dx means projectile moving left
+   - Negative dy means projectile moving down
+   
+5. Available Actions (ACT):
+   - List of currently possible actions
+   - move: Can move
+   - auto: Can auto attack
+   - q/w/e/r: Can cast abilities
+
+For example:
+T12262|ME80,100,(9553,9271),L1,G35,K0D0|Q0W0E0R0|ENY50,80,(333,36),L1|PROJ[1234,-100,50,2000,EzQ]|ACT[move,q]
+
+This shows:
+- 12262 seconds into game
+- I'm at 80% HP, full mana, position (9553,9271)
+- Level 1, 35 gold, no kills/deaths
+- All abilities ready (0 cooldown)
+- Enemy at 50% HP, 80% mana, 333 units right and 36 units up
+- One enemy projectile moving left and slightly up
+
+This format preserves all tactical information while being much more compact than raw JSON.
+
+</observation-spec>
+
+<action-spec>
+
+<spell_options>
+SPELL_OPTIONS = (
+    ("Q", 0),
+    ("W", 1),
+    ("E", 2),
+    ("R", 3),
+    ("Sum1", 4),
+    ("Sum2", 5)
+)
+</spell_options>
+<action_ids>
+0 - no_op
+1 - move
+2 - spell
+</action_ids>
+<arg_type>
+Point - (y, x) (Range between 0 and 16000 inclusive)
+</arg_type>
+<action_args>
+no_op - None
+move  - Point (y, x)
+spell - Spell Option, Point
+</action_args>
+
+<example>
+<action_name>spell</action_name>
+<action_id>2</action_id>
+<action_args>
+[[0],[0, 8000]]
+</action_args>
+</example>
+
+</action-spec>
+
+<current-policy>
+def act(self, observation):
+    import math
+
+    my_champ = next(unit for unit in observation["champ_units"] if unit["my_team"] == 1)
+    enemy_champ = next(unit for unit in observation["champ_units"] if unit["my_team"] == 0)
+
+    my_hp_pct = my_champ["current_hp"] / max(my_champ["max_hp"], 1)
+    enemy_hp_pct = enemy_champ["current_hp"] / max(enemy_champ["max_hp"], 1)
+    my_x = my_champ["position"]["X"]
+    my_y = my_champ["position"]["Y"]
+    enemy_dx = enemy_champ["dx_to_me"]
+    enemy_dy = enemy_champ["dy_to_me"]
+    enemy_dist = enemy_champ["distance_to_me"]
+    enemy_x = enemy_champ["position"]["X"]
+    enemy_y = enemy_champ["position"]["Y"]
+
+    q_ready = my_champ["q_cooldown"] == 0
+    w_ready = my_champ["w_cooldown"] == 0
+    e_ready = my_champ["e_cooldown"] == 0
+    r_ready = my_champ["r_cooldown"] == 0
+
+    game_time = observation["game_time"]
+    angle_to_enemy = math.atan2(enemy_dy, enemy_dx)
+    hp_advantage = my_hp_pct - enemy_hp_pct
+
+    # Filter for truly threatening enemy projectiles
+    threatening = []
+    for p in observation["projectiles"]:
+        if p["my_team"] == 0:
+            dist = p["distance_to_me"]
+            pdx = p["dx_to_me"]
+            pdy = p["dy_to_me"]
+            if dist < 400:
+                dot = pdx * enemy_dx + pdy * enemy_dy
+                if dot > 0 or dist < 200:
+                    threatening.append(p)
+
+    # OVERRIDE PRIORITY: Dodge very close projectiles ALWAYS (even over casting)
+    if threatening:
+        closest = min(threatening, key=lambda p: p["distance_to_me"])
+        pdx = closest["dx_to_me"]
+        pdy = closest["dy_to_me"]
+        perp_x = -pdy
+        perp_y = pdx
+        mag = math.sqrt(perp_x ** 2 + perp_y ** 2)
+        if mag > 0:
+            perp_x /= mag
+            perp_y /= mag
+
+        # E dodge only for extremely close projectiles
+        if closest["distance_to_me"] < 200 and e_ready:
+            e_x = my_x + perp_x * 475
+            e_y = my_y + perp_y * 475
+            return (2, [[2], [e_y, e_x]])
+
+        dodge_x = my_x + perp_x * 350
+        dodge_y = my_y + perp_y * 350
+        return (1, [dodge_y, dodge_x])
+
+    # Use tick-based phase to interleave casting and movement
+    # This prevents the bot from standing still spamming every tick
+    tick = int(game_time / 250)
+    phase = tick % 3  # 0=R/Q, 1=Q/W, 2=move
+
+    # AGGRESSIVE MODE: When we have HP advantage > 10%, use E to engage for point-blank Q
+    if hp_advantage > 0.1 and e_ready and enemy_dist > 400 and enemy_dist < 1500:
+        e_target_dist = min(475, enemy_dist - 150)
+        e_x = my_x + math.cos(angle_to_enemy) * e_target_dist
+        e_y = my_y + math.sin(angle_to_enemy) * e_target_dist
+        return (2, [[2], [e_y, e_x]])
+
+    # Phase 0: Cast R (wide beam, hard to dodge) as primary damage, Q as fallback
+    if phase == 0:
+        if r_ready:
+            return (2, [[3], [enemy_y, enemy_x]])
+        if q_ready and enemy_dist < 1100:
+            return (2, [[0], [enemy_y, enemy_x]])
+
+    # Phase 1: Cast Q for consistent damage, W for mark
+    if phase == 1:
+        if q_ready and enemy_dist < 1100:
+            return (2, [[0], [enemy_y, enemy_x]])
+        if w_ready and enemy_dist < 1000:
+            return (2, [[1], [enemy_y, enemy_x]])
+        # Fallback: R if nothing else
+        if r_ready:
+            return (2, [[3], [enemy_y, enemy_x]])
+
+    # Phase 2 (and fallback): Movement and positioning
+    # Use E to close gap when very far
+    if e_ready and enemy_dist > 1300 and my_hp_pct > 0.25:
+        e_x = my_x + math.cos(angle_to_enemy) * 475
+        e_y = my_y + math.sin(angle_to_enemy) * 475
+        return (2, [[2], [e_y, e_x]])
+
+    # Far away: rush toward enemy with juke
+    if enemy_dist > 1000:
+        juke = math.sin(game_time * 0.011) * math.pi / 4
+        move_angle = angle_to_enemy + juke
+        mx = my_x + math.cos(move_angle) * 400
+        my_ = my_y + math.sin(move_angle) * 400
+        return (1, [my_, mx])
+
+    # Too close: kite back
+    if enemy_dist < 350:
+        angle_away = math.atan2(-enemy_dy, -enemy_dx)
+        mx = my_x + math.cos(angle_away) * 350
+        my_ = my_y + math.sin(angle_away) * 350
+        return (1, [my_, mx])
+
+    # Optimal range (350-1000): sharp unpredictable orbiting
+    # Binary direction flip every 300ms instead of smooth sine for harder prediction
+    t = game_time
+    rapid_dir = 1.0 if int(t / 300) % 2 == 0 else -1.0
+    jitter = math.sin(t * 0.031) * 0.3
+    orbit_angle = angle_to_enemy + (math.pi / 2) * (rapid_dir + jitter)
+    mx = my_x + math.cos(orbit_angle) * 300
+    my_ = my_y + math.sin(orbit_angle) * 300
+    return (1, [my_, mx])
+</current-policy>
+
+<experience>
+T33|ME88,100,(26,280),L1,G35,K0D0|Q0W0E0R0|ENY88,100,(13901,13895),L1|PROJ|ACT[no_op,move,auto,spell_0,spell_1,spell_2,spell_3,spell_4,spell_5]
+T0|ME100,100,(6350,6350),L1,G35,K0D0|Q0W0E0R0|ENY100,100,(1300,1300),L1|PROJ|ACT[no_op,move,auto,spell_0,spell_1,spell_2,spell_3,spell_4,spell_5]
+T263|ME100,100,(6350,6350),L1,G35,K0D0|Q0W0E0R0|ENY100,100,(1300,1300),L1|PROJ|ACT[no_op,move,auto,spell_0,spell_1,spell_2,spell_3,spell_4,spell_5]
+T526|ME100,100,(6350,6350),L1,G35,K0D0|Q0W0E0R0|ENY100,100,(1300,1300),L1|PROJ|ACT[no_op,move,auto,spell_0,spell_1,spell_2,spell_3,spell_4,spell_5]
+T756|ME100,100,(6350,6350),L1,G35,K0D0|Q0W0E0R0|ENY100,100,(1300,1300),L1|PROJ|ACT[no_op,move,auto,spell_0,spell_1,spell_2,spell_3,spell_4,spell_5]
+T1018|ME100,100,(6685,6685),L1,G35,K0D0|Q0W0E0R0|ENY100,100,(629,629),L1|PROJ|ACT[no_op,move,auto,spell_0,spell_1,spell_2,spell_3,spell_4,spell_5]
+T1280|ME100,100,(6685,6685),L1,G35,K0D0|Q0W0E0R0|ENY100,100,(629,629),L1|PROJ[1073741854,629,629,2000,EzrealTrueshotBarrage][1073741853,0,0,2000,EzrealTrueshotBarrage]|ACT[no_op,move,auto,spell_0,spell_1,spell_2,spell_3,spell_4,spell_5]
+T1509|ME100,100,(6708,6614),L1,G35,K0D0|Q0W0E0R0|ENY100,100,(581,770),L1|PROJ[1073741854,281,375,2000,EzrealTrueshotBarrage][1073741853,300,395,2000,EzrealTrueshotBarrage]|ACT[no_op,move,auto,spell_0,spell_1,spell_2,spell_3,spell_4,spell_5]
+T1770|ME64,100,(6735,6533),L1,G35,K0D0|Q0W0E0R0|ENY64,100,(528,931),L1|PROJ[1073741854,256,512,2000,EzrealMysticShot][1073741853,272,419,2000,EzrealMysticShot][1073741854,-115,86,2000,EzrealTrueshotBarrage][1073741853,643,845,2000,EzrealTrueshotBarrage]|ACT[no_op,move,auto,spell_0,spell_1,spell_2,spell_3,spell_4,spell_5]
+T2000|ME64,100,(6660,6533),L1,G35,K0D0|Q0W0E0R0|ENY64,100,(677,931),L1|PROJ[1073741854,33,162,2000,EzrealMysticShot][1073741853,643,768,2000,EzrealMysticShot][1073741854,-364,-237,2000,EzrealTrueshotBarrage][1073741853,1042,1169,2000,EzrealTrueshotBarrage]|ACT[no_op,move,auto,spell_0,spell_1,spell_2,spell_3,spell_4,spell_5]
+T2264|ME51,100,(6575,6533),L1,G35,K0D0|Q0W0E0R0|ENY51,100,(849,931),L1|PROJ[1073741854,-652,-611,2000,EzrealTrueshotBarrage][1073741853,1501,1542,2000,EzrealTrueshotBarrage][1073741854,452,600,2000,EzrealMysticShot][1073741853,396,331,2000,EzrealMysticShot]|ACT[no_op,move,auto,spell_0,spell_1,spell_2,spell_3,spell_4,spell_5]
+T2528|ME51,100,(6536,6456),L1,G35,K0D0|Q0W0E0R0|ENY51,100,(925,1085),L1|PROJ[1073741854,-987,-908,2000,EzrealTrueshotBarrage][1073741853,1913,1993,2000,EzrealTrueshotBarrage][1073741854,122,297,2000,EzrealMysticShot][1073741853,803,787,2000,EzrealMysticShot]|ACT[no_op,move,auto,spell_0,spell_1,spell_2,spell_3,spell_4,spell_5]
+T2757|ME51,100,(6536,6456),L1,G35,K0D0|Q0W0E0R0|ENY51,100,(925,1085),L1|PROJ[1073741854,-1311,-1231,2000,EzrealTrueshotBarrage][1073741853,2237,2316,2000,EzrealTrueshotBarrage][1073741854,-13,157,2000,EzrealMysticShot][1073741853,939,927,2000,EzrealMysticShot]|ACT[no_op,move,auto,spell_0,spell_1,spell_2,spell_3,spell_4,spell_5]
+T3019|ME51,100,(6574,6380),L1,G35,K0D0|Q0W0E0R0|ENY51,100,(849,1237),L1|PROJ[1073741854,-1720,-1526,2000,EzrealTrueshotBarrage][1073741853,2570,2764,2000,EzrealTrueshotBarrage][1073741854,-50,234,2000,EzrealMysticShot][1073741853,900,1003,2000,EzrealMysticShot]|ACT[no_op,move,auto,spell_0,spell_1,spell_2,spell_3,spell_4,spell_5]
+T3281|ME51,100,(6416,6063),L1,G35,K0D0|Q0W0E0R0|ENY51,100,(1166,1872),L1|PROJ[1073741854,-1932,-1579,2000,EzrealTrueshotBarrage][1073741853,3099,3452,2000,EzrealTrueshotBarrage][1073741854,109,553,2000,EzrealMysticShot][1073741853,1057,1319,2000,EzrealMysticShot]|ACT[no_op,move,auto,spell_0,spell_1,spell_2,spell_3,spell_4,spell_5]
+T3512|ME51,100,(6345,6039),L1,G35,K0D0|Q0W0E0R0|ENY51,100,(1308,1919),L1|PROJ[1073741854,-2187,-1881,2000,EzrealTrueshotBarrage][1073741853,3496,3802,2000,EzrealTrueshotBarrage][1073741854,224,622,2000,EzrealMysticShot][1073741853,1084,1297,2000,EzrealMysticShot]|ACT[no_op,move,auto,spell_0,spell_1,spell_2,spell_3,spell_4,spell_5]
+T3774|ME51,100,(6371,6120),L1,G35,K0D0|Q0W0E0R0|ENY51,100,(1254,1757),L1|PROJ[1073741854,-2585,-2333,2000,EzrealTrueshotBarrage][1073741853,3840,4092,2000,EzrealTrueshotBarrage][1073741854,197,541,2000,EzrealMysticShot][1073741853,1058,1217,2000,EzrealMysticShot][1073741854,988,1472,2000,EzrealTrueshotBarrage][1073741853,265,285,2000,EzrealTrueshotBarrage]|ACT[no_op,move,auto,spell_0,spell_1,spell_2,spell_3,spell_4,spell_5]
+T4005|ME51,100,(6395,6191),L1,G35,K0D0|Q0W0E0R0|ENY51,100,(1206,1615),L1|PROJ[1073741854,-2934,-2730,2000,EzrealTrueshotBarrage][1073741853,4142,4347,2000,EzrealTrueshotBarrage][1073741854,126,422,2000,EzrealMysticShot][1073741853,1081,1194,2000,EzrealMysticShot][1073741854,674,1043,2000,EzrealTrueshotBarrage][1073741853,532,571,2000,EzrealTrueshotBarrage]|ACT[no_op,move,auto,spell_0,spell_1,spell_2,spell_3,spell_4,spell_5]
+T4268|ME52,100,(6374,6274),L1,G35,K0D0|Q0W0E0R0|ENY52,100,(1248,1449),L1|PROJ[1073741854,-3286,-3185,2000,EzrealTrueshotBarrage][1073741853,4535,4636,2000,EzrealTrueshotBarrage][1073741854,148,340,2000,EzrealMysticShot][1073741853,1101,1110,2000,EzrealMysticShot][1073741854,362,552,2000,EzrealTrueshotBarrage][1073741853,884,897,2000,EzrealTrueshotBarrage]|ACT[no_op,move,auto,spell_0,spell_1,spell_2,spell_3,spell_4,spell_5]
+T4530|ME17,100,(6395,6357),L1,G35,K0D0|Q0W0E0R0|ENY17,100,(1206,1283),L1|PROJ[1073741854,-3678,-3640,2000,EzrealTrueshotBarrage][1073741853,4886,4925,2000,EzrealTrueshotBarrage][1073741854,127,257,2000,EzrealMysticShot][1073741853,1080,1027,2000,EzrealMysticShot][1073741854,10,62,2000,EzrealTrueshotBarrage][1073741853,1195,1222,2000,EzrealTrueshotBarrage]|ACT[no_op,move,auto,spell_0,spell_1,spell_2,spell_3,spell_4,spell_5]
+T4761|ME17,100,(6395,6282),L1,G35,K0D0|Q0W0E0R0|ENY17,100,(1206,1433),L1|PROJ[1073741854,-4004,-3891,2000,EzrealTrueshotBarrage][1073741853,5212,5325,2000,EzrealTrueshotBarrage][1073741854,173,379,2000,EzrealMysticShot][1073741853,1034,1055,2000,EzrealMysticShot][1073741854,-280,-220,2000,EzrealTrueshotBarrage][1073741853,1486,1655,2000,EzrealTrueshotBarrage]|ACT[no_op,move,auto,spell_0,spell_1,spell_2,spell_3,spell_4,spell_5]
+T5024|ME17,100,(6395,6196),L1,G35,K0D0|Q0W0E0R0|ENY17,100,(1206,1604),L1|PROJ[1073741854,-4375,-4177,2000,EzrealTrueshotBarrage][1073741853,5583,5782,2000,EzrealTrueshotBarrage][1073741854,172,463,2000,EzrealMysticShot][1073741853,1035,1141,2000,EzrealMysticShot][1073741854,-611,-542,2000,EzrealTrueshotBarrage][1073741853,1817,2147,2000,EzrealTrueshotBarrage]|ACT[no_op,move,auto,spell_0,spell_1,spell_2,spell_3,spell_4,spell_5]
+T5254|ME17,100,(6466,6220),L1,G35,K0D0|Q0W0E0R0|ENY17,100,(1064,1557),L1|PROJ[1073741854,-4771,-4525,2000,EzrealTrueshotBarrage][1073741853,5838,6084,2000,EzrealTrueshotBarrage][1073741854,54,392,2000,EzrealMysticShot][1073741853,1011,1165,2000,EzrealMysticShot][1073741854,-972,-923,2000,EzrealTrueshotBarrage][1073741853,2036,2481,2000,EzrealTrueshotBarrage]|ACT[no_op,move,auto,spell_0,spell_1,spell_2,spell_3,spell_4,spell_5]
+T5516|ME17,100,(6445,6303),L1,G35,K0D0|Q0W0E0R0|ENY17,100,(1106,1391),L1|PROJ[1073741854,-5122,-4979,2000,EzrealTrueshotBarrage][1073741853,6229,6372,2000,EzrealTrueshotBarrage][1073741854,75,309,2000,EzrealMysticShot][1073741853,1032,1083,2000,EzrealMysticShot][1073741854,-1282,-1413,2000,EzrealTrueshotBarrage][1073741853,2388,2805,2000,EzrealTrueshotBarrage]|ACT[no_op,move,auto,spell_0,spell_1,spell_2,spell_3,spell_4,spell_5]
+T5779|ME17,100,(6369,6264),L1,G35,K0D0|Q0W0E0R0|ENY17,100,(1259,1468),L1|PROJ[1073741854,-5418,-5313,2000,EzrealTrueshotBarrage][1073741853,6678,6783,2000,EzrealTrueshotBarrage][1073741854,151,346,2000,EzrealMysticShot][1073741853,1109,1122,2000,EzrealMysticShot][1073741854,-1538,-1783,2000,EzrealTrueshotBarrage][1073741853,2796,3252,2000,EzrealTrueshotBarrage]|ACT[no_op,move,auto,spell_0,spell_1,spell_2,spell_3,spell_4,spell_5]
+T6010|ME17,100,(6335,6197),L1,G35,K0D0|Q0W0E0R0|ENY17,100,(1326,1602),L1|PROJ[1073741854,-5710,-5572,2000,EzrealTrueshotBarrage][1073741853,7037,7175,2000,EzrealTrueshotBarrage][1073741854,229,459,2000,EzrealMysticShot][1073741853,1098,1143,2000,EzrealMysticShot][1073741854,-1795,-2074,2000,EzrealTrueshotBarrage][1073741853,3120,3677,2000,EzrealTrueshotBarrage]|ACT[no_op,move,auto,spell_0,spell_1,spell_2,spell_3,spell_4,spell_5]
+T6272|ME17,100,(6335,6112),L1,G35,K0D0|Q0W0E0R0|ENY17,100,(1326,1772),L1|PROJ[1073741854,-6081,-5858,2000,EzrealTrueshotBarrage][1073741853,7408,7632,2000,EzrealTrueshotBarrage][1073741854,228,544,2000,EzrealMysticShot][1073741853,1098,1229,2000,EzrealMysticShot][1073741854,-2126,-2396,2000,EzrealTrueshotBarrage][1073741853,3451,4169,2000,EzrealTrueshotBarrage]|ACT[no_op,move,auto,spell_0,spell_1,spell_2,spell_3,spell_4,spell_5]
+T6503|ME17,100,(6354,6185),L1,G35,K0D0|Q0W0E0R0|ENY17,100,(1289,1626),L1|PROJ[1073741854,-6427,-6258,2000,EzrealTrueshotBarrage][1073741853,7718,7886,2000,EzrealTrueshotBarrage][1073741854,163,423,2000,EzrealMysticShot][1073741853,1127,1204,2000,EzrealMysticShot][1073741854,-2436,-2828,2000,EzrealTrueshotBarrage][1073741853,3725,4456,2000,EzrealTrueshotBarrage]|ACT[no_op,move,auto,spell_0,spell_1,spell_2,spell_3,spell_4,spell_5]
+T6767|ME17,100,(6374,6268),L1,G35,K0D0|Q0W0E0R0|ENY17,100,(1248,1460),L1|PROJ[1073741854,-6819,-6713,2000,EzrealTrueshotBarrage][1073741853,8069,8175,2000,EzrealTrueshotBarrage][1073741854,142,339,2000,EzrealMysticShot][1073741853,1106,1121,2000,EzrealMysticShot][1073741854,-2789,-3319,2000,EzrealTrueshotBarrage][1073741853,4036,4781,2000,EzrealTrueshotBarrage]|ACT[no_op,move,auto,spell_0,spell_1,spell_2,spell_3,spell_4,spell_5]
+T7029|ME17,100,(6435,6329),L1,G35,K0D0|Q0W0E0R0|ENY17,100,(1127,1339),L1|PROJ[1073741854,-7251,-7145,2000,EzrealTrueshotBarrage][1073741853,8380,8486,2000,EzrealTrueshotBarrage][1073741854,83,280,2000,EzrealMysticShot][1073741853,1045,1060,2000,EzrealMysticShot][1073741854,-3181,-3787,2000,EzrealTrueshotBarrage][1073741853,4306,5128,2000,EzrealTrueshotBarrage]|ACT[no_op,move,auto,spell_0,spell_1,spell_2,spell_3,spell_4,spell_5]
+T7259|ME17,100,(6435,6254),L1,G35,K0D0|Q0W0E0R0|ENY17,100,(1127,1489),L1|PROJ[1073741854,-7576,-7395,2000,EzrealTrueshotBarrage][1073741853,8705,8885,2000,EzrealTrueshotBarrage][1073741854,130,403,2000,EzrealMysticShot][1073741853,998,1086,2000,EzrealMysticShot][1073741854,-3470,-4068,2000,EzrealTrueshotBarrage][1073741853,4596,5559,2000,EzrealTrueshotBarrage]|ACT[no_op,move,auto,spell_0,spell_1,spell_2,spell_3,spell_4,spell_5]
+T7521|ME17,100,(6435,6169),L1,G35,K0D0|Q0W0E0R0|ENY17,100,(1127,1659),L1|PROJ[1073741854,-7947,-7681,2000,EzrealTrueshotBarrage][1073741853,9076,9342,2000,EzrealTrueshotBarrage][1073741854,130,489,2000,EzrealMysticShot][1073741853,998,1171,2000,EzrealMysticShot][1073741854,-3801,-4390,2000,EzrealTrueshotBarrage][1073741853,4927,6052,2000,EzrealTrueshotBarrage]|ACT[no_op,move,auto,spell_0,spell_1,spell_2,spell_3,spell_4,spell_5]
+T7751|ME17,100,(6417,6241),L1,G35,K0D0|Q0W0E0R0|ENY17,100,(1163,1514),L1|PROJ[1073741854,-8253,-8078,2000,EzrealTrueshotBarrage][1073741853,9419,9594,2000,EzrealTrueshotBarrage][1073741854,104,371,2000,EzrealMysticShot][1073741853,1060,1144,2000,EzrealMysticShot][1073741854,-4073,-4819,2000,EzrealTrueshotBarrage][1073741853,5235,6336,2000,EzrealTrueshotBarrage]|ACT[no_op,move,auto,spell_0,spell_1,spell_2,spell_3,spell_4,spell_5]
+T8013|ME17,100,(6455,6317),L1,G35,K0D0|Q0W0E0R0|ENY17,100,(1087,1362),L1|PROJ[1073741854,-8663,-8526,2000,EzrealTrueshotBarrage][1073741853,9752,9889,2000,EzrealTrueshotBarrage][1073741854,67,295,2000,EzrealMysticShot][1073741853,1021,1067,2000,EzrealMysticShot][1073741854,-4442,-5303,2000,EzrealTrueshotBarrage][1073741853,5527,6667,2000,EzrealTrueshotBarrage]|ACT[no_op,move,auto,spell_0,spell_1,spell_2,spell_3,spell_4,spell_5]
+T8277|ME17,100,(6416,6241),L1,G35,K0D0|Q0W0E0R0|ENY17,100,(1164,1515),L1|PROJ[1073741854,-8997,-8822,2000,EzrealTrueshotBarrage][1073741853,10163,10338,2000,EzrealTrueshotBarrage][1073741854,104,371,2000,EzrealMysticShot][1073741853,1060,1145,2000,EzrealMysticShot][1073741854,-4737,-5635,2000,EzrealTrueshotBarrage][1073741853,5898,7153,2000,EzrealTrueshotBarrage]|ACT[no_op,move,auto,spell_0,spell_1,spell_2,spell_3,spell_4,spell_5]
+T8507|ME17,100,(6383,6174),L1,G35,K0D0|Q0W0E0R0|ENY17,100,(1231,1649),L1|PROJ[1073741854,-9289,-9080,2000,EzrealTrueshotBarrage][1073741853,10522,10731,2000,EzrealTrueshotBarrage][1073741854,184,485,2000,EzrealMysticShot][1073741853,1048,1164,2000,EzrealMysticShot][1073741854,-4994,-5926,2000,EzrealTrueshotBarrage][1073741853,6222,7577,2000,EzrealTrueshotBarrage]|ACT[no_op,move,auto,spell_0,spell_1,spell_2,spell_3,spell_4,spell_5]
+T8770|ME18,100,(6345,6097),L1,G35,K0D0|Q0W0E0R0|ENY18,100,(1307,1802),L1|PROJ[1073741854,-9623,-9376,2000,EzrealTrueshotBarrage][1073741853,10932,11179,2000,EzrealTrueshotBarrage][1073741854,223,563,2000,EzrealMysticShot][1073741853,1085,1239,2000,EzrealMysticShot][1073741854,-5287,-6258,2000,EzrealTrueshotBarrage][1073741853,6592,8062,2000,EzrealTrueshotBarrage]|ACT[no_op,move,auto,spell_0,spell_1,spell_2,spell_3,spell_4,spell_5]
+T9032|ME18,100,(6345,6183),L1,G35,K0D0|Q0W0E0R0|ENY18,100,(1307,1631),L1|PROJ[1073741854,-9994,-9832,2000,EzrealTrueshotBarrage][1073741853,11303,11465,2000,EzrealTrueshotBarrage][1073741854,224,479,2000,EzrealMysticShot][1073741853,1084,1153,2000,EzrealMysticShot][1073741854,-5618,-6749,2000,EzrealTrueshotBarrage][1073741853,6923,8384,2000,EzrealTrueshotBarrage]|ACT[no_op,move,auto,spell_0,spell_1,spell_2,spell_3,spell_4,spell_5]
+T9262|ME18,100,(6397,6235),L1,G35,K0D0|Q0W0E0R0|ENY18,100,(1202,1526),L1|PROJ[1073741854,-10371,-10209,2000,EzrealTrueshotBarrage][1073741853,11575,11737,2000,EzrealTrueshotBarrage][1073741854,126,380,2000,EzrealMysticShot][1073741853,1076,1147,2000,EzrealMysticShot][1073741854,-5960,-7158,2000,EzrealTrueshotBarrage][1073741853,7159,8687,2000,EzrealTrueshotBarrage]|ACT[no_op,move,auto,spell_0,spell_1,spell_2,spell_3,spell_4,spell_5]
+T9524|ME18,100,(6377,6318),L1,G35,K0D0|Q0W0E0R0|ENY18,100,(1243,1360),L1|PROJ[1073741854,-10722,-10663,2000,EzrealTrueshotBarrage][1073741853,11967,12025,2000,EzrealTrueshotBarrage][1073741854,147,297,2000,EzrealMysticShot][1073741853,1097,1064,2000,EzrealMysticShot][1073741854,-6271,-7649,2000,EzrealTrueshotBarrage][1073741853,7511,9012,2000,EzrealTrueshotBarrage]|ACT[no_op,move,auto,spell_0,spell_1,spell_2,spell_3,spell_4,spell_5]
+T9754|ME18,100,(6443,6351),L1,G35,K0D0|Q0W0E0R0|ENY18,100,(1210,1394),L1|PROJ[1073741854,-11113,-11021,2000,EzrealTrueshotBarrage][1073741853,12224,12316,2000,EzrealTrueshotBarrage][1073741854,125,310,2000,EzrealMysticShot][1073741853,985,985,2000,EzrealMysticShot][1073741854,-6627,-8038,2000,EzrealTrueshotBarrage][1073741853,7734,9335,2000,EzrealTrueshotBarrage]|ACT[no_op,move,auto,spell_0,spell_1,spell_2,spell_3,spell_4,spell_5]
+T10018|ME18,100,(6471,6270),L1,G35,K0D0|Q0W0E0R0|ENY18,100,(1155,1557),L1|PROJ[1073741854,-11514,-11313,2000,EzrealTrueshotBarrage][1073741853,12571,12772,2000,EzrealTrueshotBarrage][1073741854,98,391,2000,EzrealMysticShot][1073741853,958,1066,2000,EzrealMysticShot][1073741854,-6987,-8367,2000,EzrealTrueshotBarrage][1073741853,8040,9827,2000,EzrealTrueshotBarrage]|ACT[no_op,move,auto,spell_0,spell_1,spell_2,spell_3,spell_4,spell_5]
+T10280|ME18,100,(6471,6185),L1,G35,K0D0|Q0W0E0R0|ENY18,100,(1084,1595),L1|PROJ[1073741854,-11885,-11599,2000,EzrealTrueshotBarrage][1073741853,12942,13228,2000,EzrealTrueshotBarrage][1073741854,97,476,2000,EzrealMysticShot][1073741853,959,1152,2000,EzrealMysticShot][1073741854,-7318,-8689,2000,EzrealTrueshotBarrage][1073741853,8371,10319,2000,EzrealTrueshotBarrage]|ACT[no_op,move,auto,spell_0,spell_1,spell_2,spell_3,spell_4,spell_5]
+T10510|ME18,100,(6489,6257),L1,G35,K0D0|Q0W0E0R0|ENY18,100,(1048,1450),L1|PROJ[1073741854,-12228,-11996,2000,EzrealTrueshotBarrage][1073741853,13249,13480,2000,EzrealTrueshotBarrage][1073741854,35,358,2000,EzrealMysticShot][1073741853,985,1125,2000,EzrealMysticShot][1073741854,-7626,-9117,2000,EzrealTrueshotBarrage][1073741853,8642,10603,2000,EzrealTrueshotBarrage]|ACT[no_op,move,auto,spell_0,spell_1,spell_2,spell_3,spell_4,spell_5]
+T10772|ME18,100,(6489,6342),L1,G35,K0D0|Q0W0E0R0|ENY18,100,(1028,1282),L1|PROJ[1073741854,-12598,-12452,2000,EzrealTrueshotBarrage][1073741853,13619,13766,2000,EzrealTrueshotBarrage][1073741854,34,271,2000,EzrealMysticShot][1073741853,986,1041,2000,EzrealMysticShot][1073741854,-7957,-9609,2000,EzrealTrueshotBarrage][1073741853,8972,10925,2000,EzrealTrueshotBarrage]|ACT[no_op,move,auto,spell_0,spell_1,spell_2,spell_3,spell_4,spell_5]
+T11000|ME18,100,(6422,6309),L1,G35,K0D0|Q0W0E0R0|ENY18,100,(1127,1381),L1|PROJ[1073741854,-12855,-12741,2000,EzrealTrueshotBarrage][1073741853,14008,14121,2000,EzrealTrueshotBarrage][1073741854,145,351,2000,EzrealMysticShot][1073741853,1007,1028,2000,EzrealMysticShot][1073741854,-8178,-9930,2000,EzrealTrueshotBarrage][1073741853,9327,11312,2000,EzrealTrueshotBarrage]|ACT[no_op,move,auto,spell_0,spell_1,spell_2,spell_3,spell_4,spell_5]
+T11262|ME18,100,(6384,6233),L1,G35,K0D0|Q0W0E0R0|ENY18,100,(1165,1543),L1|PROJ[1073741854,-13187,-13035,2000,EzrealTrueshotBarrage][1073741853,14416,14568,2000,EzrealTrueshotBarrage][1073741854,184,428,2000,EzrealMysticShot][1073741853,1044,1103,2000,EzrealMysticShot][1073741854,-8470,-10260,2000,EzrealTrueshotBarrage][1073741853,9695,11794,2000,EzrealTrueshotBarrage]|ACT[no_op,move,auto,spell_0,spell_1,spell_2,spell_3,spell_4,spell_5]
+T11525|ME18,100,(6384,6148),L1,G35,K0D0|Q0W0E0R0|ENY18,100,(1165,1713),L1|PROJ[1073741854,-13186,-12950,2000,EzrealTrueshotBarrage][1073741853,14416,14653,2000,EzrealTrueshotBarrage][1073741854,185,514,2000,EzrealMysticShot][1073741853,1044,1188,2000,EzrealMysticShot][1073741854,-8802,-10582,2000,EzrealTrueshotBarrage][1073741853,10026,12288,2000,EzrealTrueshotBarrage]|ACT[no_op,move,auto,spell_0,spell_1,spell_2,spell_3,spell_4,spell_5]
+T11754|ME18,100,(6366,6220),L1,G35,K0D0|Q0W0E0R0|ENY18,100,(1217,1574),L1|PROJ[1073741854,-13214,-13068,2000,EzrealTrueshotBarrage][1073741853,14480,14626,2000,EzrealTrueshotBarrage][1073741854,158,395,2000,EzrealMysticShot][1073741853,1107,1162,2000,EzrealMysticShot][1073741854,-9073,-11011,2000,EzrealTrueshotBarrage][1073741853,10333,12571,2000,EzrealTrueshotBarrage]|ACT[no_op,move,auto,spell_0,spell_1,spell_2,spell_3,spell_4,spell_5]
+T12015|ME18,100,(6426,6280),L1,G35,K0D0|Q0W0E0R0|ENY18,100,(1130,1434),L1|PROJ[1073741854,-13275,-13128,2000,EzrealTrueshotBarrage][1073741853,14420,14567,2000,EzrealTrueshotBarrage][1073741854,97,335,2000,EzrealMysticShot][1073741853,1048,1103,2000,EzrealMysticShot][1073741854,-9463,-11476,2000,EzrealTrueshotBarrage][1073741853,10603,12917,2000,EzrealTrueshotBarrage]|ACT[no_op,move,auto,spell_0,spell_1,spell_2,spell_3,spell_4,spell_5]
+T12278|ME18,100,(6447,6363),L1,G35,K0D0|Q0W0E0R0|ENY18,100,(1109,1266),L1|PROJ[1073741854,-13295,-13210,2000,EzrealTrueshotBarrage][1073741853,14399,14483,2000,EzrealTrueshotBarrage][1073741854,77,253,2000,EzrealMysticShot][1073741853,1026,1019,2000,EzrealMysticShot][1073741854,-9815,-11966,2000,EzrealTrueshotBarrage][1073741853,10913,13242,2000,EzrealTrueshotBarrage]|ACT[no_op,move,auto,spell_0,spell_1,spell_2,spell_3,spell_4,spell_5]
+T12507|ME18,100,(6447,6288),L1,G35,K0D0|Q0W0E0R0|ENY18,100,(1142,1407),L1|PROJ[1073741854,-13249,-13090,2000,EzrealTrueshotBarrage][1073741853,14353,14512,2000,EzrealTrueshotBarrage][1073741854,122,373,2000,EzrealMysticShot][1073741853,981,1047,2000,EzrealMysticShot][1073741854,-10104,-12248,2000,EzrealTrueshotBarrage][1073741853,11203,13673,2000,EzrealTrueshotBarrage]|ACT[no_op,move,auto,spell_0,spell_1,spell_2,spell_3,spell_4,spell_5]
+T12769|ME18,100,(6447,6203),L1,G35,K0D0|Q0W0E0R0|ENY18,100,(1142,1577),L1|PROJ[1073741854,-13249,-13005,2000,EzrealTrueshotBarrage][1073741853,14354,14597,2000,EzrealTrueshotBarrage][1073741854,122,458,2000,EzrealMysticShot][1073741853,982,1133,2000,EzrealMysticShot][1073741854,-10434,-12569,2000,EzrealTrueshotBarrage][1073741853,11532,14163,2000,EzrealTrueshotBarrage]|ACT[no_op,move,auto,spell_0,spell_1,spell_2,spell_3,spell_4,spell_5]
+T13030|ME18,100,(6447,6118),L1,G35,K0D0|Q0W0E0R0|ENY18,100,(1142,1747),L1|PROJ[1073741854,-13249,-12920,2000,EzrealTrueshotBarrage][1073741853,14353,14682,2000,EzrealTrueshotBarrage][1073741854,122,544,2000,EzrealMysticShot][1073741853,981,1217,2000,EzrealMysticShot][1073741854,-10764,-12890,2000,EzrealTrueshotBarrage][1073741853,11862,14655,2000,EzrealTrueshotBarrage]|ACT[no_op,move,auto,spell_0,spell_1,spell_2,spell_3,spell_4,spell_5]
+T13259|ME19,100,(6500,6171),L1,G35,K0D0|Q0W0E0R0|ENY19,100,(1037,1642),L1|PROJ[1073741854,-13347,-13018,2000,EzrealTrueshotBarrage][1073741853,14346,14674,2000,EzrealTrueshotBarrage][1073741854,25,445,2000,EzrealMysticShot][1073741853,973,1211,2000,EzrealMysticShot][1073741854,-11106,-13298,2000,EzrealTrueshotBarrage][1073741853,12099,14958,2000,EzrealTrueshotBarrage]|ACT[no_op,move,auto,spell_0,spell_1,spell_2,spell_3,spell_4,spell_5]
+T13521|ME19,100,(6462,6247),L1,G35,K0D0|Q0W0E0R0|ENY19,100,(1113,1490),L1|PROJ[1073741854,-13309,-13094,2000,EzrealTrueshotBarrage][1073741853,14384,14598,2000,EzrealTrueshotBarrage][1073741854,63,369,2000,EzrealMysticShot][1073741853,1011,1134,2000,EzrealMysticShot][1073741854,-11398,-13780,2000,EzrealTrueshotBarrage][1073741853,12466,15288,2000,EzrealTrueshotBarrage]|ACT[no_op,move,auto,spell_0,spell_1,spell_2,spell_3,spell_4,spell_5]
+T13751|ME19,100,(6495,6314),L1,G35,K0D0|Q0W0E0R0|ENY19,100,(1046,1356),L1|PROJ[1073741854,-13297,-13116,2000,EzrealTrueshotBarrage][1073741853,14305,14487,2000,EzrealTrueshotBarrage][1073741854,74,348,2000,EzrealMysticShot][1073741853,933,1022,2000,EzrealMysticShot][1073741854,-11472,-13896,2000,EzrealTrueshotBarrage][1073741853,12473,15270,2000,EzrealTrueshotBarrage]|ACT[no_op,move,auto,spell_0,spell_1,spell_2,spell_3,spell_4,spell_5]
+T14014|ME19,100,(6419,6276),L1,G35,K0D0|Q0W0E0R0|ENY19,100,(1161,1470),L1|PROJ[1073741854,-13220,-13077,2000,EzrealTrueshotBarrage][1073741853,14381,14524,2000,EzrealTrueshotBarrage][1073741854,151,387,2000,EzrealMysticShot][1073741853,1009,1059,2000,EzrealMysticShot][1073741854,-11396,-13859,2000,EzrealTrueshotBarrage][1073741853,12550,15309,2000,EzrealTrueshotBarrage]|ACT[no_op,move,auto,spell_0,spell_1,spell_2,spell_3,spell_4,spell_5]
+T14276|ME19,100,(6381,6199),L1,G35,K0D0|Q0W0E0R0|ENY19,100,(1199,1632),L1|PROJ[1073741854,-13182,-13001,2000,EzrealTrueshotBarrage][1073741853,14419,14601,2000,EzrealTrueshotBarrage][1073741854,189,463,2000,EzrealMysticShot][1073741853,1047,1136,2000,EzrealMysticShot][1073741854,-11358,-13782,2000,EzrealTrueshotBarrage][1073741853,12588,15385,2000,EzrealTrueshotBarrage]|ACT[no_op,move,auto,spell_0,spell_1,spell_2,spell_3,spell_4,spell_5]
+T14506|ME19,100,(6399,6272),L1,G35,K0D0|Q0W0E0R0|ENY19,100,(1163,1487),L1|PROJ[1073741854,-13246,-13119,2000,EzrealTrueshotBarrage][1073741853,14447,14574,2000,EzrealTrueshotBarrage][1073741854,126,344,2000,EzrealMysticShot][1073741853,1074,1110,2000,EzrealMysticShot][1073741854,-11335,-13804,2000,EzrealTrueshotBarrage][1073741853,12529,15263,2000,EzrealTrueshotBarrage]|ACT[no_op,move,auto,spell_0,spell_1,spell_2,spell_3,spell_4,spell_5]
+T14768|ME19,100,(6419,6354),L1,G35,K0D0|Q0W0E0R0|ENY19,100,(1121,1322),L1|PROJ[1073741854,-13268,-13203,2000,EzrealTrueshotBarrage][1073741853,14427,14492,2000,EzrealTrueshotBarrage][1073741854,104,260,2000,EzrealMysticShot][1073741853,1055,1028,2000,EzrealMysticShot][1073741854,-11355,-13886,2000,EzrealTrueshotBarrage][1073741853,12507,15179,2000,EzrealTrueshotBarrage]|ACT[no_op,move,auto,spell_0,spell_1,spell_2,spell_3,spell_4,spell_5]
+T15030|ME19,100,(6419,6269),L1,G35,K0D0|Q0W0E0R0|ENY19,100,(1182,1467),L1|PROJ[1073741854,-13269,-13118,2000,EzrealTrueshotBarrage][1073741853,14428,14578,2000,EzrealTrueshotBarrage][1073741854,103,345,2000,EzrealMysticShot][1073741853,1055,1114,2000,EzrealMysticShot][1073741854,-11354,-13800,2000,EzrealTrueshotBarrage][1073741853,12507,15263,2000,EzrealTrueshotBarrage]|ACT[no_op,move,auto,spell_0,spell_1,spell_2,spell_3,spell_4,spell_5]
+T15258|ME19,100,(6443,6199),L1,G35,K0D0|Q0W0E0R0|ENY19,100,(1191,1604),L1|PROJ[1073741854,-13245,-13001,2000,EzrealTrueshotBarrage][1073741853,14358,14602,2000,EzrealTrueshotBarrage][1073741854,126,463,2000,EzrealMysticShot][1073741853,986,1137,2000,EzrealMysticShot][1073741854,-11419,-13781,2000,EzrealTrueshotBarrage][1073741853,12525,15385,2000,EzrealTrueshotBarrage]|ACT[no_op,move,auto,spell_0,spell_1,spell_2,spell_3,spell_4,spell_5]
+T15521|ME19,100,(6443,6113),L1,G35,K0D0|Q0W0E0R0|ENY19,100,(1191,1775),L1|PROJ[1073741854,-13243,-12914,2000,EzrealTrueshotBarrage][1073741853,14356,14685,2000,EzrealTrueshotBarrage][1073741854,128,550,2000,EzrealMysticShot][1073741853,984,1221,2000,EzrealMysticShot][1073741854,-11421,-13697,2000,EzrealTrueshotBarrage][1073741853,12527,15472,2000,EzrealTrueshotBarrage]|ACT[no_op,move,auto,spell_0,spell_1,spell_2,spell_3,spell_4,spell_5]
+T15750|ME19,100,(6409,6180),L1,G35,K0D0|Q0W0E0R0|ENY19,100,(1243,1636),L1|PROJ[1073741854,-13255,-13026,2000,EzrealTrueshotBarrage][1073741853,14435,14664,2000,EzrealTrueshotBarrage][1073741854,116,437,2000,EzrealMysticShot][1073741853,1062,1200,2000,EzrealMysticShot][1073741854,-11347,-13714,2000,EzrealTrueshotBarrage][1073741853,12520,15356,2000,EzrealTrueshotBarrage]|ACT[no_op,move,auto,spell_0,spell_1,spell_2,spell_3,spell_4,spell_5]
+T16013|ME19,100,(6436,6261),L1,G35,K0D0|Q0W0E0R0|ENY19,100,(1178,1478),L1|PROJ[1073741854,-13282,-13107,2000,EzrealTrueshotBarrage][1073741853,14407,14583,2000,EzrealTrueshotBarrage][1073741854,90,356,2000,EzrealMysticShot][1073741853,1035,1119,2000,EzrealMysticShot][1073741854,-11374,-13796,2000,EzrealTrueshotBarrage][1073741853,12493,15275,2000,EzrealTrueshotBarrage]|ACT[no_op,move,auto,spell_0,spell_1,spell_2,spell_3,spell_4,spell_5]
+T16274|ME19,100,(6436,6346),L1,G35,K0D0|Q0W0E0R0|ENY19,100,(1157,1311),L1|PROJ[1073741854,-13283,-13192,2000,EzrealTrueshotBarrage][1073741853,14408,14498,2000,EzrealTrueshotBarrage][1073741854,89,271,2000,EzrealMysticShot][1073741853,1035,1034,2000,EzrealMysticShot][1073741854,-11374,-13880,2000,EzrealTrueshotBarrage][1073741853,12492,15189,2000,EzrealTrueshotBarrage]|ACT[no_op,move,auto,spell_0,spell_1,spell_2,spell_3,spell_4,spell_5]
+T16504|ME19,100,(6403,6279),L1,G35,K0D0|Q0W0E0R0|ENY19,100,(1190,1452),L1|PROJ[1073741854,-13204,-13080,2000,EzrealTrueshotBarrage][1073741853,14396,14519,2000,EzrealTrueshotBarrage][1073741854,167,384,2000,EzrealMysticShot][1073741853,1024,1055,2000,EzrealMysticShot][1073741854,-11381,-13863,2000,EzrealTrueshotBarrage][1073741853,12567,15306,2000,EzrealTrueshotBarrage]|ACT[no_op,move,auto,spell_0,spell_1,spell_2,spell_3,spell_4,spell_5]
+T16766|ME19,100,(6403,6194),L1,G35,K0D0|Q0W0E0R0|ENY19,100,(1163,1618),L1|PROJ[1073741854,-13203,-12994,2000,EzrealTrueshotBarrage][1073741853,14395,14603,2000,EzrealTrueshotBarrage][1073741854,168,470,2000,EzrealMysticShot][1073741853,1023,1139,2000,EzrealMysticShot][1073741854,-11382,-13779,2000,EzrealTrueshotBarrage][1073741853,12567,15392,2000,EzrealTrueshotBarrage]|ACT[no_op,move,auto,spell_0,spell_1,spell_2,spell_3,spell_4,spell_5]
+T17029|ME19,100,(6403,6280),L1,G35,K0D0|Q0W0E0R0|ENY19,100,(1163,1447),L1|PROJ[1073741854,-13203,-13079,2000,EzrealTrueshotBarrage][1073741853,14395,14518,2000,EzrealTrueshotBarrage][1073741854,168,384,2000,EzrealMysticShot][1073741853,1023,1054,2000,EzrealMysticShot][1073741854,-11382,-13865,2000,EzrealTrueshotBarrage][1073741853,12567,15307,2000,EzrealTrueshotBarrage]|ACT[no_op,move,auto,spell_0,spell_1,spell_2,spell_3,spell_4,spell_5]
+T17259|ME20,100,(6456,6333),L1,G35,K0D0|Q0W0E0R0|ENY20,100,(1058,1341),L1|PROJ[1073741854,-13302,-13179,2000,EzrealTrueshotBarrage][1073741853,14388,14512,2000,EzrealTrueshotBarrage][1073741854,70,284,2000,EzrealMysticShot][1073741853,1016,1048,2000,EzrealMysticShot][1073741854,-11393,-13866,2000,EzrealTrueshotBarrage][1073741853,12473,15203,2000,EzrealTrueshotBarrage]|ACT[no_op,move,auto,spell_0,spell_1,spell_2,spell_3,spell_4,spell_5]
+T17521|ME20,100,(6435,6415),L1,G35,K0D0|Q0W0E0R0|ENY20,100,(1099,1176),L1|PROJ[1073741854,-13282,-13262,2000,EzrealTrueshotBarrage][1073741853,14410,14430,2000,EzrealTrueshotBarrage][1073741854,89,201,2000,EzrealMysticShot][1073741853,1037,966,2000,EzrealMysticShot][1073741854,-11372,-13948,2000,EzrealTrueshotBarrage][1073741853,12493,15119,2000,EzrealTrueshotBarrage]|ACT[no_op,move,auto,spell_0,spell_1,spell_2,spell_3,spell_4,spell_5]
+T17750|ME20,100,(6435,6341),L1,G35,K0D0|Q0W0E0R0|ENY20,100,(1132,1318),L1|PROJ[1073741854,-13236,-13142,2000,EzrealTrueshotBarrage][1073741853,14364,14459,2000,EzrealTrueshotBarrage][1073741854,135,322,2000,EzrealMysticShot][1073741853,992,994,2000,EzrealMysticShot][1073741854,-11413,-13924,2000,EzrealTrueshotBarrage][1073741853,12534,15244,2000,EzrealTrueshotBarrage]|ACT[no_op,move,auto,spell_0,spell_1,spell_2,spell_3,spell_4,spell_5]
+T18012|ME20,100,(6462,6260),L1,G35,K0D0|Q0W0E0R0|ENY20,100,(1105,1483),L1|PROJ[1073741854,-13264,-13062,2000,EzrealTrueshotBarrage][1073741853,14338,14540,2000,EzrealTrueshotBarrage][1073741854,107,402,2000,EzrealMysticShot][1073741853,966,1076,2000,EzrealMysticShot][1073741854,-11439,-13842,2000,EzrealTrueshotBarrage][1073741853,12506,15324,2000,EzrealTrueshotBarrage]|ACT[no_op,move,auto,spell_0,spell_1,spell_2,spell_3,spell_4,spell_5]
+T18273|ME20,100,(6462,6175),L1,G35,K0D0|Q0W0E0R0|ENY20,100,(1105,1653),L1|PROJ[1073741854,-13264,-12977,2000,EzrealTrueshotBarrage][1073741853,14338,14625,2000,EzrealTrueshotBarrage][1073741854,107,487,2000,EzrealMysticShot][1073741853,966,1160,2000,EzrealMysticShot][1073741854,-11439,-13758,2000,EzrealTrueshotBarrage][1073741853,12506,15409,2000,EzrealTrueshotBarrage]|ACT[no_op,move,auto,spell_0,spell_1,spell_2,spell_3,spell_4,spell_5]
+T18503|ME20,100,(6480,6247),L1,G35,K0D0|Q0W0E0R0|ENY20,100,(1069,1508),L1|PROJ[1073741854,-13328,-13095,2000,EzrealTrueshotBarrage][1073741853,14365,14598,2000,EzrealTrueshotBarrage][1073741854,44,368,2000,EzrealMysticShot][1073741853,993,1134,2000,EzrealMysticShot][1073741854,-11416,-13780,2000,EzrealTrueshotBarrage][1073741853,12447,15287,2000,EzrealTrueshotBarrage]|ACT[no_op,move,auto,spell_0,spell_1,spell_2,spell_3,spell_4,spell_5]
+T18765|ME20,100,(6480,6333),L1,G35,K0D0|Q0W0E0R0|ENY20,100,(1049,1340),L1|PROJ[1073741854,-13328,-13180,2000,EzrealTrueshotBarrage][1073741853,14365,14513,2000,EzrealTrueshotBarrage][1073741854,44,283,2000,EzrealMysticShot][1073741853,993,1049,2000,EzrealMysticShot][1073741854,-11416,-13865,2000,EzrealTrueshotBarrage][1073741853,12447,15201,2000,EzrealTrueshotBarrage]|ACT[no_op,move,auto,spell_0,spell_1,spell_2,spell_3,spell_4,spell_5]
+T19027|ME20,100,(6404,6295),L1,G35,K0D0|Q0W0E0R0|ENY20,100,(1185,1439),L1|PROJ[1073741854,-13253,-13143,2000,EzrealTrueshotBarrage][1073741853,14443,14552,2000,EzrealTrueshotBarrage][1073741854,119,320,2000,EzrealMysticShot][1073741853,1070,1088,2000,EzrealMysticShot][1073741854,-11339,-13826,2000,EzrealTrueshotBarrage][1073741853,12523,15238,2000,EzrealTrueshotBarrage]|ACT[no_op,move,auto,spell_0,spell_1,spell_2,spell_3,spell_4,spell_5]
+T19256|ME20,100,(6371,6228),L1,G35,K0D0|Q0W0E0R0|ENY20,100,(1252,1572),L1|PROJ[1073741854,-13174,-13031,2000,EzrealTrueshotBarrage][1073741853,14431,14573,2000,EzrealTrueshotBarrage][1073741854,197,433,2000,EzrealMysticShot][1073741853,1059,1109,2000,EzrealMysticShot][1073741854,-11346,-13809,2000,EzrealTrueshotBarrage][1073741853,12597,15355,2000,EzrealTrueshotBarrage]|ACT[no_op,move,auto,spell_0,spell_1,spell_2,spell_3,spell_4,spell_5]
+T19518|ME20,100,(6371,6143),L1,G35,K0D0|Q0W0E0R0|ENY20,100,(1252,1742),L1|PROJ[1073741854,-13174,-12946,2000,EzrealTrueshotBarrage][1073741853,14431,14659,2000,EzrealTrueshotBarrage][1073741854,197,517,2000,EzrealMysticShot][1073741853,1059,1194,2000,EzrealMysticShot][1073741854,-11346,-13724,2000,EzrealTrueshotBarrage][1073741853,12596,15439,2000,EzrealTrueshotBarrage]|ACT[no_op,move,auto,spell_0,spell_1,spell_2,spell_3,spell_4,spell_5]
+T19780|ME20,100,(6350,6225),L1,G35,K0D0|Q0W0E0R0|ENY20,100,(1293,1577),L1|PROJ[1073741854,-13154,-13029,2000,EzrealTrueshotBarrage][1073741853,14452,14577,2000,EzrealTrueshotBarrage][1073741854,217,435,2000,EzrealMysticShot][1073741853,1080,1112,2000,EzrealMysticShot][1073741854,-11325,-13806,2000,EzrealTrueshotBarrage][1073741853,12617,15357,2000,EzrealTrueshotBarrage]|ACT[no_op,move,auto,spell_0,spell_1,spell_2,spell_3,spell_4,spell_5]
+T20008|ME20,100,(6403,6278),L1,G35,K0D0|Q0W0E0R0|ENY20,100,(1207,1458),L1|PROJ[1073741854,-13253,-13128,2000,EzrealTrueshotBarrage][1073741853,14446,14571,2000,EzrealTrueshotBarrage][1073741854,119,335,2000,EzrealMysticShot][1073741853,1073,1107,2000,EzrealMysticShot][1073741854,-11336,-13807,2000,EzrealTrueshotBarrage][1073741853,12522,15253,2000,EzrealTrueshotBarrage]|ACT[no_op,move,auto,spell_0,spell_1,spell_2,spell_3,spell_4,spell_5]
+T20271|ME20,100,(6403,6363),L1,G35,K0D0|Q0W0E0R0|ENY20,100,(1207,1287),L1|PROJ[1073741854,-13254,-13214,2000,EzrealTrueshotBarrage][1073741853,14447,14486,2000,EzrealTrueshotBarrage][1073741854,118,248,2000,EzrealMysticShot][1073741853,1074,1022,2000,EzrealMysticShot][1073741854,-11335,-13892,2000,EzrealTrueshotBarrage][1073741853,12522,15167,2000,EzrealTrueshotBarrage]|ACT[no_op,move,auto,spell_0,spell_1,spell_2,spell_3,spell_4,spell_5]
+T20500|ME20,100,(6403,6289),L1,G35,K0D0|Q0W0E0R0|ENY20,100,(1207,1437),L1|PROJ[1073741854,-13207,-13093,2000,EzrealTrueshotBarrage][1073741853,14400,14514,2000,EzrealTrueshotBarrage][1073741854,164,370,2000,EzrealMysticShot][1073741853,1028,1050,2000,EzrealMysticShot][1073741854,-11377,-13868,2000,EzrealTrueshotBarrage][1073741853,12563,15292,2000,EzrealTrueshotBarrage]|ACT[no_op,move,auto,spell_0,spell_1,spell_2,spell_3,spell_4,spell_5]
+T20763|ME20,100,(6430,6208),L1,G35,K0D0|Q0W0E0R0|ENY20,100,(1153,1599),L1|PROJ[1073741854,-13234,-13012,2000,EzrealTrueshotBarrage][1073741853,14373,14595,2000,EzrealTrueshotBarrage][1073741854,137,452,2000,EzrealMysticShot][1073741853,1001,1130,2000,EzrealMysticShot][1073741854,-11404,-13788,2000,EzrealTrueshotBarrage][1073741853,12537,15374,2000,EzrealTrueshotBarrage]|ACT[no_op,move,auto,spell_0,spell_1,spell_2,spell_3,spell_4,spell_5]
+T21024|ME20,100,(6430,6293),L1,G35,K0D0|Q0W0E0R0|ENY20,100,(1153,1429),L1|PROJ[1073741854,-13235,-13098,2000,EzrealTrueshotBarrage][1073741853,14374,14511,2000,EzrealTrueshotBarrage][1073741854,136,365,2000,EzrealMysticShot][1073741853,1002,1046,2000,EzrealMysticShot][1073741854,-11403,-13871,2000,EzrealTrueshotBarrage][1073741853,12536,15287,2000,EzrealTrueshotBarrage]|ACT[no_op,move,auto,spell_0,spell_1,spell_2,spell_3,spell_4,spell_5]
+T21254|ME20,100,(6482,6345),L1,G35,K0D0|Q0W0E0R0|ENY20,100,(1048,1323),L1|PROJ[1073741854,-13333,-13196,2000,EzrealTrueshotBarrage][1073741853,14367,14504,2000,EzrealTrueshotBarrage][1073741854,38,266,2000,EzrealMysticShot][1073741853,994,1040,2000,EzrealMysticShot][1073741854,-11415,-13874,2000,EzrealTrueshotBarrage][1073741853,12442,15185,2000,EzrealTrueshotBarrage]|ACT[no_op,move,auto,spell_0,spell_1,spell_2,spell_3,spell_4,spell_5]
+T21516|ME20,100,(6482,6260),L1,G35,K0D0|Q0W0E0R0|ENY20,100,(1068,1326),L1|PROJ[1073741854,-13335,-13113,2000,EzrealTrueshotBarrage][1073741853,14369,14591,2000,EzrealTrueshotBarrage][1073741854,37,350,2000,EzrealMysticShot][1073741853,996,1127,2000,EzrealMysticShot][1073741854,-11414,-13787,2000,EzrealTrueshotBarrage][1073741853,12441,15268,2000,EzrealTrueshotBarrage]|ACT[no_op,move,auto,spell_0,spell_1,spell_2,spell_3,spell_4,spell_5]
+T21779|ME21,100,(6444,6184),L1,G35,K0D0|Q0W0E0R0|ENY21,100,(1145,1478),L1|PROJ[1073741854,-13298,-13038,2000,EzrealTrueshotBarrage][1073741853,14408,14668,2000,EzrealTrueshotBarrage][1073741854,74,425,2000,EzrealMysticShot][1073741853,1035,1205,2000,EzrealMysticShot][1073741854,-11375,-13709,2000,EzrealTrueshotBarrage][1073741853,12478,15343,2000,EzrealTrueshotBarrage]|ACT[no_op,move,auto,spell_0,spell_1,spell_2,spell_3,spell_4,spell_5]
+T22008|ME21,100,(6378,6150),L1,G35,K0D0|Q0W0E0R0|ENY21,100,(1188,1582),L1|PROJ[1073741854,-13185,-12958,2000,EzrealTrueshotBarrage][1073741853,14428,14655,2000,EzrealTrueshotBarrage][1073741854,186,506,2000,EzrealMysticShot][1073741853,1056,1190,2000,EzrealMysticShot][1073741854,-11350,-13727,2000,EzrealTrueshotBarrage][1073741853,12586,15428,2000,EzrealTrueshotBarrage]|ACT[no_op,move,auto,spell_0,spell_1,spell_2,spell_3,spell_4,spell_5]
+T22270|ME21,100,(6405,6231),L1,G35,K0D0|Q0W0E0R0|ENY21,100,(1134,1582),L1|PROJ[1073741854,-13211,-13038,2000,EzrealTrueshotBarrage][1073741853,14400,14573,2000,EzrealTrueshotBarrage][1073741854,160,426,2000,EzrealMysticShot][1073741853,1028,1109,2000,EzrealMysticShot][1073741854,-11377,-13809,2000,EzrealTrueshotBarrage][1073741853,12560,15348,2000,EzrealTrueshotBarrage]|ACT[no_op,move,auto,spell_0,spell_1,spell_2,spell_3,spell_4,spell_5]
+T22500|ME21,100,(6423,6304),L1,G35,K0D0|Q0W0E0R0|ENY21,100,(1098,1437),L1|PROJ[1073741854,-13275,-13156,2000,EzrealTrueshotBarrage][1073741853,14428,14547,2000,EzrealTrueshotBarrage][1073741854,97,307,2000,EzrealMysticShot][1073741853,1055,1083,2000,EzrealMysticShot][1073741854,-11355,-13831,2000,EzrealTrueshotBarrage][1073741853,12501,15225,2000,EzrealTrueshotBarrage]|ACT[no_op,move,auto,spell_0,spell_1,spell_2,spell_3,spell_4,spell_5]
+T22761|ME21,100,(6443,6386),L1,G35,K0D0|Q0W0E0R0|ENY21,100,(1077,1270),L1|PROJ[1073741854,-13295,-13238,2000,EzrealTrueshotBarrage][1073741853,14406,14464,2000,EzrealTrueshotBarrage][1073741854,77,225,2000,EzrealMysticShot][1073741853,1034,1000,2000,EzrealMysticShot][1073741854,-11376,-13914,2000,EzrealTrueshotBarrage][1073741853,12481,15144,2000,EzrealTrueshotBarrage]|ACT[no_op,move,auto,spell_0,spell_1,spell_2,spell_3,spell_4,spell_5]
+T23024|ME21,100,(6443,6301),L1,G35,K0D0|Q0W0E0R0|ENY21,100,(1153,1393),L1|PROJ[1073741854,-13296,-13153,2000,EzrealTrueshotBarrage][1073741853,14408,14550,2000,EzrealTrueshotBarrage][1073741854,76,309,2000,EzrealMysticShot][1073741853,1035,1086,2000,EzrealMysticShot][1073741854,-11375,-13827,2000,EzrealTrueshotBarrage][1073741853,12480,15228,2000,EzrealTrueshotBarrage]|ACT[no_op,move,auto,spell_0,spell_1,spell_2,spell_3,spell_4,spell_5]
+T23253|ME21,100,(6467,6230),L1,G35,K0D0|Q0W0E0R0|ENY21,100,(1163,1531),L1|PROJ[1073741854,-13272,-13035,2000,EzrealTrueshotBarrage][1073741853,14337,14573,2000,EzrealTrueshotBarrage][1073741854,99,428,2000,EzrealMysticShot][1073741853,965,1109,2000,EzrealMysticShot][1073741854,-11441,-13809,2000,EzrealTrueshotBarrage][1073741853,12498,15350,2000,EzrealTrueshotBarrage]|ACT[no_op,move,auto,spell_0,spell_1,spell_2,spell_3,spell_4,spell_5]
+T23515|ME21,100,(6429,6154),L1,G35,K0D0|Q0W0E0R0|ENY21,100,(1201,1692),L1|PROJ[1073741854,-13234,-12959,2000,EzrealTrueshotBarrage][1073741853,14374,14649,2000,EzrealTrueshotBarrage][1073741854,137,505,2000,EzrealMysticShot][1073741853,1002,1184,2000,EzrealMysticShot][1073741854,-11403,-13733,2000,EzrealTrueshotBarrage][1073741853,12537,15427,2000,EzrealTrueshotBarrage]|ACT[no_op,move,auto,spell_0,spell_1,spell_2,spell_3,spell_4,spell_5]
+T23777|ME21,100,(6391,6230),L1,G35,K0D0|Q0W0E0R0|ENY21,100,(1260,1533),L1|PROJ[1073741854,-13194,-13034,2000,EzrealTrueshotBarrage][1073741853,14411,14571,2000,EzrealTrueshotBarrage][1073741854,177,430,2000,EzrealMysticShot][1073741853,1039,1107,2000,EzrealMysticShot][1073741854,-11366,-13811,2000,EzrealTrueshotBarrage][1073741853,12576,15352,2000,EzrealTrueshotBarrage]|ACT[no_op,move,auto,spell_0,spell_1,spell_2,spell_3,spell_4,spell_5]
+T24007|ME21,100,(6424,6297),L1,G35,K0D0|Q0W0E0R0|ENY21,100,(1174,1413),L1|PROJ[1073741854,-13273,-13146,2000,EzrealTrueshotBarrage][1073741853,14423,14550,2000,EzrealTrueshotBarrage][1073741854,99,317,2000,EzrealMysticShot][1073741853,1050,1086,2000,EzrealMysticShot][1073741854,-11359,-13828,2000,EzrealTrueshotBarrage][1073741853,12502,15236,2000,EzrealTrueshotBarrage]|ACT[no_op,move,auto,spell_0,spell_1,spell_2,spell_3,spell_4,spell_5]
+T24268|ME21,100,(6424,6382),L1,G35,K0D0|Q0W0E0R0|ENY21,100,(1174,1243),L1|PROJ[1073741854,-13273,-13231,2000,EzrealTrueshotBarrage][1073741853,14423,14465,2000,EzrealTrueshotBarrage][1073741854,99,232,2000,EzrealMysticShot][1073741853,1050,1001,2000,EzrealMysticShot][1073741854,-11359,-13913,2000,EzrealTrueshotBarrage][1073741853,12503,15151,2000,EzrealTrueshotBarrage]|ACT[no_op,move,auto,spell_0,spell_1,spell_2,spell_3,spell_4,spell_5]
+T24529|ME21,100,(6424,6297),L1,G35,K0D0|Q0W0E0R0|ENY21,100,(1174,1413),L1|PROJ[1073741854,-13272,-13145,2000,EzrealTrueshotBarrage][1073741853,14422,14549,2000,EzrealTrueshotBarrage][1073741854,100,318,2000,EzrealMysticShot][1073741853,1049,1085,2000,EzrealMysticShot][1073741854,-11360,-13829,2000,EzrealTrueshotBarrage][1073741853,12503,15237,2000,EzrealTrueshotBarrage]|ACT[no_op,move,auto,spell_0,spell_1,spell_2,spell_3,spell_4,spell_5]
+</experience>
+
+<history>
+Looking at the experience data, I can see several critical issues:
+
+1. **Both champions are Ezreal** (mirror match) - I can see EzrealMysticShot projectiles.
+
+2. **The bot is walking straight at the enemy** - My position goes from (6350,6350) toward the enemy at ~(1300,1300), steadily approaching. The enemy position relative to me starts at ~(1300,1300) dx/dy and shrinks to (30,30).
+
+3. **HP drops from 100% to 6%** - The bot is getting hit by every single Q (EzrealMysticShot) because it walks in a straight line directly toward the enemy. Both champions trade evenly since they walk at each other.
+
+4. **The current policy is bizarre** - It alternates between moving toward enemy and casting Q based on game_time modulo. The position format is also wrong - it passes `[enemy_champ_x, enemy_champ_y]` but the action spec says Point is `(y, x)`.
+
+5. **No dodging at all** - Multiple projectiles are visible in observations but the bot never tries to dodge them. The projectiles have positive dx/dy values (coming toward me) and the bot walks right into them.
+
+6. **The bot never uses W, E, R** - Only Q is cast occasionally via the modulo logic.
+
+Key improvements needed:
+- **Dodge projectiles** - Move perpendicular to incoming projectiles
+- **Use all abilities** - W (Essence Flux), E (Arcane Shift for mobility/dodge), R (Trueshot Barrage)
+- **Don't walk in a straight line** - Juke/wiggle to avoid skillshots
+- **Maintain proper range** - Don't walk directly on top of the enemy
+- **Fix coordinate ordering** - Actions use (y, x) format
+- **Spam abilities since cooldowns are disabled** - This is huge! No cooldowns means we should be casting Q constantly while dodging
+
+Since cooldowns are disabled, the optimal strategy is to spam Q while dodging enemy Q's. E can be used for repositioning/dodging. We should maintain a range where we can hit Q but also have time to react to enemy Q.
+---
+<thinking>
+Let me analyze the experience data carefully:
+
+1. **The bot starts at (6350,6350), enemy at (1300,1300)** - they're far apart (~7000 units)
+2. **The bot slowly approaches** - position changes gradually toward enemy
+3. **At T2528, first projectiles appear** - both Q's fired, and at T2761 both drop to 86% HP (both got hit)
+4. **After that initial exchange, HP barely changes** - goes from 86% to ~91% over time (natural regen), meaning the bot IS dodging projectiles somewhat
+5. **But the bot NEVER CASTS ANY ABILITIES after the initial exchange** - This is the critical problem!
+
+Looking at the projectile data more carefully: After T3518, there are always 4 projectiles (2 pairs of Q's from each side). The bot's Q and W projectiles AND enemy projectiles are all visible. The dx/dy values on many enemy projectiles are large negative numbers (already past the bot), meaning they already missed.
+
+**Key Issues:**
+1. **The bot stopped casting abilities entirely after the first exchange** - It's only dodging/moving. Enemy dist stays around 500-800 range but the bot never casts Q, W, or R.
+2. Looking at the policy: when `nearby_projectiles` exist (which is ALWAYS since there are always projectiles flying around from both sides), it enters the dodge block and NEVER gets to the attack code. The dodge check at distance < 900 catches everything.
+3. The bot E-shifts away when projectiles are < 400, which teleports it far away, then it has to re-approach.
+4. The enemy is slowly regenerating HP while we don't deal damage.
+
+**Root Cause Analysis:**
+- The projectile filter `distance_to_me < 900` is too generous - it catches projectiles that have already passed or aren't threatening
+- The bot needs to distinguish between projectiles heading TOWARD it vs already past it
+- The bot should be able to attack AND dodge - not just dodge exclusively
+- With NO COOLDOWNS, the bot should be spamming Q/W constantly while dodging
+
+**What the ideal Ezreal play looks like:**
+1. Maintain ~700-900 range (Q range is ~1150)
+2. Spam Q constantly (no cooldowns!)
+3. Use W to mark, then Q to proc it for bonus damage
+4. Sidestep enemy Q's by moving perpendicular
+5. Use E to dodge only critical skillshots, or to reposition aggressively
+6. Use R when enemy is low
+
+**Key fixes needed:**
+1. Filter projectiles better - only dodge ones actually heading toward us and close
+2. Cast Q/W EVERY frame if possible, not just when no projectiles exist
+3. Interleave attacking and dodging - cast spells TOWARD enemy while moving to dodge
+4. The bot should prioritize casting Q even while dodging
+5. Maintain proper range - not too close, not too far
+
+Let me check the projectile data: `p["dx_to_me"]` and `p["dy_to_me"]` represent direction from me to projectile. If a projectile is at dx=500, it's 500 units to my right. But the projectile is MOVING - we need to know if it's coming toward us.
+
+Actually, looking at the observation spec: "dx/dy shows direction relative to player" and "Negative dx means projectile moving left". Wait, looking again at the spec more carefully:
+
+For projectiles: `[owner,dx,dy,speed,name]` where dx/dy is direction relative to player. But in the observation dict, we have `dx_to_me` and `dy_to_me` which likely means the vector FROM the projectile TO me (or from me to projectile).
+
+Looking at the data: At T2528, projectile has dx=398, dy=255 - the projectile is 398 right and 255 above me. Over time these values decrease as the projectile approaches. When they go negative, the projectile has passed.
+
+So to determine if a projectile is threatening, I should check:
+- Is it getting closer? (distance decreasing)
+- Is it within a cone heading toward me?
+
+Actually, a simpler approach: check if the projectile's position vector (dx, dy) dotted with its velocity gives a negative number (meaning it's moving toward us). But we don't have explicit velocity... 
+
+Let me think differently. The projectile dx_to_me/dy_to_me gives the vector from my position to the projectile. If the projectile is moving toward me, the magnitude of this vector should be decreasing. But we only have one snapshot.
+
+Better approach: A projectile is threatening if it's within some distance AND we can estimate if it's heading our way. Since we know the projectile's name and its position relative to us, and enemy Ezreal Q travels in a line from enemy to a target location...
+
+Actually, let me simplify. The key insight is: **the bot should prioritize attacking over dodging**. Since cooldowns are disabled, every tick we don't cast Q is wasted DPS. The bot should:
+1. Always try to cast Q at the enemy
+2. Between Q casts, move to dodge
+3. Only use E to dodge truly threatening projectiles
+
+Let me also check: are there projectiles from MY team (my_team==1)? The filter already handles this with `my_team == 0`.
+
+Looking at T3750: `PROJ[1073741854,-108,51,2000,EzrealMysticShot]` - this projectile is at dx=-108, meaning it's slightly to my left and past me. The `1073741854` could be team 0 (enemy). But the filter checks `my_team == 0`.
+
+The main issue is clear: **the bot gets stuck in the dodge loop and never attacks**. With 4 projectiles always flying around, `nearby_projectiles` is never empty.
+
+New strategy:
+1. **ALWAYS cast Q toward enemy as first priority** (since no cooldowns, maximum DPS)
+2. If Q was just cast, move to dodge
+3. Only dodge projectiles that are actually close AND heading toward us
+4. Use tighter projectile threat detection (< 400 distance AND approaching)
+5. Maintain range of ~700-900
+
+Let me write the improved policy:
+
+```python
+def act(self, observation):
+    import math
+    
+    my_champ = next(unit for unit in observation["champ_units"] if unit["my_team"] == 1)
+    enemy_champ = next(unit for unit in observation["champ_units"] if unit["my_team"] == 0)
+    
+    my_hp_pct = my_champ["current_hp"] / max(my_champ["max_hp"], 1)
+    enemy_hp_pct = enemy_champ["current_hp"] / max(enemy_champ["max_hp"], 1)
+    my_x = my_champ["position"]["X"]
+    my_y = my_champ["position"]["Y"]
+    enemy_dx = enemy_champ["dx_to_me"]
+    enemy_dy = enemy_champ["dy_to_me"]
+    enemy_dist = enemy_champ["distance_to_me"]
+    enemy_x = enemy_champ["position"]["X"]
+    enemy_y = enemy_champ["position"]["Y"]
+    
+    q_ready = my_champ["q_cooldown"] == 0
+    w_ready = my_champ["w_cooldown"] == 0
+    e_ready = my_champ["e_cooldown"] == 0
+    r_ready = my_champ["r_cooldown"] == 0
+    
+    # Filter for ACTUALLY threatening projectiles
+    # Only consider enemy projectiles that are close and likely heading toward us
+    threatening_projectiles = []
+    for p in observation["projectiles"]:
+        if p["my_team"] == 0:
+            dist = p["distance_to_me"]
+            dx = p["dx_to_me"]
+            dy = p["dy_to_me"]
+            # A projectile is threatening if it's close and the vector from us to it
+            # is small (meaning it's near us and could hit us)
+            # Only worry about very close projectiles
+            if dist < 350:
+                threatening_projectiles.append(p)
+    
+    # PRIORITY 1: ALWAYS CAST Q when in range (no cooldowns = spam!)
+    # Ezreal Q range is ~1150. Cast it aggressively.
+    if enemy_dist < 1100 and q_ready:
+        # Lead the target slightly - aim at where they might be
+        # For now, just aim directly at them
+        return (2, [[0], [enemy_y, enemy_x]])
+    
+    # PRIORITY 2: Cast W for extra damage when in range
+    if enemy_dist < 1000 and w_ready:
+        return (2, [[1], [enemy_y, enemy_x]])
+    
+    # PRIORITY 3: Use R if enemy is low
+    if r_ready and enemy_hp_pct < 0.3:
+        return (2, [[3], [enemy_y, enemy_x]])
+    
+    # PRIORITY 4: Dodge very close projectiles
+    if threatening_projectiles:
+        closest_proj = min(threatening_projectiles, key=lambda p: p["distance_to_me"])
+        proj_dx = closest_proj["dx_to_me"]
+        proj_dy = closest_proj["dy_to_me"]
+        
+        # Move perpendicular to the projectile direction
+        perp_dx = -proj_dy
+        perp_dy = proj_dx
+        mag = math.sqrt(perp_dx**2 + perp_dy**2)
+        if mag > 0:
+            perp_dx /= mag
+            perp_dy /= mag
+        
+        dodge_dist = 300
+        dodge_x = my_x + perp_dx * dodge_dist
+        dodge_y = my_y + perp_dy * dodge_dist
+        
+        # Use E to dodge only if projectile is EXTREMELY close
+        if closest_proj["distance_to_me"] < 200 and e_ready:
+            # E away perpendicular
+            e_x = my_x + perp_dx * 475
+            e_y = my_y + perp_dy * 475
+            return (2, [[2], [e_y, e_x]])
+        
+        return (1, [dodge_y, dodge_x])
+    
+    # PRIORITY 5: Positioning
+    # Maintain optimal range of ~800 for consistent Q hits while having dodge room
+    optimal_range = 800
+    
+    if enemy_dist < 400:
+        # Too close, back off
+        angle_away = math.atan2(-enemy_dy, -enemy_dx)
+        move_x = my_x + math.cos(angle_away) * 350
+        move_y = my_y + math.sin(angle_away) * 350
+        return (1, [move_y, move_x])
+    
+    if enemy_dist > 1000:
+        # Too far, approach at an angle to be harder to hit
+        angle_to = math.atan2(enemy_dy, enemy_dx)
+        # Add perpendicular component for juking
+        juke = math.sin(observation["game_time"] * 0.005) * math.pi / 4
+        move_angle = angle_to + juke
+        move_x = my_x + math.cos(move_angle) * 300
+        move_y = my_y + math.sin(move_angle) * 300
+        return (1, [move_y, move_x])
+    
+    # At good range - orbit/juke to dodge skillshots
+    angle_to = math.atan2(enemy_dy, enemy_dx)
+    # Rapid direction changes to make us hard to predict
+    t = observation["game_time"]
+    # Fast oscillation for juking
+    juke_dir = 1 if int(t / 300) % 2 == 0 else -1
+    orbit_angle = angle_to + (math.pi / 2) * juke_dir
+    move_x = my_x + math.cos(orbit_angle) * 250
+    move_y = my_y + math.sin(orbit_angle) * 250
+    return (1, [move_y, move_x])
+```
+
+Wait, I need to reconsider. Looking at the experience data more carefully:
+
+The issue is that after the initial Q exchange at T2528, the bot's HP stays at 86-91% and slowly recovers. The ENEMY is also at 86-91%. So neither side is dealing damage after the initial exchange. The bot is stuck in a loop of dodging without ever casting.
+
+The fix is clear: **PRIORITIZE CASTING Q OVER EVERYTHING ELSE** (except maybe dodging a projectile that's about to hit you in the next 0.1 seconds).
+
+Since cooldowns are disabled, we should be casting Q literally every single game tick. The action system probably has some animation lock, but we should try to cast Q as often as possible.
+
+Also I notice the bot drifts further and further from the enemy - positions go from ~6350 to ~7300 over time, while enemy seems to stay near their starting area. The bot is orbiting away instead of staying in range.
+
+Let me also reconsider: Maybe the threshold for threatening should be even tighter, or I should just not dodge at all and focus purely on DPS. In a mirror match with no cooldowns, the one who lands more Qs wins. If we spam Q every frame, we'll deal way more damage than we take.
+
+Actually wait - the experience shows both at nearly equal HP throughout, meaning NEITHER is landing abilities. The bot fired Q once, got hit once, and then stopped fighting entirely. The priority should absolutely be:
+
+1. Spam Q (and W) at enemy every single tick
+2. Juke/move between casts
+3. Only dodge if something is literally on top of us
+---
+Looking at the experience data carefully:
+
+1. **T0-T2268**: Bot walks toward enemy, both at 100% HP. Distance ~5000+ units. No abilities cast during approach.
+2. **T2268**: First Q cast (both fire simultaneously). Both projectiles visible.
+3. **T2762**: Both drop to 86% HP - both got hit by Q.
+4. **T3027**: W+Q cast again. At T3524, both drop to ~72% HP.
+5. **T3754-T4513**: Another Q exchange, both drop to ~55% HP.
+6. **T4778-T5769**: Bot STOPS CASTING and just orbits. HP slowly recovers to 56-57%.
+7. **T5769 onwards**: Bot just orbits endlessly, never casting Q again. Both HP slowly regenerate.
+
+**Critical Problem**: After the initial exchanges, the bot enters the "orbit at optimal range" code and NEVER goes back to casting Q. Looking at why:
+
+- Enemy distance stays around 500-900 range (based on dx/dy values of ~500-800)
+- The policy checks `enemy_dist < 1100` for Q - this should be true!
+- BUT there are always projectiles flying around. The policy checks projectiles BEFORE Q... wait, in the current policy Q is Priority 1 before dodge. So why isn't it casting?
+
+Looking more carefully at the enemy distance: `enemy_dx` and `enemy_dy` values are around 500-800 each, so `enemy_dist` = sqrt(500² + 700²) ≈ 860. This IS within 1100 range. So Q should fire.
+
+Wait - the issue might be that Q IS being fired but the bot is also dodging. But looking at T6000+, the bot positions oscillate back and forth rapidly with NO HP changes. The bot is casting Q but missing because both are juking, OR the Q cast isn't actually happening.
+
+Actually, looking at projectiles: after T5769 there are always 4+ projectiles from team 1073741854 (enemy) AND 1073741853 (us). So BOTH sides ARE casting! But neither is hitting because both are dodging.
+
+**The real issue**: The bot fires Q at the enemy's CURRENT position, but the enemy is also juking. The Q misses. Meanwhile the bot orbits predictably. Since enemy projectiles always exist at various distances, the dodge code rarely triggers (threshold 300), and the bot just orbits.
+
+**What needs to change**:
+1. **Lead Q shots** - Predict enemy movement, don't aim at current position
+2. **Use W+Q combo** - W marks, Q procs for bonus damage
+3. **Use R** - Ultimate is a wide beam, harder to dodge
+4. **Better movement** - More unpredictable juking, not a simple orbit pattern
+5. **E aggressively** - Use E to reposition for guaranteed Q hits at close range
+6. **Cast more spells per frame** - We should be casting Q AND W constantly since no cooldowns
+
+The orbit period is `int(game_time / 250)` which flips every 250ms - that's very predictable. Enemy can easily predict this.
+
+**Strategy**: Since both keep dodging Qs, use R (wide beam, harder to dodge) and W (marks enemy for bonus damage on next hit). Use E aggressively to close distance and land point-blank Q. Vary movement unpredictably.
+---
+Looking at the experience data carefully:
+
+1. **T0-T1016**: Bot stays COMPLETELY STILL at (6350,6350). Enemy at (1300,1300). Distance ~7100 units. **NO ACTIONS TAKEN** - the bot is doing nothing for over 1 second of game time!
+
+2. **T1277**: Enemy fires R (EzrealTrueshotBarrage) - two projectiles appear at distance ~1300 each heading toward us.
+
+3. **T1770-T2001**: Bot barely moves (6350→6350,6435→6510). The R projectile is getting closer (distance shrinking from 1300 to ~300).
+
+4. **T2263**: HP drops from 100% to 64%! Got hit by R. Enemy also at 64% (mirror?).
+
+5. **T2526-T3280**: More R projectiles fired. HP drops further to 30%.
+
+6. **T3512**: Both at 30% HP. Bot still barely moving.
+
+**Critical Issues**:
+- The bot is NOT MOVING toward the enemy. Distance is ~7000+ units, way beyond any ability range (1100 for Q).
+- Enemy dist is huge, so `enemy_dist < 1200` for E fails, `enemy_dist < 1100` for Q fails, `enemy_dist < 1000` for W fails.
+- The only thing that triggers is `enemy_dist > 1050` approach code, but the juke pattern moves very slowly.
+- Meanwhile enemy R (global range) hits us because we barely dodge.
+- The bot doesn't use R back (which is also global) because `enemy_dist < 2000` fails (dist ~7000).
+
+**Key fixes needed**:
+1. **Use R at any range** - it's global! Fire R at enemy immediately while closing distance
+2. **Move DIRECTLY toward enemy faster** - stop juking at extreme range, just rush in
+3. **Dodge R projectiles** - they're huge and do massive damage
+4. **Increase R range check** to be very large or unlimited
+5. **Better projectile dodge threshold** - R projectiles were at 300 distance but our threshold is also 300, may have been too late
+
+From history: the bot was previously not casting abilities. Now it casts but misses at close range. But THIS game shows a completely different problem - the bot never gets in range because it approaches too slowly, and gets killed by enemy R (global) while approaching.
+
+**New strategy**:
+1. If far away (>2000), fire R immediately (global range) and rush toward enemy
+2. Cast R liberally - no cooldowns means spam it
+3. Dodge projectiles at larger range (500+) since R is wide
+4. Use E to close gaps when far
+5. Once in range, spam Q/W/R constantly
+6. Keep the perpendicular dodge logic but trigger it earlier
+---
+<thinking>
+Let me analyze the latest experience data carefully:
+
+1. **T0-T1020**: Bot stays completely still at (6350,6350). Enemy at (1300,1300). Distance ~7100 units. The bot does NOTHING for over 1 second. This is because the policy fires R first (Priority 0), but looking at the code... R IS ready, enemy dist IS > 0. So it should cast R. But the bot doesn't move at all.
+
+Wait, looking at the positions: ME at (26,280) at T33 but then ME at (6350,6350) at T0? The timestamps are out of order. Let me re-read...
+
+Actually T33 shows position (26,280) but T0 shows (6350,6350). This seems like the T33 entry might be from a different game or the ordering is off. Let me focus on the main sequence starting from T0.
+
+T0-T1020: Bot at (6350,6350), enemy at (1300,1300). Bot doesn't move. But the policy should trigger R (global range, ready). So why isn't anything happening? Maybe the game hasn't started yet? Or maybe the policy IS casting R but it doesn't show position change because R is a cast-in-place ability.
+
+T1282: Projectiles appear - EzrealTrueshotBarrage from both sides! So R WAS being cast by both sides. The projectiles have dx=1300 (enemy position relative to us) - these are R projectiles heading from enemy toward us.
+
+T1511-T2006: R projectiles approaching. dx decreasing from 1300 to 276. Bot still at (6350,6350) - NOT DODGING!
+
+T2268: HP drops from 100% to 64%! Got hit by enemy R. Position shifts to (6685,6685). Enemy at (629,629), also at 64%.
+
+T2532: More R projectiles. Both at 64%.
+
+T3022: HP drops to 30%! Got hit by another R. Both at 30%.
+
+T3251-T4531: HP at 16%. More R projectiles fired. Bot barely moves.
+
+T4531-T4761: HP at 16-17%. Both alive, spamming R at each other.
+
+**Key Problems with Current Policy:**
+
+1. **Bot spams R and nothing else** - R is Priority 1 (before Q, W, E, movement). Since cooldowns are disabled and R is always ready, the bot ONLY casts R every single tick. It never moves, never dodges, never casts Q/W.
+
+2. **Bot gets hit by enemy R because it never moves** - R cast doesn't move the character, so it stands still and eats every enemy R.
+
+3. **The R-only spam is a death loop** - Both sides spam R, both get hit, both die equally. No advantage gained.
+
+4. **Dodging never triggers** - The dodge code (Priority 0) checks for projectiles < 500 distance. But R is being cast every tick before the dodge check. Actually wait - dodge IS Priority 0 in the current policy. Let me re-read...
+
+Looking at the current policy:
+- Priority 0: Dodge close projectiles (< 500 dist)
+- Priority 1: Cast R (always, any range)
+- Priority 2: Cast Q (< 1150 range)
+- Priority 3: Cast W (< 1000 range)
+- Priority 4: E to close gap (> 1200)
+- Priority 5: Movement
+
+So the dodge SHOULD trigger when projectiles are within 500. But looking at T1774, projectile dist ~850 (sqrt(603²+603²)). At T2006, dist ~390 (sqrt(276²+276²)). So at T2006 the projectile IS within 500.
+
+But wait - the bot's position doesn't change at T2006 (still at 6350,6350). That means the dodge didn't trigger OR the dodge command was issued but didn't execute because the bot was already casting R.
+
+Actually, I think the problem is: **the bot casts R every tick, and R has a cast animation that locks the character in place**. So even though dodge is Priority 0, by the time a projectile gets within 500 range, the bot is mid-R-cast and can't move.
+
+Actually no, looking more carefully: the dodge IS priority 0 (before R). So when projectiles are within 500, it should dodge instead of casting R. But at T2006, projectiles are at dist 390 (within 500). At T2268, the bot moved to (6685,6685) - so it DID try to dodge, but too late (already got hit).
+
+The issue is the 500 threshold is too small for R projectiles which travel at 2000 speed. By the time they're within 500, you only have 250ms to dodge - not enough if you were casting R.
+
+**Solutions:**
+
+1. **Don't spam R as first priority** - R should be used strategically, not every tick
+2. **Increase dodge detection range** - For fast projectiles like R, need to dodge at 800+ distance
+3. **Prioritize Q over R** - Q is faster, more reliable at range
+4. **Move between casts** - Don't just stand and cast
+5. **Alternate between casting and moving** - Cast Q, then move to dodge, cast Q, move to dodge
+
+**New Strategy:**
+
+Since cooldowns are disabled, the optimal play is:
+1. Approach enemy while dodging
+2. At ~800-1000 range, alternate between casting Q and dodging
+3. Use W occasionally for mark damage
+4. Use R sparingly (when enemy can't dodge, or to finish)
+5. Use E for emergency dodges or gap closing
+6. ALWAYS be moving between ability casts
+
+The key insight: we need to INTERLEAVE actions. We can't just cast spells every tick - we need to move between casts to dodge. A simple alternation: cast Q one tick, move/dodge next tick.
+
+Let me also think about the movement issue. The bot starts at (6350,6350) and enemy at (1300,1300). Distance is sqrt((6350-1300)² + (6350-1300)²) ≈ 7141. The bot needs to close this gap. But in the current policy, R is always cast first, preventing any movement.
+
+Looking at the game_time: T0 to T4761. That's about 4.7 seconds of real game time. The bot needs to approach during this time.
+
+**New Policy Design:**
+
+I need a state machine approach:
+1. Far range (>1200): Move toward enemy, use R occasionally, dodge incoming R
+2. Mid range (800-1200): Spam Q, dodge, use W
+3. Close range (<800): Q spam, kite back if low HP, E if needed
+
+Key mechanic: **Alternate between casting and moving.** Use game_time modulo to alternate:
+- Even ticks: Cast an ability
+- Odd ticks: Move to dodge/reposition
+
+Actually, since we get observations every ~250ms, we can check: if there's a threatening projectile, dodge. Otherwise, cast an ability. This is better than blind alternation.
+
+But the problem is projectiles are ALWAYS present once they start firing. So we need smarter projectile filtering.
+
+Let me design the projectile threat assessment:
+- A projectile is threatening if:
+  1. It's from the enemy team (my_team == 0)
+  2. It's within a certain distance (say 600)
+  3. It's heading TOWARD us (distance is decreasing)
+
+We can estimate if it's heading toward us by checking: if the projectile position vector dot product with some inferred velocity is negative. But we don't track frame-to-frame.
+
+Alternative: use the projectile name and position. EzrealTrueshotBarrage (R) and EzrealMysticShot (Q) both travel in straight lines from enemy toward a target. If the projectile is between us and the enemy, it's likely heading toward us.
+
+Actually, simpler heuristic: if the projectile's dx_to_me has the same sign as enemy_dx_to_me AND the magnitude is smaller, the projectile is between us and the enemy, heading toward us. 
+
+Even simpler: just dodge any close enemy projectile. But raise/lower the threshold smartly.
+
+Let me write the new policy:
+
+```python
+def act(self, observation):
+    import math
+    
+    my_champ = next(unit for unit in observation["champ_units"] if unit["my_team"] == 1)
+    enemy_champ = next(unit for unit in observation["champ_units"] if unit["my_team"] == 0)
+    
+    my_hp_pct = my_champ["current_hp"] / max(my_champ["max_hp"], 1)
+    enemy_hp_pct = enemy_champ["current_hp"] / max(enemy_champ["max_hp"], 1)
+    my_x = my_champ["position"]["X"]
+    my_y = my_champ["position"]["Y"]
+    enemy_dx = enemy_champ["dx_to_me"]
+    enemy_dy = enemy_champ["dy_to_me"]
+    enemy_dist = enemy_champ["distance_to_me"]
+    enemy_x = enemy_champ["position"]["X"]
+    enemy_y = enemy_champ["position"]["Y"]
+    
+    q_ready = my_champ["q_cooldown"] == 0
+    w_ready = my_champ["w_cooldown"] == 0
+    e_ready = my_champ["e_cooldown"] == 0
+    r_ready = my_champ["r_cooldown"] == 0
+    
+    game_time = observation["game_time"]
+    
+    # Identify truly threatening enemy projectiles
+    threatening = []
+    for p in observation["projectiles"]:
+        if p["my_team"] == 0:
+            dist = p["distance_to_me"]
+            if dist < 500:
+                threatening.append(p)
+    
+    # PRIORITY 0: Dodge close projectiles ALWAYS
+    if threatening:
+        closest = min(threatening, key=lambda p: p["distance_to_me"])
+        pdx = closest["dx_to_me"]
+        pdy = closest["dy_to_me"]
+        perp_x = -pdy
+        perp_y = pdx
+        mag = math.sqrt(perp_x**2 + perp_y**2)
+        if mag > 0:
+            perp_x /= mag
+            perp_y /= mag
+        
+        if closest["distance_to_me"] < 250 and e_ready:
+            e_x = my_x + perp_x * 475
+            e_y = my_y + perp_y * 475
+            return (2, [[2], [e_y, e_x]])
+        
+        dodge_x = my_x + perp_x * 350
+        dodge_y = my_y + perp_y * 350
+        return (1, [dodge_y, dodge_x])
+    
+    # PRIORITY 1: R when far (global) - but alternate with movement
+    if r_ready:
+        ...
+```
+
+Wait, the core problem is still: R is always ready (no cooldowns), so Priority 1 fires R every tick when there are no close projectiles. This means we never move toward enemy.
+
+I need to use game_time to pace abilities. For example, only cast R every N milliseconds to allow movement in between.
+
+Let me think about what game_time values look like: T0, T265, T526, T757, T1020... so intervals are ~250ms.
+
+I'll use a pacing mechanism:
+- Cast R once every ~1000ms (every 4th tick)
+- Cast Q every other tick when in range
+- Move/dodge on other ticks
+
+```python
+# Determine action phase based on time
+tick_phase = int(game_time / 250) % 4  # 0,1,2,3 cycling
+```
+
+Actually, let me think about this differently. The key issues from history:
+
+1. Bot stands still because it spams R every tick → Need to interleave movement
+2. Bot gets hit by R because it doesn't dodge in time → Need larger dodge radius
+3. Bot never uses Q/W because R takes priority → Need smarter ability usage
+4. Bot never approaches enemy → Need approach movement
+
+Here's my refined strategy:
+
+**Phase 1: Far away (>1200 distance)**
+- Use game_time % to alternate: R cast → move toward → R cast → move toward
+- Dodge any incoming projectiles with high priority
+
+**Phase 2: Mid range (600-1200)**
+- Alternate: Q cast → dodge/move → W cast → dodge/move
+- Use R occasionally for big damage
+- Juke unpredictably
+
+**Phase 3: Close range (<600)**
+- Spam Q, kite back
+- E if needed for safety
+
+The alternation is key. Let me use `game_time % 500` or similar to switch between cast/move modes.
+
+Actually, I think a cleaner approach: every tick, check if there's a projectile to dodge. If yes, dodge. If no, check what ability to cast based on range and a cycling counter. If no ability is appropriate, move toward/orbit enemy.
+
+The problem with my R-spam was that NO COOLDOWNS means R is always available. So I need to explicitly limit R usage.
+
+Let me write the final policy:
+
+```python
+def act(self, observation):
+    import math
+    
+    my_champ = next(unit for unit in observation["champ_units"] if unit["my_team"] == 1)
+    enemy_champ = next(unit for unit in observation["champ_units"] if unit["my_team"] == 0)
+    
+    my_hp_pct = my_champ["current_hp"] / max(my_champ["max_hp"], 1)
+    enemy_hp_pct = enemy_champ["current_hp"] / max(enemy_champ["max_hp"], 1)
+    my_x = my_champ["position"]["X"]
+    my_y = my_champ["position"]["Y"]
+    enemy_dx = enemy_champ["dx_to_me"]
+    enemy_dy = enemy_champ["dy_to_me"]
+    enemy_dist = enemy_champ["distance_to_me"]
+    enemy_x = enemy_champ["position"]["X"]
+    enemy_y = enemy_champ["position"]["Y"]
+    
+    q_ready = my_champ["q_cooldown"] == 0
+    w_ready = my_champ["w_cooldown"] == 0
+    e_ready = my_champ["e_cooldown"] == 0
+    r_ready = my_champ["r_cooldown"] == 0
+    
+    game_time = observation["game_time"]
+    
+    # Threatening projectiles - wider detection radius
+    threatening = []
+    for p in observation["projectiles"]:
+        if p["my_team"] == 0:
+            dist = p["distance_to_me"]
+            if dist < 600:
+                threatening.append(p)
+    
+    # PRIORITY 0: ALWAYS dodge close threatening projectiles
+    if threatening:
+        closest = min(threatening, key=lambda p: p["distance_to_me"])
+        pdx = closest["dx_to_me"]
+        pdy = closest["dy_to_me"]
+        perp_x = -pdy
+        perp_y = pdx
+        mag = math.sqrt(perp_x**2 + perp_y**2)
+        if mag > 0:
+            perp_x /= mag
+            perp_y /= mag
+        
+        # E dodge for very close projectiles
+        if closest["distance_to_me"] < 300 and e_ready:
+            e_x = my_x + perp_x * 475
+            e_y = my_y + perp_y * 475
+            return (2, [[2], [e_y, e_x]])
+        
+        dodge_x = my_x + perp_x * 400
+        dodge_y = my_y + perp_y * 400
+        return (1, [dodge_y, dodge_x])
+    
+    # Use a tick counter to alternate between casting and moving
+    tick = int(game_time / 250)
+    
+    # Aim with lead prediction
+    angle_to = math.atan2(enemy_dy, enemy_dx)
+    lead = math.sin(game_time * 0.017) * 200
+    aim_x = enemy_x + math.cos(angle_to + math.pi/2) * lead
+    aim_y = enemy_y + math.sin(angle_to + math.pi/2) * lead
+    
+    # Every other tick: cast an ability
+    if tick % 2 == 0:
+        # R spam when far away (but not every tick - every 6th tick)
+        if r_ready and enemy_dist > 1200 and tick % 6 == 0:
+            return (2, [[3], [aim_y, aim_x]])
+        
+        # Q is highest DPS when in range
+        if q_ready and enemy_dist < 1150:
+            return (2, [[0], [aim_y, aim_x]])
+        
+        # W for mark
+        if w_ready and enemy_dist < 1000:
+            return (2, [[1], [aim_y, aim_x]])
+        
+        # R at any range every 6th tick
+        if r_ready and tick % 6 == 0:
+            return (2, [[3], [aim_y, aim_x]])
+    
+    # Odd ticks or no ability to cast: MOVE
+    # E to close gap when far
+    if e_ready and enemy_dist > 1500 and my_hp_pct > 0.3:
+        e_x = my_x + math.cos(angle_to) * 475
+        e_y = my_y + math.sin(angle_to) * 475
+        return (2, [[2], [e_y, e_x]])
+    
+    # Movement based on range
+    if enemy_dist > 1000:
+        # Approach with juke
+        juke = math.sin(game_time * 0.009) * math.pi / 5
+        move_angle = angle_to + juke
+        mx = my_x + math.cos(move_angle) * 400
+        my = my_y + math.sin(move_angle) * 400
+        return (1, [my, mx])
+    
+    if enemy_dist < 350:
+        # Kite back
+        angle_away = math.atan2(-enemy_dy, -enemy_dx)
+        mx = my_x + math.cos(angle_away) * 350
+        my = my_y + math.sin(angle_away) * 350
+        return (1, [my, mx])
+    
+    # Optimal range: juke unpredictably
+    t = game_time
+    juke1 = math.sin(t * 0.013) * 0.8
+    juke2 = math.sin(t * 0.0071 + 1.9) * 0.5
+    juke3 = math.sin(t * 0.023 + 0.5) * 0.3
+    combined = juke1 + juke2 + juke3
+    orbit_angle = angle_to + (math.pi / 2) * combined
+    mx = my_x + math.cos(orbit_angle) * 280
+    my = my_y + math.sin(orbit_angle) * 280
+    return (1, [my, mx])
+```
+
+This should fix the core issues:
+1. Bot no longer stands still spamming R (alternates between cast and move)
+2. Dodge radius increased to 600 (catches R projectiles sooner)
+3. Q prioritized over R at close range
+4. Movement interleaved with casting
+5. R only used every 6th tick to prevent R-lock
+6. E used for gap closing when far
+7. Unpredictable juking when in range
+---
+Looking at the experience data carefully:
+
+1. **T0-T526**: Bot at (6350,6350), enemy at (1300,1300). Distance ~7100. Bot starts moving toward enemy.
+2. **T1018-1281**: Projectiles appear - both fire Q and R simultaneously. Bot still at (6685,6685).
+3. **T1769**: HP drops from 100% to 51%! Got hit by R AND Q. Enemy at 65%. We took WAY more damage.
+4. **T1769-T8778**: HP stays at 51-52%, enemy at 65-66%. Bot orbits around 6500-6800 range but NEVER DEALS DAMAGE. Enemy slowly regens.
+5. **T8778**: HP drops to 17%! Got hit by another R. Enemy still at 66%.
+6. **T8778-T24520**: HP stays at 17-21% (regen), enemy at 67-70%. Bot just orbits, never attacking.
+
+**Critical Problems:**
+
+1. **The bot NEVER CASTS ABILITIES after initial exchange** - Looking at tick logic: `tick = int(game_time / 250)`, and `tick % 2 == 0` for casting. But game_time values are like 1769, 2032... so tick = 7, 8, etc. Even ticks should cast. But enemy_dist based on dx/dy ~(300-600) means dist ~400-700, well within Q range (1150). So WHY isn't Q being cast?
+
+2. **The dodge block catches everything** - There are ALWAYS projectiles within 600 distance (the `threatening` filter). Looking at data: every observation has projectiles with dx/dy of 200-500, meaning distances of 300-700. Many are within 600. So the bot ALWAYS enters the dodge block and NEVER reaches the cast phase.
+
+3. **Many "threatening" projectiles are already PAST us** - Projectiles with large negative dx/dy values (like -10000) are far past. But some projectiles at dx=253, dy=257 (dist ~360) trigger the dodge. These might be our OWN projectiles being misidentified, or enemy projectiles that already passed.
+
+4. **The dodge is ineffective** - HP dropped from 51% to 17% at T8778 despite constant dodging. The perpendicular dodge doesn't work well against R (wide beam).
+
+**Key Fixes:**
+
+1. **Filter projectiles MUCH more aggressively** - Only dodge projectiles heading TOWARD us (positive dot product with enemy direction) AND very close (<400)
+2. **NEVER let dodge completely block ability casting** - Cast Q FIRST, then dodge. DPS > dodging.
+3. **Use E offensively** - E into range, cast Q point-blank
+4. **Spam Q as TOP priority** when in range - Q every tick, no alternation needed
+5. **Move/dodge ONLY when Q is on animation cooldown** (even though cooldowns are "disabled", there's likely a cast time)
+
+The fundamental insight: with no cooldowns, the winner is whoever lands more Qs. Standing still dodging = 0 DPS = losing. We must prioritize Q spam.
+
+New approach: Cast Q EVERY TICK at enemy when in range. Only dodge if a projectile is < 300 distance. Use the tick alternation ONLY for R (not Q). Approach aggressively with E when far.
+---
+<thinking>
+Let me analyze the latest experience data carefully:
+
+1. **T0-T526**: Bot at (6350,6350), enemy at (1300,1300). Distance ~7100. Bot starts moving toward enemy at T526 (moved to 6685,6685).
+2. **T1016**: First projectiles appear - EzrealMysticShot from both sides. Bot still at (6685,6685).
+3. **T1278**: More projectiles - R (TrueshotBarrage) fired by both sides.
+4. **T1508**: HP drops to 86% for both. Bot moved slightly to (6747,6643).
+5. **T1772**: HP drops to 51%! Got hit by R. Both at 51%.
+6. **T2002-T9260**: HP stays at 51-52%. Bot orbits around (6200-6400, 6000-6200). Enemy stays at (100-500, 200-900). Distance is ~sqrt(300^2 + 500^2) ≈ 580. Bot is IN RANGE for Q (1100) but NEVER CASTS.
+7. **T9523**: Enemy HP drops to 18%! We must have landed something. Our HP still 52%.
+8. **T9754-T24531**: Enemy stays at 18-21%. We stay at 53-56%. Neither side deals significant damage anymore.
+
+So the pattern is:
+- Initial R exchange: both drop to 51%
+- Then some damage lands on enemy (drops to 18%) around T9523
+- After that, both just orbit and neither lands anything
+
+**Why isn't the bot casting Q?** Looking at the current policy:
+
+The dodge block checks for enemy projectiles within 400 distance where `dot > 0 or dist < 200`. Looking at projectiles in the data:
+
+At T2002: Multiple projectiles. Some like `[1073741854,-529,-306,2000,EzrealTrueshotBarrage]` have negative dx (past us). But `[1073741853,890,1113,2000,EzrealTrueshotBarrage]` - this is team 1073741853. Need to check which team is enemy (my_team==0).
+
+Wait, the projectile data format in observations is `[owner, dx, dy, speed, name]` but in the dict it would have `my_team`, `dx_to_me`, `dy_to_me`, `distance_to_me`, `speed`, `name`.
+
+Looking at the current policy, threatening projectiles are filtered by:
+- `my_team == 0` (enemy)
+- `dist < 400`
+- `dot > 0 or dist < 200`
+
+The `dot = pdx * enemy_dx + pdy * enemy_dy` checks if the projectile is in the same direction as the enemy. This is a decent filter.
+
+But the problem is: **Q IS Priority 0 (before dodge)**. In the current policy, Q is cast FIRST when in range:
+
+```python
+if q_ready and enemy_dist < 1100:
+    return (2, [[0], [aim_y, aim_x]])
+```
+
+So if enemy is within 1100, Q should fire EVERY tick. Looking at enemy_dist: enemy_dx and enemy_dy are typically 200-600, so dist ~300-850. This IS within 1100. So Q SHOULD be firing.
+
+But wait - looking at the experience, both HP values stay constant for long periods. If Q is firing every tick, surely some would hit. Unless:
+1. Q has a cast animation that prevents re-casting immediately
+2. The lead prediction is causing misses
+3. There's something else preventing the cast
+
+Actually, looking at T9523: enemy drops from 52% to 18% - that's a massive damage spike. Then stays at 18-19% afterward. This suggests something DID hit (maybe R?). The tick-based R logic: `tick = int(game_time / 250)`, `tick % 8 == 0`. At T9523, tick = 38, 38%8 = 6, not 0. But at T9260, tick = 37, 37%8 = 5. Hmm, nearby ticks: 32%8=0 (T8000), 40%8=0 (T10000). So R would fire around T8000 and T10000.
+
+Actually, the R was probably fired and hit, causing the big damage at T9523.
+
+The key observation: **Q is supposedly being cast every tick but not hitting**. The lead prediction might be causing all misses:
+```python
+lead_offset = math.sin(game_time * 0.019) * 150
+```
+
+With game_time at 5000-10000, `sin(5000 * 0.019) = sin(95)` which oscillates rapidly. The 150-unit offset might be causing consistent misses.
+
+Also, both champions seem to be orbiting each other at range 400-800, both dodging. The Q projectile travels at 2000 speed, taking ~0.3-0.4 seconds to reach. During that time, the enemy moves ~100-150 units. So aiming at current position might actually be better than the lead prediction which adds random offset.
+
+**Key issues to fix:**
+
+1. **Remove or reduce Q lead prediction** - Aim directly at enemy position, or use very small lead
+2. **The bot IS casting Q but missing** - Need better aim
+3. **Use W before Q for mark damage** - W+Q combo does more
+4. **Use R more frequently** - It's a wide beam, easier to hit
+5. **Dodge needs to be smarter** - Only dodge projectiles actually heading at us with better filtering
+6. **Need to consider that projectiles from BOTH teams exist** - Ensure we only dodge enemy ones
+
+Actually wait, let me re-examine. Looking at the observation carefully:
+
+T3021 has many projectiles: some with `my_team` 1073741854 and some 1073741853. These IDs probably map to specific teams. In the observation dict, `my_team` would be 0 or 1. The raw observation format shows the owner ID, but the dict should normalize this.
+
+Looking at the current policy's threatening filter more carefully:
+- It checks `p["my_team"] == 0` - only enemy projectiles
+- `dist < 400` - close ones
+- `dot > 0 or dist < 200` - heading toward us
+
+This seems reasonable. But there might always be projectiles within 400 from BOTH teams. If the filter correctly identifies enemy ones, then maybe only 1-2 are threatening at any time.
+
+The real problem might be simpler: **the Q IS being cast, but it's missing every time because the lead prediction is bad AND the enemy is dodging**.
+
+**New strategy for hitting Q:**
+
+1. **Aim directly at enemy** - No lead prediction. Even if they dodge, sometimes they won't.
+2. **Use W first** - W is a wider/different hitbox, marking enemy. Then Q procs it.
+3. **Use R more** - R is a massive beam, much harder to dodge at close range.
+4. **Cast E toward enemy then Q** - E blinks you close, then Q point-blank is almost guaranteed.
+5. **Vary timing** - Don't cast Q every tick (enemy can predict). Instead, cast Q, move, move, Q to vary timing.
+
+Actually, the biggest bang for buck: **Use E aggressively**. E blinks 475 units. If we're at 800 range, E puts us at 325 range. Then Q at 325 range is nearly instant (0.16 seconds) and very hard to dodge. This is classic Ezreal E-Q burst.
+
+**Revised Policy:**
+
+1. If far (>1200): Move toward enemy with juke pattern. Cast R occasionally.
+2. If in range (600-1200): 
+   - Priority: Cast Q directly at enemy (no lead)
+   - Then W for mark
+   - Dodge if projectile very close (<300)
+3. If close (<600): Q spam, kite if needed
+4. Use E aggressively: E toward enemy → immediate Q for burst
+5. R on tick timer (every ~8 ticks) for extra damage
+
+The E→Q combo is key. With no cooldowns, we can E→Q→E→Q repeatedly. Each E puts us point-blank and Q is nearly unmissable.
+
+But E also repositions us, so we need to be careful not to E into enemy projectiles.
+
+Let me write the new policy:
+
+```python
+def act(self, observation):
+    import math
+    
+    my_champ = next(unit for unit in observation["champ_units"] if unit["my_team"] == 1)
+    enemy_champ = next(unit for unit in observation["champ_units"] if unit["my_team"] == 0)
+    
+    my_hp_pct = my_champ["current_hp"] / max(my_champ["max_hp"], 1)
+    enemy_hp_pct = enemy_champ["current_hp"] / max(enemy_champ["max_hp"], 1)
+    my_x = my_champ["position"]["X"]
+    my_y = my_champ["position"]["Y"]
+    enemy_dx = enemy_champ["dx_to_me"]
+    enemy_dy = enemy_champ["dy_to_me"]
+    enemy_dist = enemy_champ["distance_to_me"]
+    enemy_x = enemy_champ["position"]["X"]
+    enemy_y = enemy_champ["position"]["Y"]
+    
+    q_ready = my_champ["q_cooldown"] == 0
+    w_ready = my_champ["w_cooldown"] == 0
+    e_ready = my_champ["e_cooldown"] == 0
+    r_ready = my_champ["r_cooldown"] == 0
+    
+    game_time = observation["game_time"]
+    angle_to_enemy = math.atan2(enemy_dy, enemy_dx)
+    
+    # Filter threatening projectiles - only very close enemy projectiles
+    # that are roughly between us and enemy (heading toward us)
+    threatening = []
+    for p in observation["projectiles"]:
+        if p["my_team"] == 0:
+            dist = p["distance_to_me"]
+            pdx = p["dx_to_me"]
+            pdy = p["dy_to_me"]
+            if dist < 400:
+                # Check if projectile is on same side as enemy (heading toward us)
+                dot = pdx * enemy_dx + pdy * enemy_dy
+                if dot > 0 or dist < 200:
+                    threatening.append(p)
+    
+    # PRIORITY 0: Cast Q at enemy - THIS IS THE HIGHEST PRIORITY
+    # No cooldowns = spam Q every tick for maximum DPS
+    # Aim directly at enemy position (no lead - lead was causing misses)
+    if q_ready and enemy_dist < 1100:
+        return (2, [[0], [enemy_y, enemy_x]])
+    
+    # PRIORITY 1: Dodge VERY close projectiles (only after Q cast attempted)
+    if threatening:
+        closest = min(threatening, key=lambda p: p["distance_to_me"])
+        pdx = closest["dx_to_me"]
+        pdy = closest["dy_to_me"]
+        perp_x = -pdy
+        perp_y = pdx
+        mag = math.sqrt(perp_x**2 + perp_y**2)
+        if mag > 0:
+            perp_x /= mag
+            perp_y /= mag
+        
+        # E dodge for extremely close projectiles
+        if closest["distance_to_me"] < 200 and e_ready:
+            e_x = my_x + perp_x * 475
+            e_y = my_y + perp_y * 475
+            return (2, [[2], [e_y, e_x]])
+        
+        dodge_x = my_x + perp_x * 350
+        dodge_y = my_y + perp_y * 350
+        return (1, [dodge_y, dodge_x])
+    
+    # PRIORITY 2: Cast W for mark damage
+    if w_ready and enemy_dist < 1000:
+        return (2, [[1], [enemy_y, enemy_x]])
+    
+    # PRIORITY 3: Use R periodically for burst (wide beam = easier to hit)
+    tick = int(game_time / 250)
+    if r_ready and tick % 8 == 0:
+        return (2, [[3], [enemy_y, enemy_x]])
+    
+    # PRIORITY 4: Use E to close gap when far
+    if e_ready and enemy_dist > 1300 and my_hp_pct > 0.25:
+        e_x = my_x + math.cos(angle_to_enemy) * 475
+        e_y = my_y + math.sin(angle_to_enemy) * 475
+        return (2, [[2], [e_y, e_x]])
+    
+    # PRIORITY 5: Movement and positioning
+    # Far: approach with juke
+    if enemy_dist > 1000:
+        juke = math.sin(game_time * 0.011) * math.pi / 4
+        move_angle = angle_to_enemy + juke
+        mx = my_x + math.cos(move_angle) * 400
+        my_ = my_y + math.sin(move_angle) * 400
+        return (1, [my_, mx])
+    
+    # Too close: kite back
+    if enemy_dist < 350:
+        angle_away = math.atan2(-enemy_dy, -enemy_dx)
+        mx = my_x + math.cos(angle_away) * 350
+        my_ = my_y + math.sin(angle_away) * 350
+        return (1, [my_, mx])
+    
+    # Optimal range: unpredictable orbiting
+    t = game_time
+    juke1 = math.sin(t * 0.015) * 0.7
+    juke2 = math.sin(t * 0.0083 + 2.1) * 0.5
+    juke3 = math.sin(t * 0.027 + 0.7) * 0.4
+    combined = juke1 + juke2 + juke3
+    orbit_angle = angle_to_enemy + (math.pi / 2) * combined
+    mx = my_x + math.cos(orbit_angle) * 300
+    my_ = my_y + math.sin(orbit_angle) * 300
+    return (1, [my_, mx])
+```
+
+Wait, this is essentially the same as the current policy with the lead prediction removed. The current policy already has Q as Priority 0. So why isn't Q hitting?
+
+Let me look at the data again more carefully. The enemy's relative position (dx, dy) oscillates between ~(0-600, 100-900). That means the enemy is moving around unpredictably too.
+
+The issue might be that:
+1. Q IS being cast every tick
+2. But the enemy dodges most of them
+3. Both sides land approximately equally, resulting in equal HP
+
+Looking at T1772: both drop to 51%. That's pretty even. Then at T9523, enemy drops to 18% but we stay at 52%. So we DID land more damage somehow.
+
+Actually, the more I look at it, the current policy might be working okay - it's just a mirror match and both bots are equally good. The fact that we're at 53% and enemy at 18-20% means we're actually WINNING.
+
+But then from T9523 onward, enemy stays at 18-20% and slowly regens. We stay at 53-56%. Neither side finishes the other. The problem is we can't FINISH the kill.
+
+**The real issue: we need to be more aggressive when we have HP advantage.**
+
+When we're at 53% HP and enemy is at 18%, we should:
+1. Use E aggressively to close gap
+2. Spam Q/W/R to finish them
+3. Take calculated trades (even if we get hit, we can afford it)
+
+**Key improvement: HP-advantage-based aggression.**
+
+When we have significant HP advantage (>20% more), switch to aggressive mode:
+- E toward enemy
+- Spam all abilities
+- Don't worry about dodging as much
+
+When HP disadvantage, play safe and dodge more.
+
+Also, I need to make R fire more often. Every 8 ticks (2 seconds) is too infrequent. R is massive damage and wide - it should be used every 3-4 ticks at least.
+
+Let me also look at whether the Q lead prediction was actually helping or hurting. The current policy has:
+```python
+lead_offset = math.sin(game_time * 0.019) * 150
+```
+
+At game_time 5000: sin(95) ≈ sin(95 mod 2π) = sin(95 - 30*π) ≈ sin(0.75) ≈ 0.68. So offset ≈ 102 units.
+At game_time 5250: sin(99.75) ≈ sin(99.75 - 31*π) ≈ sin(2.39) ≈ 0.67. offset ≈ 100 units.
+
+The lead oscillates but slowly. This might actually be WORSE than no lead because it consistently pushes aim off-center. Better to aim directly at the enemy.
+
+Let me finalize the policy with these key changes:
+1. **Remove Q lead prediction** - aim directly at enemy
+2. **HP-advantage aggression** - E aggressively when ahead
+3. **More frequent R** - every 4 ticks instead of 8
+4. **Tighter dodge radius** - only dodge truly close projectiles
+5. **Better orbiting** - more unpredictable movement pattern
+---
+Looking at the latest experience data:
+
+1. **T0-T754**: Bot at (6350,6350), enemy at (1300,1300). Distance ~7100. Bot moves to (6685,6685) by T523.
+2. **T1018**: First projectiles appear. Bot still at (6685,6685).
+3. **T1511**: Enemy drops to 86% - our Q/R hit! We're still at 100%.
+4. **T1772**: MASSIVE HP DROP - we go from 100% to 51%! Enemy also at 51%. Got hit by R.
+5. **T2264**: Enemy drops to 33%! We stay at 51%. Our damage is landing.
+6. **T2756**: We drop to 37%, enemy at 34%. Getting hit by more projectiles.
+7. **T3281**: Enemy at 20%, we at 38%. We're winning!
+8. **T3509**: We drop to 20%, enemy at 21%. Now even again.
+9. **T4005-T7778**: Both at ~20-22%. Bot orbits but neither finishes the other. HP slowly regens.
+
+**Key problems:**
+
+1. **Bot doesn't move at all during T0-T1772** - stands still at (6685,6685) getting hit by everything. The Q-first priority means it casts Q every tick and NEVER moves/dodges.
+2. **After getting low HP, bot orbits but never finishes enemy** - enemy at 20% but we can't kill them.
+3. **The aggressive E engage (hp_advantage > 0.2)** triggered early but then both ended up equally low.
+4. **Projectile dodge never triggers** because Q is always Priority 0 and always ready (no cooldowns). The bot casts Q EVERY tick and never reaches the dodge code.
+
+**ROOT CAUSE**: With no cooldowns, Q is ALWAYS ready. Since Q is Priority 0, the bot ALWAYS returns Q cast and NEVER dodges. It's a stationary turret getting hit by everything.
+
+**Fix**: We MUST interleave Q casting with movement/dodging. Use tick-based alternation: cast Q on some ticks, move/dodge on others. Also, dodge should take priority over Q when projectiles are very close.
+
+**Strategy:**
+- Tick % 3 == 0: Cast Q (every 3rd tick ≈ 750ms)
+- Tick % 3 == 1: Cast W or R
+- Tick % 3 == 2: Move/dodge
+- BUT override to dodge if projectile is < 400 distance regardless of tick
+- When HP advantage > 20%, use E aggressively then Q
+- R every ~4 ticks for burst damage (wider beam = easier to hit)
+---
+<thinking>
+Let me analyze the latest experience data carefully:
+
+1. **T0-T754**: Bot at (6350,6350), enemy at (1300,1300). Distance ~7100. Bot moves to (6685,6685) by T525.
+2. **T1018**: Projectiles appear - EzrealMysticShot from both sides. Bot still at (6685,6685).
+3. **T1510**: HP drops to 86% for both. Bot barely moved to (6737,6632).
+4. **T1773**: Bot at 86%, enemy at 86%. Slow movement.
+5. **T2263**: More projectiles (Q and W from both sides). Bot at (6737,6632).
+6. **T2528**: HP drops to 72% for us, 73% for enemy. Getting hit.
+7. **T2758-T3516**: HP at 73% for both. Bot orbits around (6400-6700, 6300-6700).
+8. **T3516 onwards**: Enemy fires more Qs. HP stays at 73-77% for both (natural regen). Distance to enemy ~700-1300.
+9. **For the ENTIRE rest of the game (T3516-T24521)**: Both HP slowly regenerate (73→77%). Neither side deals meaningful damage. Bot just orbits endlessly.
+
+**Key observations from this episode:**
+
+1. **Bot barely deals damage after initial exchange** - HP stays at 73-77% for both sides for 20+ seconds.
+2. **Bot IS moving (orbiting)** but never in a way that leads to kills.
+3. **Looking at projectiles**: There are always 2 EzrealMysticShot projectiles visible (one from each team). The enemy projectiles have dx/dy values of 100-800, meaning distances of 150-1100.
+4. **The bot seems to be casting Q** (our projectiles exist) but they're all missing because the enemy dodges too.
+5. **The tick-based phase system (tick % 3)** means Q only fires every 3rd tick (~750ms). This is LOW DPS for no-cooldown mode.
+
+**Root cause analysis from history:**
+
+The history shows a recurring problem cycle:
+- If Q is highest priority → bot never moves → gets hit by everything
+- If dodge is highest priority → bot never casts → deals no damage
+- If tick-based alternation → Q fires too infrequently to kill
+- Lead prediction on Q → causes more misses than hits
+
+**What's happening in this specific episode:**
+
+The current policy uses tick % 3 phases:
+- Phase 0: Q cast
+- Phase 1: W/R cast  
+- Phase 2: move
+
+Looking at enemy distances: dx/dy values like (500-800, 600-1300) → distances of ~800-1500. Many observations show enemy_dist > 1000, which means Q cast condition (`enemy_dist < 1100`) barely passes.
+
+The threatening projectile filter uses:
+- `dist < 400`
+- `dot > 0 or dist < 200`
+
+Looking at projectile data: Most enemy projectiles have distances of 200-500+. Some are within 400. When they're within 400 AND dot > 0, the dodge override triggers.
+
+**The fundamental problem**: The bot is stuck in a stalemate. Both Ezreals orbit each other, fire Q, and both dodge. Neither can kill the other.
+
+**What needs to change to WIN:**
+
+1. **E→Q burst combo**: Use E to blink toward enemy, then immediately Q at point-blank range. Point-blank Q is nearly impossible to dodge. With no cooldowns, we can E→Q repeatedly.
+
+2. **R more aggressively**: R is a wide beam. Fire it frequently (every 2-3 ticks). At 600-800 range, R is hard to dodge.
+
+3. **Better movement pattern**: The current orbit is predictable (sinusoidal). Use sharper direction changes.
+
+4. **Aggressive when HP advantage**: When we're ahead, E into enemy face and burst.
+
+5. **DODGE OVERRIDE should remain highest priority** for truly close projectiles, but the threshold should be tight (< 350).
+
+6. **Cast Q MORE FREQUENTLY**: Instead of every 3rd tick, cast Q every 2nd tick. Alternate Q → move → Q → move.
+
+Let me design the new policy:
+
+```python
+def act(self, observation):
+    import math
+    
+    my_champ = next(unit for unit in observation["champ_units"] if unit["my_team"] == 1)
+    enemy_champ = next(unit for unit in observation["champ_units"] if unit["my_team"] == 0)
+    
+    my_hp_pct = my_champ["current_hp"] / max(my_champ["max_hp"], 1)
+    enemy_hp_pct = enemy_champ["current_hp"] / max(enemy_champ["max_hp"], 1)
+    my_x = my_champ["position"]["X"]
+    my_y = my_champ["position"]["Y"]
+    enemy_dx = enemy_champ["dx_to_me"]
+    enemy_dy = enemy_champ["dy_to_me"]
+    enemy_dist = enemy_champ["distance_to_me"]
+    enemy_x = enemy_champ["position"]["X"]
+    enemy_y = enemy_champ["position"]["Y"]
+    
+    q_ready = my_champ["q_cooldown"] == 0
+    w_ready = my_champ["w_cooldown"] == 0
+    e_ready = my_champ["e_cooldown"] == 0
+    r_ready = my_champ["r_cooldown"] == 0
+    
+    game_time = observation["game_time"]
+    angle_to_enemy = math.atan2(enemy_dy, enemy_dx)
+    hp_advantage = my_hp_pct - enemy_hp_pct
+    
+    # Filter for truly threatening enemy projectiles
+    threatening = []
+    for p in observation["projectiles"]:
+        if p["my_team"] == 0:
+            dist = p["distance_to_me"]
+            pdx = p["dx_to_me"]
+            pdy = p["dy_to_me"]
+            if dist < 400:
+                # Check if heading toward us (same general direction as enemy)
+                dot = pdx * enemy_dx + pdy * enemy_dy
+                if dot > 0 or dist < 200:
+                    threatening.append(p)
+    
+    # OVERRIDE: Dodge very close projectiles ALWAYS
+    if threatening:
+        closest = min(threatening, key=lambda p: p["distance_to_me"])
+        pdx = closest["dx_to_me"]
+        pdy = closest["dy_to_me"]
+        perp_x = -pdy
+        perp_y = pdx
+        mag = math.sqrt(perp_x**2 + perp_y**2)
+        if mag > 0:
+            perp_x /= mag
+            perp_y /= mag
+        
+        # E dodge for extremely close
+        if closest["distance_to_me"] < 200 and e_ready:
+            e_x = my_x + perp_x * 475
+            e_y = my_y + perp_y * 475
+            return (2, [[2], [e_y, e_x]])
+        
+        dodge_x = my_x + perp_x * 350
+        dodge_y = my_y + perp_y * 350
+        return (1, [dodge_y, dodge_x])
+    
+    tick = int(game_time / 250)
+    
+    # AGGRESSIVE E→Q COMBO when we have HP advantage
+    if hp_advantage > 0.15 and e_ready and enemy_dist > 400 and enemy_dist < 1500:
+        # E toward enemy to close gap for point-blank Q
+        e_target_dist = min(475, enemy_dist - 200)
+        e_x = my_x + math.cos(angle_to_enemy) * e_target_dist
+        e_y = my_y + math.sin(angle_to_enemy) * e_target_dist
+        return (2, [[2], [e_y, e_x]])
+    
+    # Alternate: cast on even ticks, move on odd ticks
+    if tick % 2 == 0:
+        # Cast R every 4th tick for burst (wide beam, hard to dodge)
+        if r_ready and tick % 4 == 0 and enemy_dist < 3000:
+            return (2, [[3], [enemy_y, enemy_x]])
+        
+        # Q - primary damage, aim directly at enemy
+        if q_ready and enemy_dist < 1100:
+            return (2, [[0], [enemy_y, enemy_x]])
+        
+        # W for mark damage
+        if w_ready and enemy_dist < 1000:
+            return (2, [[1], [enemy_y, enemy_x]])
+        
+        # R at any range if nothing else available
+        if r_ready:
+            return (2, [[3], [enemy_y, enemy_x]])
+    
+    # ODD TICKS: Movement/positioning
+    
+    # E to close gap when very far
+    if e_ready and enemy_dist > 1300 and my_hp_pct > 0.25:
+        e_x = my_x + math.cos(angle_to_enemy) * 475
+        e_y = my_y + math.sin(angle_to_enemy) * 475
+        return (2, [[2], [e_y, e_x]])
+    
+    # Far: rush toward enemy with juke
+    if enemy_dist > 1000:
+        juke = math.sin(game_time * 0.011) * math.pi / 4
+        move_angle = angle_to_enemy + juke
+        mx = my_x + math.cos(move_angle) * 400
+        my_ = my_y + math.sin(move_angle) * 400
+        return (1, [my_, mx])
+    
+    # Too close: kite back
+    if enemy_dist < 350:
+        angle_away = math.atan2(-enemy_dy, -enemy_dx)
+        mx = my_x + math.cos(angle_away) * 350
+        my_ = my_y + math.sin(angle_away) * 350
+        return (1, [my_, mx])
+    
+    # Optimal range (350-1000): rapid unpredictable orbiting
+    t = game_time
+    # Multiple sine waves with different frequencies for unpredictability
+    juke1 = math.sin(t * 0.015) * 0.7
+    juke2 = math.sin(t * 0.0083 + 2.1) * 0.5
+    juke3 = math.sin(t * 0.027 + 0.7) * 0.4
+    combined = juke1 + juke2 + juke3
+    orbit_angle = angle_to_enemy + (math.pi / 2) * combined
+    mx = my_x + math.cos(orbit_angle) * 300
+    my_ = my_y + math.sin(orbit_angle) * 300
+    return (1, [my_, mx])
+```
+
+Wait, this is essentially the current policy! Let me look at what's ACTUALLY different/wrong.
+
+The current policy has these exact issues:
+1. tick % 3 means only casting 2/3 of the time (phases 0 and 1 cast, phase 2 moves)
+2. R only fires when `tick % 4 == 0` AND it's phase 1 → very rare
+3. The orbit juke pattern is smooth/predictable
+
+Looking at the data: the bot orbits between (6300-6700) on both axes for 20+ seconds. Enemy dist stays around 600-1300. Bot casts Q on phase 0 and W/R on phase 1, moves on phase 2. But Q keeps missing because the enemy dodges.
+
+**What I need to change:**
+
+1. **Increase R frequency dramatically** - R is a wide beam that's much harder to dodge than Q. With no cooldowns, spam R. Make R fire every other cast tick.
+
+2. **Use E→Q combo** - Blink to point-blank range and fire Q. Nearly unmissable.
+
+3. **Change orbit to be more erratic** - Instead of smooth sinusoidal, use sharp directional changes.
+
+4. **When casting Q, add slight lead based on orbit direction** - If enemy is orbiting, lead slightly in their movement direction.
+
+Actually, the biggest insight: **R does massive AoE damage and is a wide beam**. With no cooldowns, we should be spamming R much more than Q. R is harder to dodge. Let me make R the primary damage source and Q the filler.
+
+Also, I notice the hp_advantage check for E engage is `> 0.2` in current policy but both start even and stay roughly even. So the E engage never triggers. Lower this to `> 0.05` or just make E engage a regular part of the rotation.
+
+Let me also consider: the E→Q combo. E blinks 475 units. If we're at 800 range, E puts us at ~325 from enemy. At 325 range, Q travel time is ~163ms. Enemy move speed is ~340 units/sec, so they move ~56 units in that time. Q hitbox is ~60 wide, so they'd need to move perpendicular AND react in time. This is very likely to hit.
+
+After E→Q, we're at 325 range. Then we need to kite back. So the rotation is: E forward → Q → move back → R → move back → E forward → Q → etc.
+
+New policy with E→Q focus:
+
+```python
+def act(self, observation):
+    import math
+    
+    my_champ = next(unit for unit in observation["champ_units"] if unit["my_team"] == 1)
+    enemy_champ = next(unit for unit in observation["champ_units"] if unit["my_team"] == 0)
+    
+    my_hp_pct = my_champ["current_hp"] / max(my_champ["max_hp"], 1)
+    enemy_hp_pct = enemy_champ["current_hp"] / max(enemy_champ["max_hp"], 1)
+    my_x = my_champ["position"]["X"]
+    my_y = my_champ["position"]["Y"]
+    enemy_dx = enemy_champ["dx_to_me"]
+    enemy_dy = enemy_champ["dy_to_me"]
+    enemy_dist = enemy_champ["distance_to_me"]
+    enemy_x = enemy_champ["position"]["X"]
+    enemy_y = enemy_champ["position"]["Y"]
+    
+    q_ready = my_champ["q_cooldown"] == 0
+    w_ready = my_champ["w_cooldown"] == 0
+    e_ready = my_champ["e_cooldown"] == 0
+    r_ready = my_champ["r_cooldown"] == 0
+    
+    game_time = observation["game_time"]
+    angle_to_enemy = math.atan2(enemy_dy, enemy_dx)
+    hp_advantage = my_hp_pct - enemy_hp_pct
+    
+    # Threatening projectiles - tight filter
+    threatening = []
+    for p in observation["projectiles"]:
+        if p["my_team"] == 0:
+            dist = p["distance_to_me"]
+            pdx = p["dx_to_me"]
+            pdy = p["dy_to_me"]
+            if dist < 400:
+                dot = pdx * enemy_dx + pdy * enemy_dy
+                if dot > 0 or dist < 200:
+                    threatening.append(p)
+    
+    # OVERRIDE: Dodge very close projectiles
+    if threatening:
+        closest = min(threatening, key=lambda p: p["distance_to_me"])
+        pdx = closest["dx_to_me"]
+        pdy = closest["dy_to_me"]
+        perp_x = -pdy
+        perp_y = pdx
+        mag = math.sqrt(perp_x**2 + perp_y**2)
+        if mag > 0:
+            perp_x /= mag
+            perp_y /= mag
+        
+        if closest["distance_to_me"] < 200 and e_ready:
+            e_x = my_x + perp_x * 475
+            e_y = my_y + perp_y * 475
+            return (2, [[2], [e_y, e_x]])
+        
+        dodge_x = my_x + perp_x * 350
+        dodge_y = my_y + perp_y * 350
+        return (1, [dodge_y, dodge_x])
+    
+    tick = int(game_time / 250)
+    phase = tick % 3  # 0=attack, 1=attack2, 2=move
+    
+    # AGGRESSIVE E→Q when HP advantage OR to engage
+    if hp_advantage > 0.1 and e_ready and enemy_dist > 400 and enemy_dist < 1500:
+        e_target = min(475, enemy_dist - 150)
+        e_x = my_x + math.cos(angle_to_enemy) * e_target
+        e_y = my_y + math.sin(angle_to_enemy) * e_target
+        return (2, [[2], [e_y, e_x]])
+    
+    # Phase 0: R (wide beam, high damage, hard to dodge)
+    if phase == 0:
+        if r_ready:
+            return (2, [[3], [enemy_y, enemy_x]])
+        if q_ready and enemy_dist < 1100:
+            return (2, [[0], [enemy_y, enemy_x]])
+    
+    # Phase 1: Q + W
+    if phase == 1:
+        if q_ready and enemy_dist < 1100:
+            return (2, [[0], [enemy_y, enemy_x]])
+        if w_ready and enemy_dist < 1000:
+            return (2, [[1], [enemy_y, enemy_x]])
+    
+    # Phase 2: Move
+    # E to close gap when far
+    if e_ready and enemy_dist > 1300 and my_hp_pct > 0.25:
+        e_x = my_x + math.cos(angle_to_enemy) * 475
+        e_y = my_y + math.sin(angle_to_enemy) * 475
+        return (2, [[2], [e_y, e_x]])
+    
+    if enemy_dist > 1000:
+        juke = math.sin(game_time * 0.011) * math.pi / 4
+        move_angle = angle_to_enemy + juke
+        mx = my_x + math.cos(move_angle) * 400
+        my_ = my_y + math.sin(move_angle) * 400
+        return (1, [my_, mx])
+    
+    if enemy_dist < 350:
+        angle_away = math.atan2(-enemy_dy, -enemy_dx)
+        mx = my_x + math.cos(angle_away) * 350
+        my_ = my_y + math.sin(angle_away) * 350
+        return (1, [my_, mx])
+    
+    # Orbit unpredictably
+    t = game_time
+    # Sharp direction changes instead of smooth sine
+    rapid = 1.0 if int(t / 300) % 2 == 0 else -1.0
+    jitter = math.sin(t * 0.031) * 0.3
+    orbit_angle = angle_to_enemy + (math.pi / 2) * (rapid + jitter)
+    mx = my_x + math.cos(orbit_angle) * 300
+    my_ = my_y + math.sin(orbit_angle) * 300
+    return (1, [my_, mx])
+```
+
+The key changes from the current policy:
+1. **R fires every 3rd tick (phase 0)** instead of every 12th tick (tick%4==0 AND phase 1). Much more R damage.
+2. **E aggressive engage at hp_advantage > 0.1** (was 0.2). More frequent E→Q combos.
+3. **Sharper orbiting** - binary direction switch every 300ms instead of smooth sine. Harder to predict.
+4. **R is primary damage in phase 0**, Q is filler in phase 1.
+5. **W used as filler** when Q has been cast.
+
+This should significantly increase DPS while maintaining dodging capability.
+</history>
+
+<example>
+<thinking>
+During this episode, I constantly lost reward as I was hit by skillshots frequently due to being poor at dodging them.
+Therefore, I'm now going to try wiggling my character model rapidly moving back and forth before comitting to
+a skillshot, to make it harder for the enemy Ezreal to land a skillshot on me.
+<thinking>
+<policy>
+
+def act(self, obs):
+    import math # YOU MUST IMPORT THIS MODULE EVERY SINGLE TIME. DO NOT IMOPRT ANY OTHER MODULES
+    
+    # Get our champion and enemy champion info
+    my_champ = next(unit for unit in observation["champ_units"] if unit["my_team"] == 1)
+    enemy_champ = next(unit for unit in observation["champ_units"] if unit["my_team"] == 0)
+    nearby_projectiles = [p for p in observation["projectiles"] 
+                         if p["my_team"] == 0 and p["distance_to_me"] < 800]
+
+    # High priority: Dodge enemy skillshots (prevents HP loss which has high negative reward)
+    if nearby_projectiles:
+        proj = nearby_projectiles[0]
+        # Calculate perpendicular dodge direction
+        dodge_x = proj["dy_to_me"]
+        dodge_y = -proj["dx_to_me"]
+        magnitude = (dodge_x**2 + dodge_y**2)**0.5
+        if magnitude > 0:
+            dodge_x = (dodge_x/magnitude * 200) + my_champ["position"]["X"]
+            dodge_y = (dodge_y/magnitude * 200) + my_champ["position"]["Y"]
+            return (1, [dodge_y, dodge_x])
+
+    # Offensive opportunities (for kill rewards and HP damage)
+    if enemy_champ["distance_to_me"] < 600:
+        # Check if we have HP advantage
+        my_hp_percent = my_champ["current_hp"] / my_champ["max_hp"]
+        enemy_hp_percent = enemy_champ["current_hp"] / enemy_champ["max_hp"]
+        
+        if my_hp_percent > enemy_hp_percent + 0.2:  # We have significant HP advantage
+            # Cast Q if available and in range
+            if my_champ["q_cooldown"] == 0:
+                return (2, [[0], [enemy_champ["position"]["Y"], enemy_champ["position"]["X"]]])
+        else:
+            # Maintain safe distance if we don't have HP advantage
+            retreat_x = my_champ["position"]["X"] - enemy_champ["dx_to_me"]
+            retreat_y = my_champ["position"]["Y"] - enemy_champ["dy_to_me"]
+            return (1, [retreat_y, retreat_x])
+
+    # Resource management (MP has moderate reward weight)
+    if my_champ["current_mp"] / my_champ["max_mp"] < 0.3:
+        # Play conservatively when low on mana
+        safe_x = my_champ["position"]["X"] + (enemy_champ["dx_to_me"] * -1.5)
+        safe_y = my_champ["position"]["Y"] + (enemy_champ["dy_to_me"] * -1.5)
+        return (1, [safe_y, safe_x])
+
+    # Default behavior: Maintain optimal trading range
+    optimal_range = 500  # Adjust based on champion
+    if enemy_champ["distance_to_me"] > optimal_range:
+        # Move closer
+        approach_x = my_champ["position"]["X"] + enemy_champ["dx_to_me"] * 0.5
+        approach_y = my_champ["position"]["Y"] + enemy_champ["dy_to_me"] * 0.5
+        return (1, [approach_y, approach_x])
+    else:
+        # Orbit around enemy while in range
+        orbit_angle = math.atan2(enemy_champ["dy_to_me"], enemy_champ["dx_to_me"])
+        orbit_x = enemy_champ["position"]["X"] + math.cos(orbit_angle + math.pi/4) * optimal_range
+        orbit_y = enemy_champ["position"]["Y"] + math.sin(orbit_angle + math.pi/4) * optimal_range
+        return (1, [orbit_y, orbit_x])
+</policy>
+</example>
+
+<task>
+You must now return the new policy based on <example></example>.
+Simply infill and complete the tags below.
+DO NOT PROVIDE ANY PREAMBLE OR IRRELEVANT TEXT, FILL IN THE TEMPLATE AS REQUIRED.
+</task>
+
+<thinking>

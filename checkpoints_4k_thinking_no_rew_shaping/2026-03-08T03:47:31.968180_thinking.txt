@@ -1,0 +1,37 @@
+Looking at the experience data carefully:
+
+1. **T0-T1016**: Bot stays COMPLETELY STILL at (6350,6350). Enemy at (1300,1300). Distance ~7100 units. **NO ACTIONS TAKEN** - the bot is doing nothing for over 1 second of game time!
+
+2. **T1277**: Enemy fires R (EzrealTrueshotBarrage) - two projectiles appear at distance ~1300 each heading toward us.
+
+3. **T1770-T2001**: Bot barely moves (6350→6350,6435→6510). The R projectile is getting closer (distance shrinking from 1300 to ~300).
+
+4. **T2263**: HP drops from 100% to 64%! Got hit by R. Enemy also at 64% (mirror?).
+
+5. **T2526-T3280**: More R projectiles fired. HP drops further to 30%.
+
+6. **T3512**: Both at 30% HP. Bot still barely moving.
+
+**Critical Issues**:
+- The bot is NOT MOVING toward the enemy. Distance is ~7000+ units, way beyond any ability range (1100 for Q).
+- Enemy dist is huge, so `enemy_dist < 1200` for E fails, `enemy_dist < 1100` for Q fails, `enemy_dist < 1000` for W fails.
+- The only thing that triggers is `enemy_dist > 1050` approach code, but the juke pattern moves very slowly.
+- Meanwhile enemy R (global range) hits us because we barely dodge.
+- The bot doesn't use R back (which is also global) because `enemy_dist < 2000` fails (dist ~7000).
+
+**Key fixes needed**:
+1. **Use R at any range** - it's global! Fire R at enemy immediately while closing distance
+2. **Move DIRECTLY toward enemy faster** - stop juking at extreme range, just rush in
+3. **Dodge R projectiles** - they're huge and do massive damage
+4. **Increase R range check** to be very large or unlimited
+5. **Better projectile dodge threshold** - R projectiles were at 300 distance but our threshold is also 300, may have been too late
+
+From history: the bot was previously not casting abilities. Now it casts but misses at close range. But THIS game shows a completely different problem - the bot never gets in range because it approaches too slowly, and gets killed by enemy R (global) while approaching.
+
+**New strategy**:
+1. If far away (>2000), fire R immediately (global range) and rush toward enemy
+2. Cast R liberally - no cooldowns means spam it
+3. Dodge projectiles at larger range (500+) since R is wide
+4. Use E to close gaps when far
+5. Once in range, spam Q/W/R constantly
+6. Keep the perpendicular dodge logic but trigger it earlier

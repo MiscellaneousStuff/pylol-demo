@@ -1,0 +1,29 @@
+Looking at the experience data carefully:
+
+1. **We're Ezreal vs Ezreal** (mirror match)
+2. **We start at ~(6350,6350), enemy at ~(1300,1300)** - ~7100 units apart
+3. **HP drops**: At T2754 both drop to 64% (R hit each other). At T9780 enemy drops to 31% but we stay at 66% - we landed something! At T12776 we drop to 32% while enemy is 32%. Then it stabilizes around 32-33% for both.
+4. **The bot barely closes distance** - we stay around (6200-6400) range the entire game, never getting closer than ~5000 units to the enemy
+5. **All projectiles show huge distances** (dx/dy values of 500-1500+) - never getting close enough to use short-range abilities
+
+Key problems:
+- **Not approaching the enemy at all** - distance stays ~7000 the entire game
+- **Only casting Q and R at long range** which both hit equally (mirror match)
+- **Never getting into E range** to use blink aggressively
+- **Time-based cycling is too slow** - game_time values are in milliseconds-ish, and dividing by 100-150 means very slow action cycling
+- **Projectile dodging doesn't work** because projectiles are all far away (dx/dy > 600)
+
+The fundamental issue: **The bot needs to WALK toward the enemy aggressively.** Every single action should either be moving toward the enemy or casting an ability at them. The zigzag approach is getting confused by the time modulo.
+
+New strategy:
+1. **Primary goal**: Close distance to enemy ASAP by moving toward them every other tick
+2. **Cast Q/R while approaching** (alternating with movement)
+3. **Once within ~500 range, spam E on enemy** (blink deals damage, repositions)
+4. **Dodge only very close projectiles** (< 300 distance) with perpendicular movement
+5. **Use faster cycling** - game_time increments by ~250 per tick, so modulo needs to account for that
+
+The game_time values go: 0, 261, 524, 753, 1016... incrementing by ~250 each step. So `game_time // 250` gives us a tick counter we can use to alternate actions.
+
+Critical insight: We should ALWAYS be either moving toward enemy or casting. Never standing still. The approach should be the DEFAULT, with abilities cast opportunistically while moving.
+
+With no cooldowns, the ideal pattern is: move toward enemy → Q → move → W → move → E (when close) → R → repeat. But since we can only do one action per tick, we should alternate: cast ability aimed at enemy (which moves us toward), then move toward.

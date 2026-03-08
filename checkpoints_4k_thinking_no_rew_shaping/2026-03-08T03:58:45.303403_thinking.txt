@@ -1,0 +1,267 @@
+<thinking>
+Let me analyze the latest experience data carefully:
+
+1. **T0-T526**: Bot at (6350,6350), enemy at (1300,1300). Distance ~7100. Bot starts moving toward enemy at T526 (moved to 6685,6685).
+2. **T1016**: First projectiles appear - EzrealMysticShot from both sides. Bot still at (6685,6685).
+3. **T1278**: More projectiles - R (TrueshotBarrage) fired by both sides.
+4. **T1508**: HP drops to 86% for both. Bot moved slightly to (6747,6643).
+5. **T1772**: HP drops to 51%! Got hit by R. Both at 51%.
+6. **T2002-T9260**: HP stays at 51-52%. Bot orbits around (6200-6400, 6000-6200). Enemy stays at (100-500, 200-900). Distance is ~sqrt(300^2 + 500^2) ≈ 580. Bot is IN RANGE for Q (1100) but NEVER CASTS.
+7. **T9523**: Enemy HP drops to 18%! We must have landed something. Our HP still 52%.
+8. **T9754-T24531**: Enemy stays at 18-21%. We stay at 53-56%. Neither side deals significant damage anymore.
+
+So the pattern is:
+- Initial R exchange: both drop to 51%
+- Then some damage lands on enemy (drops to 18%) around T9523
+- After that, both just orbit and neither lands anything
+
+**Why isn't the bot casting Q?** Looking at the current policy:
+
+The dodge block checks for enemy projectiles within 400 distance where `dot > 0 or dist < 200`. Looking at projectiles in the data:
+
+At T2002: Multiple projectiles. Some like `[1073741854,-529,-306,2000,EzrealTrueshotBarrage]` have negative dx (past us). But `[1073741853,890,1113,2000,EzrealTrueshotBarrage]` - this is team 1073741853. Need to check which team is enemy (my_team==0).
+
+Wait, the projectile data format in observations is `[owner, dx, dy, speed, name]` but in the dict it would have `my_team`, `dx_to_me`, `dy_to_me`, `distance_to_me`, `speed`, `name`.
+
+Looking at the current policy, threatening projectiles are filtered by:
+- `my_team == 0` (enemy)
+- `dist < 400`
+- `dot > 0 or dist < 200`
+
+The `dot = pdx * enemy_dx + pdy * enemy_dy` checks if the projectile is in the same direction as the enemy. This is a decent filter.
+
+But the problem is: **Q IS Priority 0 (before dodge)**. In the current policy, Q is cast FIRST when in range:
+
+```python
+if q_ready and enemy_dist < 1100:
+    return (2, [[0], [aim_y, aim_x]])
+```
+
+So if enemy is within 1100, Q should fire EVERY tick. Looking at enemy_dist: enemy_dx and enemy_dy are typically 200-600, so dist ~300-850. This IS within 1100. So Q SHOULD be firing.
+
+But wait - looking at the experience, both HP values stay constant for long periods. If Q is firing every tick, surely some would hit. Unless:
+1. Q has a cast animation that prevents re-casting immediately
+2. The lead prediction is causing misses
+3. There's something else preventing the cast
+
+Actually, looking at T9523: enemy drops from 52% to 18% - that's a massive damage spike. Then stays at 18-19% afterward. This suggests something DID hit (maybe R?). The tick-based R logic: `tick = int(game_time / 250)`, `tick % 8 == 0`. At T9523, tick = 38, 38%8 = 6, not 0. But at T9260, tick = 37, 37%8 = 5. Hmm, nearby ticks: 32%8=0 (T8000), 40%8=0 (T10000). So R would fire around T8000 and T10000.
+
+Actually, the R was probably fired and hit, causing the big damage at T9523.
+
+The key observation: **Q is supposedly being cast every tick but not hitting**. The lead prediction might be causing all misses:
+```python
+lead_offset = math.sin(game_time * 0.019) * 150
+```
+
+With game_time at 5000-10000, `sin(5000 * 0.019) = sin(95)` which oscillates rapidly. The 150-unit offset might be causing consistent misses.
+
+Also, both champions seem to be orbiting each other at range 400-800, both dodging. The Q projectile travels at 2000 speed, taking ~0.3-0.4 seconds to reach. During that time, the enemy moves ~100-150 units. So aiming at current position might actually be better than the lead prediction which adds random offset.
+
+**Key issues to fix:**
+
+1. **Remove or reduce Q lead prediction** - Aim directly at enemy position, or use very small lead
+2. **The bot IS casting Q but missing** - Need better aim
+3. **Use W before Q for mark damage** - W+Q combo does more
+4. **Use R more frequently** - It's a wide beam, easier to hit
+5. **Dodge needs to be smarter** - Only dodge projectiles actually heading at us with better filtering
+6. **Need to consider that projectiles from BOTH teams exist** - Ensure we only dodge enemy ones
+
+Actually wait, let me re-examine. Looking at the observation carefully:
+
+T3021 has many projectiles: some with `my_team` 1073741854 and some 1073741853. These IDs probably map to specific teams. In the observation dict, `my_team` would be 0 or 1. The raw observation format shows the owner ID, but the dict should normalize this.
+
+Looking at the current policy's threatening filter more carefully:
+- It checks `p["my_team"] == 0` - only enemy projectiles
+- `dist < 400` - close ones
+- `dot > 0 or dist < 200` - heading toward us
+
+This seems reasonable. But there might always be projectiles within 400 from BOTH teams. If the filter correctly identifies enemy ones, then maybe only 1-2 are threatening at any time.
+
+The real problem might be simpler: **the Q IS being cast, but it's missing every time because the lead prediction is bad AND the enemy is dodging**.
+
+**New strategy for hitting Q:**
+
+1. **Aim directly at enemy** - No lead prediction. Even if they dodge, sometimes they won't.
+2. **Use W first** - W is a wider/different hitbox, marking enemy. Then Q procs it.
+3. **Use R more** - R is a massive beam, much harder to dodge at close range.
+4. **Cast E toward enemy then Q** - E blinks you close, then Q point-blank is almost guaranteed.
+5. **Vary timing** - Don't cast Q every tick (enemy can predict). Instead, cast Q, move, move, Q to vary timing.
+
+Actually, the biggest bang for buck: **Use E aggressively**. E blinks 475 units. If we're at 800 range, E puts us at 325 range. Then Q at 325 range is nearly instant (0.16 seconds) and very hard to dodge. This is classic Ezreal E-Q burst.
+
+**Revised Policy:**
+
+1. If far (>1200): Move toward enemy with juke pattern. Cast R occasionally.
+2. If in range (600-1200): 
+   - Priority: Cast Q directly at enemy (no lead)
+   - Then W for mark
+   - Dodge if projectile very close (<300)
+3. If close (<600): Q spam, kite if needed
+4. Use E aggressively: E toward enemy → immediate Q for burst
+5. R on tick timer (every ~8 ticks) for extra damage
+
+The E→Q combo is key. With no cooldowns, we can E→Q→E→Q repeatedly. Each E puts us point-blank and Q is nearly unmissable.
+
+But E also repositions us, so we need to be careful not to E into enemy projectiles.
+
+Let me write the new policy:
+
+```python
+def act(self, observation):
+    import math
+    
+    my_champ = next(unit for unit in observation["champ_units"] if unit["my_team"] == 1)
+    enemy_champ = next(unit for unit in observation["champ_units"] if unit["my_team"] == 0)
+    
+    my_hp_pct = my_champ["current_hp"] / max(my_champ["max_hp"], 1)
+    enemy_hp_pct = enemy_champ["current_hp"] / max(enemy_champ["max_hp"], 1)
+    my_x = my_champ["position"]["X"]
+    my_y = my_champ["position"]["Y"]
+    enemy_dx = enemy_champ["dx_to_me"]
+    enemy_dy = enemy_champ["dy_to_me"]
+    enemy_dist = enemy_champ["distance_to_me"]
+    enemy_x = enemy_champ["position"]["X"]
+    enemy_y = enemy_champ["position"]["Y"]
+    
+    q_ready = my_champ["q_cooldown"] == 0
+    w_ready = my_champ["w_cooldown"] == 0
+    e_ready = my_champ["e_cooldown"] == 0
+    r_ready = my_champ["r_cooldown"] == 0
+    
+    game_time = observation["game_time"]
+    angle_to_enemy = math.atan2(enemy_dy, enemy_dx)
+    
+    # Filter threatening projectiles - only very close enemy projectiles
+    # that are roughly between us and enemy (heading toward us)
+    threatening = []
+    for p in observation["projectiles"]:
+        if p["my_team"] == 0:
+            dist = p["distance_to_me"]
+            pdx = p["dx_to_me"]
+            pdy = p["dy_to_me"]
+            if dist < 400:
+                # Check if projectile is on same side as enemy (heading toward us)
+                dot = pdx * enemy_dx + pdy * enemy_dy
+                if dot > 0 or dist < 200:
+                    threatening.append(p)
+    
+    # PRIORITY 0: Cast Q at enemy - THIS IS THE HIGHEST PRIORITY
+    # No cooldowns = spam Q every tick for maximum DPS
+    # Aim directly at enemy position (no lead - lead was causing misses)
+    if q_ready and enemy_dist < 1100:
+        return (2, [[0], [enemy_y, enemy_x]])
+    
+    # PRIORITY 1: Dodge VERY close projectiles (only after Q cast attempted)
+    if threatening:
+        closest = min(threatening, key=lambda p: p["distance_to_me"])
+        pdx = closest["dx_to_me"]
+        pdy = closest["dy_to_me"]
+        perp_x = -pdy
+        perp_y = pdx
+        mag = math.sqrt(perp_x**2 + perp_y**2)
+        if mag > 0:
+            perp_x /= mag
+            perp_y /= mag
+        
+        # E dodge for extremely close projectiles
+        if closest["distance_to_me"] < 200 and e_ready:
+            e_x = my_x + perp_x * 475
+            e_y = my_y + perp_y * 475
+            return (2, [[2], [e_y, e_x]])
+        
+        dodge_x = my_x + perp_x * 350
+        dodge_y = my_y + perp_y * 350
+        return (1, [dodge_y, dodge_x])
+    
+    # PRIORITY 2: Cast W for mark damage
+    if w_ready and enemy_dist < 1000:
+        return (2, [[1], [enemy_y, enemy_x]])
+    
+    # PRIORITY 3: Use R periodically for burst (wide beam = easier to hit)
+    tick = int(game_time / 250)
+    if r_ready and tick % 8 == 0:
+        return (2, [[3], [enemy_y, enemy_x]])
+    
+    # PRIORITY 4: Use E to close gap when far
+    if e_ready and enemy_dist > 1300 and my_hp_pct > 0.25:
+        e_x = my_x + math.cos(angle_to_enemy) * 475
+        e_y = my_y + math.sin(angle_to_enemy) * 475
+        return (2, [[2], [e_y, e_x]])
+    
+    # PRIORITY 5: Movement and positioning
+    # Far: approach with juke
+    if enemy_dist > 1000:
+        juke = math.sin(game_time * 0.011) * math.pi / 4
+        move_angle = angle_to_enemy + juke
+        mx = my_x + math.cos(move_angle) * 400
+        my_ = my_y + math.sin(move_angle) * 400
+        return (1, [my_, mx])
+    
+    # Too close: kite back
+    if enemy_dist < 350:
+        angle_away = math.atan2(-enemy_dy, -enemy_dx)
+        mx = my_x + math.cos(angle_away) * 350
+        my_ = my_y + math.sin(angle_away) * 350
+        return (1, [my_, mx])
+    
+    # Optimal range: unpredictable orbiting
+    t = game_time
+    juke1 = math.sin(t * 0.015) * 0.7
+    juke2 = math.sin(t * 0.0083 + 2.1) * 0.5
+    juke3 = math.sin(t * 0.027 + 0.7) * 0.4
+    combined = juke1 + juke2 + juke3
+    orbit_angle = angle_to_enemy + (math.pi / 2) * combined
+    mx = my_x + math.cos(orbit_angle) * 300
+    my_ = my_y + math.sin(orbit_angle) * 300
+    return (1, [my_, mx])
+```
+
+Wait, this is essentially the same as the current policy with the lead prediction removed. The current policy already has Q as Priority 0. So why isn't Q hitting?
+
+Let me look at the data again more carefully. The enemy's relative position (dx, dy) oscillates between ~(0-600, 100-900). That means the enemy is moving around unpredictably too.
+
+The issue might be that:
+1. Q IS being cast every tick
+2. But the enemy dodges most of them
+3. Both sides land approximately equally, resulting in equal HP
+
+Looking at T1772: both drop to 51%. That's pretty even. Then at T9523, enemy drops to 18% but we stay at 52%. So we DID land more damage somehow.
+
+Actually, the more I look at it, the current policy might be working okay - it's just a mirror match and both bots are equally good. The fact that we're at 53% and enemy at 18-20% means we're actually WINNING.
+
+But then from T9523 onward, enemy stays at 18-20% and slowly regens. We stay at 53-56%. Neither side finishes the other. The problem is we can't FINISH the kill.
+
+**The real issue: we need to be more aggressive when we have HP advantage.**
+
+When we're at 53% HP and enemy is at 18%, we should:
+1. Use E aggressively to close gap
+2. Spam Q/W/R to finish them
+3. Take calculated trades (even if we get hit, we can afford it)
+
+**Key improvement: HP-advantage-based aggression.**
+
+When we have significant HP advantage (>20% more), switch to aggressive mode:
+- E toward enemy
+- Spam all abilities
+- Don't worry about dodging as much
+
+When HP disadvantage, play safe and dodge more.
+
+Also, I need to make R fire more often. Every 8 ticks (2 seconds) is too infrequent. R is massive damage and wide - it should be used every 3-4 ticks at least.
+
+Let me also look at whether the Q lead prediction was actually helping or hurting. The current policy has:
+```python
+lead_offset = math.sin(game_time * 0.019) * 150
+```
+
+At game_time 5000: sin(95) ≈ sin(95 mod 2π) = sin(95 - 30*π) ≈ sin(0.75) ≈ 0.68. So offset ≈ 102 units.
+At game_time 5250: sin(99.75) ≈ sin(99.75 - 31*π) ≈ sin(2.39) ≈ 0.67. offset ≈ 100 units.
+
+The lead oscillates but slowly. This might actually be WORSE than no lead because it consistently pushes aim off-center. Better to aim directly at the enemy.
+
+Let me finalize the policy with these key changes:
+1. **Remove Q lead prediction** - aim directly at enemy
+2. **HP-advantage aggression** - E aggressively when ahead
+3. **More frequent R** - every 4 ticks instead of 8
+4. **Tighter dodge radius** - only dodge truly close projectiles
+5. **Better orbiting** - more unpredictable movement pattern

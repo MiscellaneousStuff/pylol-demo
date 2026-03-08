@@ -1,0 +1,20 @@
+Looking at the experience data, the critical problem is clear:
+
+1. **The bot NEVER attacks** - Throughout the entire episode (24+ seconds), the bot stays at 100% HP and 35 gold with 0 kills. The enemy also stays at 100% HP. The bot is just orbiting/moving around at ~1900-2400 distance from the enemy, never getting close enough or casting any abilities.
+
+2. **Enemy distance is always ~1800-2500** - The enemy_dx and enemy_dy values show distances of 1400-1700+ in each axis, meaning total distance is roughly 1900-2500. This is WAY beyond Q range (1150). The bot's "optimal_range = 850" means it tries to approach, but the zigzag approach at 30-degree angles is too slow and inefficient.
+
+3. **Projectiles are all at >900 distance** - The projectile distances are all 1300-1700+, yet the dodge threshold is 900. The bot keeps dodging these far-away projectiles instead of approaching the enemy. Looking at projectile dx/dy values, they're all very far (500-900+), so `distance_to_me` would be huge. Wait - the dodge threshold is `< 900` and the projectiles have distances like `p["distance_to_me"]`. Let me check... the projectiles show dx_to_me values like 358, 485 etc. The distance would be sqrt(358² + 485²) ≈ 603. So they ARE within 900 range!
+
+4. **The bot is constantly dodging far-away projectiles** - It's always in dodge mode because there are always 4 projectiles within 900 range. This prevents it from ever casting Q or approaching. The projectiles might be persistent (W fields?) or the bot's own projectiles being misclassified.
+
+5. **There are always 4 projectiles** - This is suspicious. These might be Ezreal's W essence flux or they could be the bot's own projectiles. The `my_team == 0` filter should exclude own projectiles... but there are ALWAYS exactly 4 projectiles. They might be minion-related or persistent objects.
+
+Key fixes needed:
+- **Reduce dodge radius significantly** or filter out projectiles that aren't actually threatening (ones moving away from us)
+- **The bot must actually approach and fight** - get within Q range (1100) and cast abilities
+- **Cast Q aggressively** - Ezreal Q has 1150 range, bot needs to be within that
+- **Auto attack when close** - use auto attacks for damage
+- **Filter projectiles by whether they're actually approaching** - check if the projectile is getting closer
+
+The projectiles always have positive dx_to_me and dy_to_me, meaning the projectiles are always to the right/above the bot. These might just be persistent objects that aren't actually threatening. I should filter by checking if the projectile is actually moving toward us.

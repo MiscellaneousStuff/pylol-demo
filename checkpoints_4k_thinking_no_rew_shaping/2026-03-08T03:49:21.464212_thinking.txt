@@ -1,0 +1,336 @@
+<thinking>
+Let me analyze the latest experience data carefully:
+
+1. **T0-T1020**: Bot stays completely still at (6350,6350). Enemy at (1300,1300). Distance ~7100 units. The bot does NOTHING for over 1 second. This is because the policy fires R first (Priority 0), but looking at the code... R IS ready, enemy dist IS > 0. So it should cast R. But the bot doesn't move at all.
+
+Wait, looking at the positions: ME at (26,280) at T33 but then ME at (6350,6350) at T0? The timestamps are out of order. Let me re-read...
+
+Actually T33 shows position (26,280) but T0 shows (6350,6350). This seems like the T33 entry might be from a different game or the ordering is off. Let me focus on the main sequence starting from T0.
+
+T0-T1020: Bot at (6350,6350), enemy at (1300,1300). Bot doesn't move. But the policy should trigger R (global range, ready). So why isn't anything happening? Maybe the game hasn't started yet? Or maybe the policy IS casting R but it doesn't show position change because R is a cast-in-place ability.
+
+T1282: Projectiles appear - EzrealTrueshotBarrage from both sides! So R WAS being cast by both sides. The projectiles have dx=1300 (enemy position relative to us) - these are R projectiles heading from enemy toward us.
+
+T1511-T2006: R projectiles approaching. dx decreasing from 1300 to 276. Bot still at (6350,6350) - NOT DODGING!
+
+T2268: HP drops from 100% to 64%! Got hit by enemy R. Position shifts to (6685,6685). Enemy at (629,629), also at 64%.
+
+T2532: More R projectiles. Both at 64%.
+
+T3022: HP drops to 30%! Got hit by another R. Both at 30%.
+
+T3251-T4531: HP at 16%. More R projectiles fired. Bot barely moves.
+
+T4531-T4761: HP at 16-17%. Both alive, spamming R at each other.
+
+**Key Problems with Current Policy:**
+
+1. **Bot spams R and nothing else** - R is Priority 1 (before Q, W, E, movement). Since cooldowns are disabled and R is always ready, the bot ONLY casts R every single tick. It never moves, never dodges, never casts Q/W.
+
+2. **Bot gets hit by enemy R because it never moves** - R cast doesn't move the character, so it stands still and eats every enemy R.
+
+3. **The R-only spam is a death loop** - Both sides spam R, both get hit, both die equally. No advantage gained.
+
+4. **Dodging never triggers** - The dodge code (Priority 0) checks for projectiles < 500 distance. But R is being cast every tick before the dodge check. Actually wait - dodge IS Priority 0 in the current policy. Let me re-read...
+
+Looking at the current policy:
+- Priority 0: Dodge close projectiles (< 500 dist)
+- Priority 1: Cast R (always, any range)
+- Priority 2: Cast Q (< 1150 range)
+- Priority 3: Cast W (< 1000 range)
+- Priority 4: E to close gap (> 1200)
+- Priority 5: Movement
+
+So the dodge SHOULD trigger when projectiles are within 500. But looking at T1774, projectile dist ~850 (sqrt(603²+603²)). At T2006, dist ~390 (sqrt(276²+276²)). So at T2006 the projectile IS within 500.
+
+But wait - the bot's position doesn't change at T2006 (still at 6350,6350). That means the dodge didn't trigger OR the dodge command was issued but didn't execute because the bot was already casting R.
+
+Actually, I think the problem is: **the bot casts R every tick, and R has a cast animation that locks the character in place**. So even though dodge is Priority 0, by the time a projectile gets within 500 range, the bot is mid-R-cast and can't move.
+
+Actually no, looking more carefully: the dodge IS priority 0 (before R). So when projectiles are within 500, it should dodge instead of casting R. But at T2006, projectiles are at dist 390 (within 500). At T2268, the bot moved to (6685,6685) - so it DID try to dodge, but too late (already got hit).
+
+The issue is the 500 threshold is too small for R projectiles which travel at 2000 speed. By the time they're within 500, you only have 250ms to dodge - not enough if you were casting R.
+
+**Solutions:**
+
+1. **Don't spam R as first priority** - R should be used strategically, not every tick
+2. **Increase dodge detection range** - For fast projectiles like R, need to dodge at 800+ distance
+3. **Prioritize Q over R** - Q is faster, more reliable at range
+4. **Move between casts** - Don't just stand and cast
+5. **Alternate between casting and moving** - Cast Q, then move to dodge, cast Q, move to dodge
+
+**New Strategy:**
+
+Since cooldowns are disabled, the optimal play is:
+1. Approach enemy while dodging
+2. At ~800-1000 range, alternate between casting Q and dodging
+3. Use W occasionally for mark damage
+4. Use R sparingly (when enemy can't dodge, or to finish)
+5. Use E for emergency dodges or gap closing
+6. ALWAYS be moving between ability casts
+
+The key insight: we need to INTERLEAVE actions. We can't just cast spells every tick - we need to move between casts to dodge. A simple alternation: cast Q one tick, move/dodge next tick.
+
+Let me also think about the movement issue. The bot starts at (6350,6350) and enemy at (1300,1300). Distance is sqrt((6350-1300)² + (6350-1300)²) ≈ 7141. The bot needs to close this gap. But in the current policy, R is always cast first, preventing any movement.
+
+Looking at the game_time: T0 to T4761. That's about 4.7 seconds of real game time. The bot needs to approach during this time.
+
+**New Policy Design:**
+
+I need a state machine approach:
+1. Far range (>1200): Move toward enemy, use R occasionally, dodge incoming R
+2. Mid range (800-1200): Spam Q, dodge, use W
+3. Close range (<800): Q spam, kite back if low HP, E if needed
+
+Key mechanic: **Alternate between casting and moving.** Use game_time modulo to alternate:
+- Even ticks: Cast an ability
+- Odd ticks: Move to dodge/reposition
+
+Actually, since we get observations every ~250ms, we can check: if there's a threatening projectile, dodge. Otherwise, cast an ability. This is better than blind alternation.
+
+But the problem is projectiles are ALWAYS present once they start firing. So we need smarter projectile filtering.
+
+Let me design the projectile threat assessment:
+- A projectile is threatening if:
+  1. It's from the enemy team (my_team == 0)
+  2. It's within a certain distance (say 600)
+  3. It's heading TOWARD us (distance is decreasing)
+
+We can estimate if it's heading toward us by checking: if the projectile position vector dot product with some inferred velocity is negative. But we don't track frame-to-frame.
+
+Alternative: use the projectile name and position. EzrealTrueshotBarrage (R) and EzrealMysticShot (Q) both travel in straight lines from enemy toward a target. If the projectile is between us and the enemy, it's likely heading toward us.
+
+Actually, simpler heuristic: if the projectile's dx_to_me has the same sign as enemy_dx_to_me AND the magnitude is smaller, the projectile is between us and the enemy, heading toward us. 
+
+Even simpler: just dodge any close enemy projectile. But raise/lower the threshold smartly.
+
+Let me write the new policy:
+
+```python
+def act(self, observation):
+    import math
+    
+    my_champ = next(unit for unit in observation["champ_units"] if unit["my_team"] == 1)
+    enemy_champ = next(unit for unit in observation["champ_units"] if unit["my_team"] == 0)
+    
+    my_hp_pct = my_champ["current_hp"] / max(my_champ["max_hp"], 1)
+    enemy_hp_pct = enemy_champ["current_hp"] / max(enemy_champ["max_hp"], 1)
+    my_x = my_champ["position"]["X"]
+    my_y = my_champ["position"]["Y"]
+    enemy_dx = enemy_champ["dx_to_me"]
+    enemy_dy = enemy_champ["dy_to_me"]
+    enemy_dist = enemy_champ["distance_to_me"]
+    enemy_x = enemy_champ["position"]["X"]
+    enemy_y = enemy_champ["position"]["Y"]
+    
+    q_ready = my_champ["q_cooldown"] == 0
+    w_ready = my_champ["w_cooldown"] == 0
+    e_ready = my_champ["e_cooldown"] == 0
+    r_ready = my_champ["r_cooldown"] == 0
+    
+    game_time = observation["game_time"]
+    
+    # Identify truly threatening enemy projectiles
+    threatening = []
+    for p in observation["projectiles"]:
+        if p["my_team"] == 0:
+            dist = p["distance_to_me"]
+            if dist < 500:
+                threatening.append(p)
+    
+    # PRIORITY 0: Dodge close projectiles ALWAYS
+    if threatening:
+        closest = min(threatening, key=lambda p: p["distance_to_me"])
+        pdx = closest["dx_to_me"]
+        pdy = closest["dy_to_me"]
+        perp_x = -pdy
+        perp_y = pdx
+        mag = math.sqrt(perp_x**2 + perp_y**2)
+        if mag > 0:
+            perp_x /= mag
+            perp_y /= mag
+        
+        if closest["distance_to_me"] < 250 and e_ready:
+            e_x = my_x + perp_x * 475
+            e_y = my_y + perp_y * 475
+            return (2, [[2], [e_y, e_x]])
+        
+        dodge_x = my_x + perp_x * 350
+        dodge_y = my_y + perp_y * 350
+        return (1, [dodge_y, dodge_x])
+    
+    # PRIORITY 1: R when far (global) - but alternate with movement
+    if r_ready:
+        ...
+```
+
+Wait, the core problem is still: R is always ready (no cooldowns), so Priority 1 fires R every tick when there are no close projectiles. This means we never move toward enemy.
+
+I need to use game_time to pace abilities. For example, only cast R every N milliseconds to allow movement in between.
+
+Let me think about what game_time values look like: T0, T265, T526, T757, T1020... so intervals are ~250ms.
+
+I'll use a pacing mechanism:
+- Cast R once every ~1000ms (every 4th tick)
+- Cast Q every other tick when in range
+- Move/dodge on other ticks
+
+```python
+# Determine action phase based on time
+tick_phase = int(game_time / 250) % 4  # 0,1,2,3 cycling
+```
+
+Actually, let me think about this differently. The key issues from history:
+
+1. Bot stands still because it spams R every tick → Need to interleave movement
+2. Bot gets hit by R because it doesn't dodge in time → Need larger dodge radius
+3. Bot never uses Q/W because R takes priority → Need smarter ability usage
+4. Bot never approaches enemy → Need approach movement
+
+Here's my refined strategy:
+
+**Phase 1: Far away (>1200 distance)**
+- Use game_time % to alternate: R cast → move toward → R cast → move toward
+- Dodge any incoming projectiles with high priority
+
+**Phase 2: Mid range (600-1200)**
+- Alternate: Q cast → dodge/move → W cast → dodge/move
+- Use R occasionally for big damage
+- Juke unpredictably
+
+**Phase 3: Close range (<600)**
+- Spam Q, kite back
+- E if needed for safety
+
+The alternation is key. Let me use `game_time % 500` or similar to switch between cast/move modes.
+
+Actually, I think a cleaner approach: every tick, check if there's a projectile to dodge. If yes, dodge. If no, check what ability to cast based on range and a cycling counter. If no ability is appropriate, move toward/orbit enemy.
+
+The problem with my R-spam was that NO COOLDOWNS means R is always available. So I need to explicitly limit R usage.
+
+Let me write the final policy:
+
+```python
+def act(self, observation):
+    import math
+    
+    my_champ = next(unit for unit in observation["champ_units"] if unit["my_team"] == 1)
+    enemy_champ = next(unit for unit in observation["champ_units"] if unit["my_team"] == 0)
+    
+    my_hp_pct = my_champ["current_hp"] / max(my_champ["max_hp"], 1)
+    enemy_hp_pct = enemy_champ["current_hp"] / max(enemy_champ["max_hp"], 1)
+    my_x = my_champ["position"]["X"]
+    my_y = my_champ["position"]["Y"]
+    enemy_dx = enemy_champ["dx_to_me"]
+    enemy_dy = enemy_champ["dy_to_me"]
+    enemy_dist = enemy_champ["distance_to_me"]
+    enemy_x = enemy_champ["position"]["X"]
+    enemy_y = enemy_champ["position"]["Y"]
+    
+    q_ready = my_champ["q_cooldown"] == 0
+    w_ready = my_champ["w_cooldown"] == 0
+    e_ready = my_champ["e_cooldown"] == 0
+    r_ready = my_champ["r_cooldown"] == 0
+    
+    game_time = observation["game_time"]
+    
+    # Threatening projectiles - wider detection radius
+    threatening = []
+    for p in observation["projectiles"]:
+        if p["my_team"] == 0:
+            dist = p["distance_to_me"]
+            if dist < 600:
+                threatening.append(p)
+    
+    # PRIORITY 0: ALWAYS dodge close threatening projectiles
+    if threatening:
+        closest = min(threatening, key=lambda p: p["distance_to_me"])
+        pdx = closest["dx_to_me"]
+        pdy = closest["dy_to_me"]
+        perp_x = -pdy
+        perp_y = pdx
+        mag = math.sqrt(perp_x**2 + perp_y**2)
+        if mag > 0:
+            perp_x /= mag
+            perp_y /= mag
+        
+        # E dodge for very close projectiles
+        if closest["distance_to_me"] < 300 and e_ready:
+            e_x = my_x + perp_x * 475
+            e_y = my_y + perp_y * 475
+            return (2, [[2], [e_y, e_x]])
+        
+        dodge_x = my_x + perp_x * 400
+        dodge_y = my_y + perp_y * 400
+        return (1, [dodge_y, dodge_x])
+    
+    # Use a tick counter to alternate between casting and moving
+    tick = int(game_time / 250)
+    
+    # Aim with lead prediction
+    angle_to = math.atan2(enemy_dy, enemy_dx)
+    lead = math.sin(game_time * 0.017) * 200
+    aim_x = enemy_x + math.cos(angle_to + math.pi/2) * lead
+    aim_y = enemy_y + math.sin(angle_to + math.pi/2) * lead
+    
+    # Every other tick: cast an ability
+    if tick % 2 == 0:
+        # R spam when far away (but not every tick - every 6th tick)
+        if r_ready and enemy_dist > 1200 and tick % 6 == 0:
+            return (2, [[3], [aim_y, aim_x]])
+        
+        # Q is highest DPS when in range
+        if q_ready and enemy_dist < 1150:
+            return (2, [[0], [aim_y, aim_x]])
+        
+        # W for mark
+        if w_ready and enemy_dist < 1000:
+            return (2, [[1], [aim_y, aim_x]])
+        
+        # R at any range every 6th tick
+        if r_ready and tick % 6 == 0:
+            return (2, [[3], [aim_y, aim_x]])
+    
+    # Odd ticks or no ability to cast: MOVE
+    # E to close gap when far
+    if e_ready and enemy_dist > 1500 and my_hp_pct > 0.3:
+        e_x = my_x + math.cos(angle_to) * 475
+        e_y = my_y + math.sin(angle_to) * 475
+        return (2, [[2], [e_y, e_x]])
+    
+    # Movement based on range
+    if enemy_dist > 1000:
+        # Approach with juke
+        juke = math.sin(game_time * 0.009) * math.pi / 5
+        move_angle = angle_to + juke
+        mx = my_x + math.cos(move_angle) * 400
+        my = my_y + math.sin(move_angle) * 400
+        return (1, [my, mx])
+    
+    if enemy_dist < 350:
+        # Kite back
+        angle_away = math.atan2(-enemy_dy, -enemy_dx)
+        mx = my_x + math.cos(angle_away) * 350
+        my = my_y + math.sin(angle_away) * 350
+        return (1, [my, mx])
+    
+    # Optimal range: juke unpredictably
+    t = game_time
+    juke1 = math.sin(t * 0.013) * 0.8
+    juke2 = math.sin(t * 0.0071 + 1.9) * 0.5
+    juke3 = math.sin(t * 0.023 + 0.5) * 0.3
+    combined = juke1 + juke2 + juke3
+    orbit_angle = angle_to + (math.pi / 2) * combined
+    mx = my_x + math.cos(orbit_angle) * 280
+    my = my_y + math.sin(orbit_angle) * 280
+    return (1, [my, mx])
+```
+
+This should fix the core issues:
+1. Bot no longer stands still spamming R (alternates between cast and move)
+2. Dodge radius increased to 600 (catches R projectiles sooner)
+3. Q prioritized over R at close range
+4. Movement interleaved with casting
+5. R only used every 6th tick to prevent R-lock
+6. E used for gap closing when far
+7. Unpredictable juking when in range

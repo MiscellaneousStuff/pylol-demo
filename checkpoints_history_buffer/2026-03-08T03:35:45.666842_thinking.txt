@@ -1,0 +1,24 @@
+Looking at the experience data carefully:
+
+1. **The bot NEVER casts abilities** - Throughout 24+ seconds, the bot stays at ~43-46% HP (after initial trades) and just orbits. Enemy distance is always ~1000-1500 (checking dx/dy values like 1000-1200 range). Q is always ready (Q0) but the bot never casts it.
+
+2. **Why?** The enemy_dist is calculated from dx_to_me and dy_to_me. Looking at values like dx=1076, dy=1329 → distance = sqrt(1076²+1329²) ≈ 1710. That's > 1100, so Q never fires! The bot's Q range check is `enemy_dist < 1100` but the actual distances are 1200-1800.
+
+3. **Projectiles everywhere** - There are always 4 projectiles with distances ~300-1000. The dodge code triggers for any projectile < 350, but looking at projectile distances, most are 300-900. The projectile dx/dy like (269,345) = distance 437, which is > 350. So dodge rarely triggers. But the bot still just orbits because it's too far to Q.
+
+4. **Core issue: Bot never gets close enough to fight.** The approach zigzag at 450 units per step is too slow, and the bot seems to hover at ~1500+ distance forever. It needs to:
+   - Approach more aggressively to get within Q range (1150)
+   - Actually cast Q when in range
+   - Cast W for additional damage
+   - Use auto attacks when close enough (550 range)
+
+5. **From history**: Previous issues were about dodge loops preventing approach. The current policy has Q priority highest but distance is never < 1100.
+
+**Fix plan:**
+- Increase Q cast range check to 1150 (actual range)
+- Approach more aggressively - move directly toward enemy with larger steps
+- Only dodge projectiles that are VERY close (<250) AND actually approaching us
+- Cast Q as absolute top priority when in range
+- Use W when Q is on cooldown
+- Auto attack when close
+- Don't orbit pointlessly - always be either approaching to Q range or kiting after casting

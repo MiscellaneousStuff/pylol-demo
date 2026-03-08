@@ -1,0 +1,22 @@
+Looking at the experience data, I can see several critical issues:
+
+1. **Both champions are Ezreal** - mirror matchup. Both start at ~88% HP and trade down symmetrically to 6% HP by the end. The bot is walking directly into the enemy while alternating between moving and casting Q every 250ms (the `mult=4` oscillation).
+
+2. **The bot walks in a straight line toward the enemy** - positions go from (6350,6350) steadily toward the enemy at (1300,1300) then enemy gets closer. This makes it trivially easy for enemy Ezreal Q's to hit.
+
+3. **HP drops symmetrically** - 100→88→72→59→46→32→19→6 for both. The bot is trading 1-for-1 which means no advantage is gained. The bot gets hit by every single enemy Q because it walks straight at the enemy.
+
+4. **The bot never dodges projectiles** - PROJ data shows EzrealMysticShot projectiles coming at the bot, and HP drops correspond to being hit. The bot needs to dodge perpendicular to incoming skillshots.
+
+5. **The position format issue** - The action takes `[y, x]` but the current policy passes `[enemy_champ_x, enemy_champ_y]` which swaps x and y. Need to fix this.
+
+6. **Strategy needed**: As Ezreal vs Ezreal, the key is to:
+   - Dodge enemy Q's (perpendicular movement)
+   - Land our Q's (predict enemy movement)
+   - Don't walk in a straight line
+   - Maintain distance around 800-1000 (Q range is 1150) to have time to react to projectiles
+   - Use E (Arcane Shift) to dodge critical skillshots when low HP
+
+The projectile data shows `dx_to_me` and `dy_to_me` which indicate the relative position of the projectile to us. When these values are small and decreasing, the projectile is approaching.
+
+Key fix: Implement proper dodging by moving perpendicular to incoming projectiles, and cast Q from a safe range instead of walking into melee range.
